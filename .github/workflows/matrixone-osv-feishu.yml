@@ -1,0 +1,155 @@
+testname: MatrixOne OSV Daily Scan
+
+on:
+  schedule:
+    # 09:00 Asia/Shanghai = 01:00 UTC.
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan-and-notify:
+    runs-on: ubuntu-latest
+    env:
+      REPO_NAME: matrixorigin/matrixone
+      COMMIT_SHA: ${{ github.sha }}
+      FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+      FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+      FEISHU_RECIPIENT_OPEN_ID: ${{ secrets.FEISHU_RECIPIENT_OPEN_ID }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run OSV-Scanner
+        id: osv
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            ghcr.io/google/osv-scanner:v2.7.0 \
+            scan source --format=json /src > osv-results.json 2> osv-scanner.stderr
+          rc=$?
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          if [ ! -s osv-results.json ]; then
+            printf '%s\n' '{"results":[],"scan_error":true}' > osv-results.json
+          fi
+          exit 0
+
+      - name: Summarize scan
+        id: summary
+        shell: bash
+        env:
+          SCAN_EXIT_CODE: ${{ steps.osv.outputs.exit_code }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path('osv-results.json')
+          try:
+              result = json.loads(path.read_text())
+          except Exception:
+              result = {'results': [], 'scan_error': True}
+
+          packages = set()
+          vulnerabilities = []
+          for finding in result.get('results', []):
+              for package in finding.get('packages', []):
+                  name = package.get('package', {}).get('name')
+                  if name:
+                      packages.add(name)
+                  vulnerabilities.extend(package.get('vulnerabilities', []))
+
+          ids = []
+          for vulnerability in vulnerabilities:
+              aliases = vulnerability.get('aliases', [])
+              value = next((x for x in aliases if x.startswith('CVE-')), vulnerability.get('id'))
+              if value and value not in ids:
+                  ids.append(value)
+
+          scanner_exit_code = int(os.environ.get('SCAN_EXIT_CODE') or '2')
+          failed = bool(result.get('scan_error')) or scanner_exit_code > 1
+          status = 'scan_failed' if failed else ('vulnerabilities_found' if vulnerabilities else 'clean')
+          output = os.environ['GITHUB_OUTPUT']
+          with open(output, 'a', encoding='utf-8') as f:
+              f.write(f"scan_status={status}\n")
+              f.write(f"vulnerability_count={len(vulnerabilities)}\n")
+              f.write(f"unique_vulnerability_count={len(ids)}\n")
+              f.write(f"package_count={len(packages)}\n")
+              f.write(f"vulnerability_ids={','.join(ids[:12])}\n")
+          summary = os.environ['GITHUB_STEP_SUMMARY']
+          with open(summary, 'a', encoding='utf-8') as f:
+              f.write('## MatrixOne OSV scan\n')
+              f.write(f'- Status: `{status}`\n')
+              f.write(f'- Vulnerabilities: `{len(vulnerabilities)}`\n')
+              f.write(f'- Unique IDs: `{len(ids)}`\n')
+              f.write(f'- Packages: `{len(packages)}`\n')
+              f.write(f'- Commit: `{os.environ["COMMIT_SHA"][:12]}`\n')
+          PY
+
+      - name: Upload raw OSV report
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrixone-osv-${{ github.run_number }}
+          path: |
+            osv-results.json
+            osv-scanner.stderr
+          retention-days: 14
+
+      - name: Send Feishu bot notification
+        if: ${{ always() }}
+        env:
+          SCAN_STATUS: ${{ steps.summary.outputs.scan_status }}
+          VULNERABILITY_COUNT: ${{ steps.summary.outputs.vulnerability_count }}
+          UNIQUE_VULNERABILITY_COUNT: ${{ steps.summary.outputs.unique_vulnerability_count }}
+          PACKAGE_COUNT: ${{ steps.summary.outputs.package_count }}
+          VULNERABILITY_IDS: ${{ steps.summary.outputs.vulnerability_ids }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          def post(url, payload, headers=None):
+              body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+              request = urllib.request.Request(url, data=body, headers=headers or {}, method='POST')
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.loads(response.read().decode('utf-8'))
+
+          token_response = post(
+              'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
+              {'app_id': os.environ['FEISHU_APP_ID'], 'app_secret': os.environ['FEISHU_APP_SECRET']},
+              {'Content-Type': 'application/json'},
+          )
+          if token_response.get('code') not in (None, 0):
+              raise SystemExit(f"Feishu token request failed: {token_response.get('msg', 'unknown error')}")
+
+          status = os.environ.get('SCAN_STATUS', 'scan_failed')
+          ids = os.environ.get('VULNERABILITY_IDS', '')
+          lines = [
+              '⏰ MatrixOne OSV 安全扫描',
+              f"仓库：{os.environ['REPO_NAME']}",
+              f"提交：{os.environ['COMMIT_SHA'][:12]}",
+              f"结果：{status}",
+              f"命中：{os.environ.get('VULNERABILITY_COUNT', '0')} 条，唯一漏洞：{os.environ.get('UNIQUE_VULNERABILITY_COUNT', '0')}，涉及包：{os.environ.get('PACKAGE_COUNT', '0')}",
+          ]
+          if ids:
+              lines.append(f"漏洞标识：{ids}")
+          content = json.dumps({'text': '\n'.join(lines)}, ensure_ascii=False)
+          message = post(
+              'https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id',
+              {'receive_id': os.environ['FEISHU_RECIPIENT_OPEN_ID'], 'msg_type': 'text', 'content': content},
+              {'Authorization': f"Bearer {token_response['tenant_access_token']}", 'Content-Type': 'application/json'},
+          )
+          if message.get('code') not in (None, 0):
+              raise SystemExit(f"Feishu message failed: {message.get('msg', 'unknown error')}")
+          print('Feishu notification sent as the configured app bot.')
+          PY
