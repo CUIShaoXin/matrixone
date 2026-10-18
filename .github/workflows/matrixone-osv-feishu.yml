@@ -1,4 +1,4 @@
-testname: MatrixOne OSV Daily Scan
+name: MatrixOne OSV Daily Scan
 
 on:
   schedule:
@@ -12,9 +12,9 @@ permissions:
 jobs:
   scan-and-notify:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       REPO_NAME: matrixorigin/matrixone
-      COMMIT_SHA: ${{ github.sha }}
       FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
       FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
       FEISHU_RECIPIENT_OPEN_ID: ${{ secrets.FEISHU_RECIPIENT_OPEN_ID }}
@@ -22,18 +22,23 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
+          repository: matrixorigin/matrixone
+          ref: main
           fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record scanned commit
+        run: echo "COMMIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Run OSV-Scanner
         id: osv
-        continue-on-error: true
         shell: bash
         run: |
           set +e
           docker run --rm \
             -v "${GITHUB_WORKSPACE}:/src" \
             ghcr.io/google/osv-scanner:v2.7.0 \
-            scan source --format=json /src > osv-results.json 2> osv-scanner.stderr
+            scan source --recursive --format=json /src > osv-results.json 2> osv-scanner.stderr
           rc=$?
           echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
           if [ ! -s osv-results.json ]; then
@@ -132,7 +137,7 @@ jobs:
           if token_response.get('code') not in (None, 0):
               raise SystemExit(f"Feishu token request failed: {token_response.get('msg', 'unknown error')}")
 
-          status = os.environ.get('SCAN_STATUS', 'scan_failed')
+          status = os.environ.get('SCAN_STATUS') or 'scan_failed'
           ids = os.environ.get('VULNERABILITY_IDS', '')
           lines = [
               '⏰ MatrixOne OSV 安全扫描',
@@ -141,6 +146,7 @@ jobs:
               f"结果：{status}",
               f"命中：{os.environ.get('VULNERABILITY_COUNT', '0')} 条，唯一漏洞：{os.environ.get('UNIQUE_VULNERABILITY_COUNT', '0')}，涉及包：{os.environ.get('PACKAGE_COUNT', '0')}",
           ]
+          lines.append(f"运行详情：https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}")
           if ids:
               lines.append(f"漏洞标识：{ids}")
           content = json.dumps({'text': '\n'.join(lines)}, ensure_ascii=False)
@@ -153,3 +159,9 @@ jobs:
               raise SystemExit(f"Feishu message failed: {message.get('msg', 'unknown error')}")
           print('Feishu notification sent as the configured app bot.')
           PY
+
+      - name: Fail if scan did not complete
+        if: ${{ always() && steps.summary.outputs.scan_status != 'clean' && steps.summary.outputs.scan_status != 'vulnerabilities_found' }}
+        run: |
+          echo 'OSV scan did not complete. See the uploaded report and scanner stderr.'
+          exit 1
