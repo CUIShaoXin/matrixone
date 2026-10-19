@@ -50,6 +50,7 @@ jobs:
         env:
           MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
           SCAN_GITHUB_TOKEN: ${{ secrets.SCAN_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           REPORT_DATE: ${{ inputs.report_date }}
           WAIT_FOR_CLOUD_RUNS: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
         run: python3 .github/scripts/moi-preview/moi_cloud_prepare.py
