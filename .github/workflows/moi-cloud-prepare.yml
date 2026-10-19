@@ -14,7 +14,6 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 concurrency:
   group: moi-cloud-prepare
@@ -33,24 +32,15 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-          sparse-checkout: .github/scripts/moi-preview
+          sparse-checkout: |
+            .github/scripts/moi-preview
+            .github/scripts/moi-scan
       - name: Verify cloud preparation boundaries
         run: python3 -m unittest discover -s .github/scripts/moi-preview -p 'test_*.py'
-      - name: Install verified OSV release
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --fail --location --silent --show-error \
-            https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64 \
-            --output /tmp/matrix-osv-scanner
-          echo '160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b  /tmp/matrix-osv-scanner' | sha256sum --check --status
-          chmod 700 /tmp/matrix-osv-scanner
-      - name: Collect scans and verify MOI archive
+      - name: Verify repository uploads and MOI archive
         id: archive
         env:
           MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
-          SCAN_GITHUB_TOKEN: ${{ secrets.SCAN_GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ github.token }}
           REPORT_DATE: ${{ inputs.report_date }}
           WAIT_FOR_CLOUD_RUNS: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
         run: python3 .github/scripts/moi-preview/moi_cloud_prepare.py

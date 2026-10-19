@@ -47,7 +47,9 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-          sparse-checkout: .github/scripts/moi-preview
+          sparse-checkout: |
+            .github/scripts/moi-preview
+            .github/scripts/moi-scan
       - name: Verify preview boundaries
         run: python3 -m unittest discover -s .github/scripts/moi-preview -p 'test_*.py'
       - name: Validate archived report with MOI assistant

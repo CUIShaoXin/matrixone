@@ -5,9 +5,16 @@ on:
     # 07:30 Asia/Shanghai = 23:30 UTC on the previous day.
     - cron: '30 23 * * *'
   workflow_dispatch:
+    inputs:
+      notify_feishu:
+        description: 'Send the existing Feishu notification after this manual scan'
+        type: boolean
+        default: true
+        required: false
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   scan-and-notify:
@@ -19,24 +26,34 @@ jobs:
       FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
       FEISHU_RECIPIENT_OPEN_ID: ${{ secrets.FEISHU_RECIPIENT_OPEN_ID }}
     steps:
+      - name: Check out trusted MOI upload code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          path: .moi-uploader
+          sparse-checkout: .github/scripts/moi-scan
+      - name: Verify MOI upload boundaries
+        run: python3 -m unittest discover -s .moi-uploader/.github/scripts/moi-scan -p 'test_*.py'
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           repository: matrixorigin/matrixone
+          path: source
           ref: main
           fetch-depth: 1
           persist-credentials: false
 
       - name: Record scanned commit
-        run: echo "COMMIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+        run: echo "COMMIT_SHA=$(git -C source rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Run OSV-Scanner
         id: osv
         shell: bash
         run: |
+          echo "SCAN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
           set +e
           docker run --rm \
-            -v "${GITHUB_WORKSPACE}:/src" \
+            -v "${GITHUB_WORKSPACE}/source:/src:ro" \
             ghcr.io/google/osv-scanner:v2.7.0 \
             scan source --recursive --format=json /src > osv-results.json 2> osv-scanner.stderr
           rc=$?
@@ -108,8 +125,25 @@ jobs:
             osv-scanner.stderr
           retention-days: 14
 
+      - name: Upload this repository scan to MOI
+        if: ${{ always() && steps.osv.outputs.exit_code != '' }}
+        env:
+          MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SCAN_EXIT_CODE: ${{ steps.osv.outputs.exit_code }}
+        run: python3 .moi-uploader/.github/scripts/moi-scan/moi_repo_scan.py
+
+      - name: Retain MOI upload receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: moi-scan-upload-${{ github.run_id }}-${{ github.run_attempt }}
+          path: out/moi-scan-upload-receipt.json
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Send Feishu bot notification
-        if: ${{ always() }}
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.notify_feishu) }}
         env:
           SCAN_STATUS: ${{ steps.summary.outputs.scan_status }}
           VULNERABILITY_COUNT: ${{ steps.summary.outputs.vulnerability_count }}
@@ -165,3 +199,4 @@ jobs:
         run: |
           echo 'OSV scan did not complete. See the uploaded report and scanner stderr.'
           exit 1
+
