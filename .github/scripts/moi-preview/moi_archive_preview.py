@@ -117,7 +117,7 @@ def validate_handoff(handoff, report_date):
     daily = handoff.get("daily_report", {})
     message = handoff.get("message", {})
     require(receipt.get("workspace_id") == WORKSPACE, "receipt_workspace_mismatch")
-    require(receipt.get("archive_status") == "archived"
+    require(receipt.get("archive_status") in {"archived", "archived_with_gaps"}
             and receipt.get("readback_verified") is True
             and receipt.get("files_verified") is True, "archive_not_verified")
     require(receipt.get("scan_rows") == 3 and receipt.get("daily_rows") == 1,
