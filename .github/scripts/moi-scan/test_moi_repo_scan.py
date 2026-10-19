@@ -163,7 +163,8 @@ class RepositoryUpload(unittest.TestCase):
             old = os.getcwd()
             try:
                 os.chdir(directory)
-                with patch.dict(os.environ, {"GITHUB_REPOSITORY": "wrong/repo", "MOI_API_KEY": "private-test-key"}):
+                with patch.dict(os.environ, {"GITHUB_REPOSITORY": "wrong/repo", "MOI_API_KEY": "private-test-key",
+                                             "GITHUB_STEP_SUMMARY": ""}):
                     self.assertEqual(1, scan.main())
                 receipt = Path("out/moi-scan-upload-receipt.json").read_text()
                 self.assertNotIn("private-test-key", receipt)
