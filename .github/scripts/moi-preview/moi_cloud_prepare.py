@@ -517,9 +517,12 @@ def main():
             require(os.environ.get("GITHUB_RUN_ATTEMPT", "1") == "1", "rerun_requires_verified_cloud_ready")
             key = os.environ.get("SCAN_GITHUB_TOKEN", "").strip()
             require(bool(key), "private_repository_token_required")
+            repository_key = os.environ.get("GITHUB_TOKEN", "").strip()
+            require(bool(repository_key), "execution_repository_token_required")
             if os.environ.get("WAIT_FOR_CLOUD_RUNS") == "true":
                 require(now().time() < dt.time(9, 50), "daily_preparation_window_missed")
             gh = GitHub(key)
+            source_clients = {"matrixone": GitHub(repository_key), "taas": gh}
             # Before scanning or writing, verify the two private-repository read scopes.
             for repo in ("matrixorigin/taas", "matrixorigin/matrixflow"):
                 access = gh.read("/repos/" + repo)
@@ -528,14 +531,14 @@ def main():
             require(moi.named_file(lock_name) is None, "existing_preparation_requires_recovery")
             moi.upload(lock_name, pack(dict(report_date=date, github_run_id=os.environ["GITHUB_RUN_ID"],
                        github_run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT", "1"), started_at=now().isoformat())))
-            scans = {name: collect(gh, name, date, now()) for name in ("matrixone", "taas")}
+            scans = {name: collect(source_clients[name], name, date, now()) for name in ("matrixone", "taas")}
             scans["matrixflow"] = scan_matrixflow(gh)
             deadline = now().replace(hour=9, minute=50, second=0, microsecond=0)
             while os.environ.get("WAIT_FOR_CLOUD_RUNS") == "true" and now() < deadline and any(scans[n]["status"] == "pending" for n in ("matrixone", "taas")):
                 time.sleep(min(60, max(1, (deadline - now()).total_seconds())))
                 for name in ("matrixone", "taas"):
                     if scans[name]["status"] == "pending":
-                        scans[name] = collect(gh, name, date, now())
+                        scans[name] = collect(source_clients[name], name, date, now())
             if os.environ.get("WAIT_FOR_CLOUD_RUNS") == "true":
                 require(now().time() < dt.time(9, 55), "daily_archival_window_missed")
             handoff = archive(moi, scans, date)
