@@ -557,6 +557,9 @@ def main():
         exit_code = 0
     except Error as exc:
         receipt.update(status="blocked", error_code=str(exc))
+        if os.environ.get("GITHUB_STEP_SUMMARY"):
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                summary.write("\nError code: `" + str(exc) + "`\n")
     except Exception:
         receipt.update(status="blocked", error_code="unexpected_error_details_withheld")
     path = Path("out/moi-cloud-prepare-receipt.json")
