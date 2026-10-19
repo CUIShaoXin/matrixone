@@ -110,7 +110,8 @@ class CloudPreparation(unittest.TestCase):
             try:
                 os.chdir(directory)
                 with patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": "CUIShaoXin/matrixone",
-                         "GITHUB_RUN_ATTEMPT": "1", "MOI_API_KEY": "sensitive-test-key", "SCAN_GITHUB_TOKEN": "", "REPORT_DATE": ""}), \
+                         "GITHUB_RUN_ATTEMPT": "1", "MOI_API_KEY": "sensitive-test-key", "SCAN_GITHUB_TOKEN": "", "REPORT_DATE": "",
+                         "GITHUB_STEP_SUMMARY": "", "GITHUB_OUTPUT": ""}), \
                      patch.object(cloud.MOI, "named_file", return_value=None), \
                      patch.object(cloud.MOI, "upload") as upload:
                     self.assertEqual(1, cloud.main())
