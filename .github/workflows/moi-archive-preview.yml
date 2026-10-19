@@ -1,0 +1,67 @@
+name: MOI Archive Assistant Preview
+run-name: MOI archive preview (${{ inputs.report_date }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      report_date:
+        description: 'Archived report date (YYYY-MM-DD); this does not start a scan'
+        required: true
+        type: string
+      source_conversation_id:
+        description: 'MOI conversation containing the verified archive handoff; use this OR handoff_file_id'
+        required: false
+        type: string
+      handoff_file_id:
+        description: 'Verified handoff JSON file in MOI; use this OR source_conversation_id'
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      report_date:
+        required: true
+        type: string
+      source_conversation_id:
+        required: false
+        type: string
+      handoff_file_id:
+        required: false
+        type: string
+    secrets:
+      MOI_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: moi-archive-assistant-preview
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out preview code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts/moi-preview
+      - name: Verify preview boundaries
+        run: python3 -m unittest discover -s .github/scripts/moi-preview -p 'test_*.py'
+      - name: Validate archived report with MOI assistant
+        env:
+          MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
+          REPORT_DATE: ${{ inputs.report_date }}
+          SOURCE_CONVERSATION_ID: ${{ inputs.source_conversation_id }}
+          HANDOFF_FILE_ID: ${{ inputs.handoff_file_id }}
+        run: python3 .github/scripts/moi-preview/moi_archive_preview.py
+      - name: Retain receipt without report contents
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: moi-preview-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: out/moi-preview-receipt.json
+          if-no-files-found: warn
+          retention-days: 7
