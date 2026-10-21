@@ -44,6 +44,10 @@ def file_evidence(fid, raw, **fields):
     return dict(file_id=fid, bytes=len(raw), sha256=sha256(raw), readback_verified=True, **fields)
 
 
+def knowledge_rows(data):
+    return data.get("items", data.get("sources", []))
+
+
 def coordinate_key(row):
     package = row.get("package", row)
     return package["ecosystem"], package["name"], row["version"]
@@ -295,7 +299,7 @@ class Runner:
                   self.sink("validation","{{ .state.validation }}",run_prefix+"-validation.json")]
         generated=self.workflow(repo.name+"_finalize",nodes)
         # Correct the legacy operator's import description before publishing or KB registration.
-        if "artifacts" not in saved:
+        if saved.get("artifact_storage_version") != 2:
             osv=json.loads(generated["osv"][1]);facts=osv["facts"]
             require(osv["commit"] == proof["commit"] and facts["report_date_shanghai"] == self.state["date"], "scan_date_or_commit_mismatch")
             require(osv.get("manifest_integrity_verified") and osv.get("source_commit_verified") and osv.get("execution_location")=="MOI cloud Python worker", "scan_integrity_missing")
@@ -307,14 +311,20 @@ class Runner:
             require((facts["marker"]+"-EMPLOYEE").encode() in employee, "employee_marker_missing")
             require((facts["marker"]+"-DETAIL") in detail, "detail_marker_missing")
             values={"osv":json_bytes(osv),"details":detail.encode(),"employee":employee}
-            saved["artifacts"]={}
+            normalized_nodes=[]
             for kind,body in values.items():
                 suffix=".json" if kind=="osv" else ".md"
-                name=run_prefix+"-accepted-"+kind+suffix
-                artifact=self.api.upload(name,body)
-                if kind!="osv":self.api.request("/catalog/file/create",{"volume_id":140002,"file_ids":[artifact["file_id"]]})
-                saved["artifacts"][kind]=dict(artifact,name=name)
-            saved.update(marker=facts["marker"],counts={key:facts[key] for key in COUNTS},validation=json.loads(generated["validation"][1]))
+                name=run_prefix+"-accepted-v2-"+kind+suffix
+                normalized_nodes.append(self.sink(kind,json.loads(body) if kind=="osv" else body.decode(),name,
+                                                  130001 if kind=="osv" else 140002,"json" if kind=="osv" else "markdown"))
+            normalized=self.workflow(repo.name+"_store_accepted_v2",normalized_nodes)
+            saved["artifacts"]={kind:normalized[kind][0] for kind in values}
+            for kind,body in values.items():
+                require(normalized[kind][1] == body if kind!="osv" else json.loads(normalized[kind][1])==json.loads(body),"normalized_report_readback_mismatch")
+            saved.pop("kb_appended",None)
+            for key in list(saved):
+                if key.startswith("rag"):saved.pop(key)
+            saved.update(artifact_storage_version=2,marker=facts["marker"],counts={key:facts[key] for key in COUNTS},validation=json.loads(generated["validation"][1]))
             self.journal.save()
         targets=[dict(file_id=saved["artifacts"][kind]["file_id"],marker=saved["marker"]+suffix) for kind,suffix in (("details","-DETAIL"),("employee","-EMPLOYEE"))]
         self.knowledge(repo.name,saved,targets)
@@ -336,8 +346,10 @@ class Runner:
             rows=[]
             for page in range(1,21):
                 data=self.api.data(self.api.request("/semantic-models/80001/sources?page="+str(page)+"&page_size=100"))
-                current=data.get("sources",[]);rows.extend(current)
+                current=knowledge_rows(data);rows.extend(current)
                 if len(current)<100:break
+            failed=[row for row in rows if row.get("ingest_status")=="failed" and row.get("source_file_id") in wanted]
+            require(not failed,"kb_ingestion_failed")
             found={fid for row in rows for fid in wanted if fid in (row.get("source_file_id"),row.get("kb_file_id"),row.get("source_id")) and row.get("ingest_status")=="succeeded"}
             if found==wanted:break
             time.sleep(15)
