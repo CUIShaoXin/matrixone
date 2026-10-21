@@ -10,10 +10,6 @@ on:
       resume_run_id:
         description: Existing checkpoint run id, empty for new acquisition
         required: false
-  push:
-    branches: [matrix-report-link-v1]
-    paths:
-      - .github/workflows/moi-daily-cloud-acceptance.yml
 permissions:
   contents: read
 concurrency:
@@ -35,7 +31,7 @@ jobs:
           MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
           SCAN_GITHUB_TOKEN: ${{ secrets.SCAN_GITHUB_TOKEN }}
           MATRIX_DAILY_SCOPE: ${{ inputs.scope || 'matrixone-test' }}
-          MATRIX_RESUME_RUN_ID: ${{ inputs.resume_run_id || '39636575507-1' }}
+          MATRIX_RESUME_RUN_ID: ${{ inputs.resume_run_id }}
           MATRIX_NODE_MODULES: /tmp/matrix-report-renderer/node_modules
         run: python3 .github/scripts/moi-report-link/cloud_daily.py
       - name: Retain status without reports, links or credentials
