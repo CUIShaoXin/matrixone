@@ -342,7 +342,13 @@ class Runner:
             saved["kb_appended"]=True;self.journal.save()
         deadline=time.monotonic()+900
         wanted={x["file_id"] for x in targets}
+        last_reconcile=0
         while time.monotonic()<deadline:
+            if time.monotonic()-last_reconcile>=60:
+                jobs=self.api.data(self.api.request("/semantic-models/80001/source-jobs"))
+                if jobs.get("reconcile_required"):
+                    self.api.request("/semantic-models/80001/source-jobs/reconcile",{},method="POST",timeout=45)
+                last_reconcile=time.monotonic()
             rows=[]
             for page in range(1,21):
                 data=self.api.data(self.api.request("/semantic-models/80001/sources?page="+str(page)+"&page_size=100"))
