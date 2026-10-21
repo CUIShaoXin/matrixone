@@ -199,6 +199,39 @@ def validate_zip(stream,expected_commit,max_archive_bytes=1024*1024*1024,max_exp
     stream.seek(0)
     return {'bytes':count,'sha256':digest,'commit':expected_commit,'zip_entries':len(entries),'crc_verified':True,'manifests':manifests}
 
+def run(github:ManagedGitHub,objects:ManagedObjects,run_id:str,date_shanghai:str,sleep=time.sleep):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,80}',run_id) or not re.fullmatch(r'\d{8}',date_shanghai):raise ValueError('invalid_run_identifier')
+    results=[]
+    for repository in REPOSITORIES:
+        receipt={'repository':repository.owner+'/'+repository.name,'branch':repository.branch,'run_id':run_id,'date_shanghai':date_shanghai,'status':'failed','attempts':0,'private_dependency_source_downloaded':False}
+        try:
+            commit=github.branch_commit(repository)
+            if not re.fullmatch(r'[0-9a-f]{40}',commit):raise ValueError('invalid_commit')
+            key='snapshots/'+date_shanghai+'/'+repository.name+'/'+repository.name+'-'+commit+'-'+run_id+'.zip'
+            for attempt in range(1,4):
+                receipt['attempts']=attempt
+                try:
+                    with tempfile.TemporaryFile() as stream:
+                        github.download_zip(repository,commit,stream)
+                        verified=validate_zip(stream,commit)
+                        objects.put_stream(key,stream,verified['bytes'],verified['sha256'])
+                        with objects.get_stream(key) as readback:
+                            size,sha=digest_stream(readback,rewind=False)
+                        if size!=verified['bytes'] or sha!=verified['sha256']:raise ValueError('minio_readback_mismatch')
+                        receipt.update(verified,key=key,status='verified',minio_readback_verified=True)
+                    break
+                except Exception:
+                    if attempt==3:raise
+                    sleep(2**attempt)
+        except Exception as exc:
+            # Exception messages may contain request URLs or credentials. Save only type.
+            receipt['error_type']=type(exc).__name__
+        receipt['finished_at']=datetime.now(timezone.utc).isoformat()
+        objects.put_receipt('receipts/'+date_shanghai+'/'+run_id+'/'+repository.name+'.json',receipt)
+        results.append(receipt)
+    summary={'run_id':run_id,'date_shanghai':date_shanghai,'repositories':results,'all_three_verified':all(x['status']=='verified' for x in results),'eligible_for_full_three_repository_report':all(x['status']=='verified' for x in results)}
+    objects.put_receipt('receipts/'+date_shanghai+'/'+run_id+'/summary.json',summary)
+    return summary
 
 """Existing Actions secrets -> fixed GitHub ZIP -> existing MinIO, no group send."""
 import datetime as dt
@@ -206,7 +239,9 @@ import json
 import os
 from pathlib import Path
 import re
+import ssl
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -251,12 +286,29 @@ class GitHub:
         self.token = token
         self.opener = urllib.request.build_opener(NoRedirect())
 
+    def open(self, request, timeout, stage):
+        for attempt in range(3):
+            try:
+                return self.opener.open(request, timeout=timeout)
+            except urllib.error.HTTPError as exc:
+                if exc.code not in (429, 502, 503, 504) or attempt == 2:
+                    raise
+            except urllib.error.URLError as exc:
+                if isinstance(exc.reason, ssl.SSLCertVerificationError):
+                    raise Failure(stage + "_certificate_verification_failed") from None
+                if attempt == 2:
+                    raise Failure(stage + "_network_" + type(exc.reason).__name__) from None
+            except TimeoutError:
+                if attempt == 2:
+                    raise Failure(stage + "_timeout") from None
+            time.sleep(attempt + 1)
+
     def get(self, repository, path, binary=False):
         req = urllib.request.Request("https://api.github.com/repos/" + repository + path,
             headers={"Authorization": "Bearer " + self.token, "Accept": "application/vnd.github+json",
                      "User-Agent": "Matrix-MOI-ZIP-Preparation", "X-GitHub-Api-Version": "2022-11-28"})
         try:
-            response = self.opener.open(req, timeout=40)
+            response = self.open(req, timeout=40, stage="github_archive_redirect" if binary else "github_branch_metadata")
         except urllib.error.HTTPError as exc:
             if binary and exc.code in (301, 302, 303, 307, 308):
                 url = urllib.parse.urlsplit(exc.headers.get("Location", ""))
@@ -264,7 +316,7 @@ class GitHub:
                     raise Failure("github_untrusted_archive_redirect") from None
                 # Never forward GitHub Authorization to the archive endpoint.
                 try:
-                    response = self.opener.open(urllib.request.Request(url.geturl()), timeout=60)
+                    response = self.open(urllib.request.Request(url.geturl()), timeout=60, stage="github_archive_download")
                 except urllib.error.HTTPError as error:
                     raise Failure("github_archive_http_" + str(error.code)) from None
             else:
