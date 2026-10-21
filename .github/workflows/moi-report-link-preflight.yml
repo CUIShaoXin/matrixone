@@ -4,7 +4,7 @@ on:
   push:
     branches: [matrix-report-link-v1]
     paths:
-      - .github/scripts/moi-report-link/**
+      - .github/scripts/moi-report-link/cloud_preflight.py
       - .github/workflows/moi-report-link-preflight.yml
 permissions:
   contents: read
@@ -32,3 +32,4 @@ jobs:
           name: moi-cloud-zip-preflight-${{ github.run_id }}
           path: out/moi-cloud-zip-preflight-receipt.json
           retention-days: 7
+
