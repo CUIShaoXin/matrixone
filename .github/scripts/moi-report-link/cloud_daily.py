@@ -390,7 +390,13 @@ class Runner:
                          source_acceptance=batch,published=uploaded,url=url,expires_at_utc=expiry,login_free_verification=verified,
                          sent=False,daily_automation_ready=False,bucket_policy_changed=False)
             preview="MatrixOne 单仓验证完成，未发群，三仓每日链路未验收。\n完整报告（免登录）：\n"+url+"\n"
-        artifact=self.api.upload("matrix-daily-publication-"+self.state["run_id"]+".json",json_bytes(receipt))
+        if batch["three_repository_reports_accepted"]:
+            date_tag=batch["date"].replace("-","")
+            receipt["message_artifact"]=self.api.upload("matrix-security-report-share-"+date_tag+"-message.txt",preview.encode())
+            receipt["source_acceptance_file_id"]=self.state["acceptance_file_id"]
+            artifact=self.api.upload("matrix-security-report-share-"+date_tag+".json",json_bytes(receipt))
+        else:
+            artifact=self.api.upload("matrix-daily-publication-"+self.state["run_id"]+".json",json_bytes(receipt))
         self.state.update(publication_file_id=artifact["file_id"],published=True,daily_automation_ready=False,sent=False)
         self.journal.save()
         return artifact
