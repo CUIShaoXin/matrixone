@@ -365,7 +365,7 @@ class Runner:
         if not saved.get("kb_appended"):
             self.api.request("/semantic-models/80001/sources", {"sources":[dict(source_type="local_file",upload_kind="unstructured",file_id=saved["artifacts"][kind]["file_id"],file_name=saved["artifacts"][kind]["name"]) for kind in ("details","employee")]},timeout=45)
             saved["kb_appended"]=True;self.journal.save()
-        deadline=time.monotonic()+900
+        deadline=time.monotonic()+3600
         wanted={x["file_id"] for x in targets}
         last_reconcile=0
         while time.monotonic()<deadline:
@@ -373,6 +373,7 @@ class Runner:
                 jobs=self.api.data(self.api.request("/semantic-models/80001/source-jobs"))
                 if jobs.get("reconcile_required"):
                     self.api.request("/semantic-models/80001/source-jobs/reconcile",{},method="POST",timeout=45)
+                self.event(stage=tag+"_knowledge", status="waiting_for_ingestion")
                 last_reconcile=time.monotonic()
             rows=[]
             for page in range(1,21):
