@@ -1,43 +1,72 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
-const dependencies = process.env.MATRIX_NODE_MODULES || '/Users/cuishaoxin/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules';
-const { Marked } = await import(pathToFileURL(path.join(dependencies, 'marked/lib/marked.esm.js')));
 const escape = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
-const markdown = new Marked({ gfm: true, breaks: false });
-markdown.use({ renderer: {
-  html({ text }) { return escape(text); },
-  image({ text }) { return `<span>${escape(text || '')}</span>`; },
-  link({ href, tokens }) {
-    const text = this.parser.parseInline(tokens);
-    if (!/^https?:\/\//i.test(href || '') && !/^#[A-Za-z0-9_-]+$/.test(href || '')) return text;
-    return `<a href="${escape(href)}" rel="noreferrer noopener">${text}</a>`;
-  },
-}});
+const digest = raw => crypto.createHash('sha256').update(raw).digest('hex');
+const names = { 'golang.org/x/crypto': 'x/crypto', 'github.com/jackc/pgx/v5': 'pgx/v5', 'vitess.io/vitess': 'Vitess', 'google.golang.org/grpc': 'gRPC' };
+
+function artifact(root, repo, result, kind) {
+  const raw = fs.readFileSync(path.join(root, `${repo}-fullzip-${kind}.${kind === 'osv' ? 'json' : 'md'}`));
+  const expected = result.artifacts[kind];
+  if (raw.length !== expected.bytes || digest(raw) !== expected.sha256) throw Error('focus_source_hash_mismatch:' + repo + ':' + kind);
+  return raw.toString('utf8');
+}
+
+export function collectFocus(batch, root) {
+  const partial = batch.single_repository_test === true;
+  const repos = partial ? ['matrixone'] : ['matrixone', 'taas', 'matrixflow'];
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(batch.date) || (!batch.three_repository_reports_accepted && !partial)
+      || JSON.stringify(Object.keys(batch.results).sort()) !== JSON.stringify([...repos].sort())) throw Error('focus_unaccepted_batch');
+  const editsFile = path.join(root, 'focus-edits.json');
+  const edits = fs.existsSync(editsFile) ? JSON.parse(fs.readFileSync(editsFile, 'utf8')) : {};
+  const groups = repos.map(repo => {
+    const result = batch.results[repo];
+    if (!/^[0-9a-f]{40}$/.test(result.commit) || !result.independent_readback_verified || !result.kb_marker_retrieved) throw Error('focus_source_unaccepted');
+    const scan = JSON.parse(artifact(root, repo, result, 'osv'));
+    if (scan.commit !== result.commit || scan.facts.report_date_shanghai !== batch.date) throw Error('focus_source_date_or_commit_mismatch');
+    const employee = artifact(root, repo, result, 'employee');
+    const bullets = employee.split(/\n\s*\n/).filter(p => /^\s*[-•]\s/.test(p));
+    return (scan.facts.priority_components || []).flatMap(component => {
+      const bullet = bullets.find(p => p.includes(component.name));
+      if (!bullet) return [];
+      const edit = edits[repo]?.[component.name];
+      const risk = edit?.risk || bullet.match(/影响(?:\/触发)?[：:]([\s\S]*?)(?:候选(?:评估)?|建议(?:动作)?[：:]|$)/)?.[1]?.trim();
+      if (!risk) throw Error('focus_impact_summary_missing:' + component.name);
+      const action = edit?.action || bullet.match(/建议(?:动作)?[：:]([\s\S]*?)(?:候选(?:评估)?|$)/)?.[1]?.trim()
+        || '先确认是否使用上述功能；涉及该路径后再安排修复评估与回归。';
+      const candidate = (scan.facts.candidate_evaluations || []).find(c => c.component === component.name);
+      const checked = candidate?.status === 'candidate_osv_checked' && Array.isArray(candidate.remaining_ids);
+      const review = checked ? (candidate.remaining_ids.length ? `仍匹配 ${candidate.remaining_ids.length} 条公告` : '本轮 OSV 未匹配')
+        : candidate?.status === 'candidate_osv_query_failed' ? '复查失败，风险余量未知' : '尚未完成复查';
+      return [{ repo, commit: result.commit, name: component.name, label: names[component.name] || component.name,
+        versions: Object.keys(component.versions || {}), risk, action, candidate: candidate?.version || '未确认', review,
+        published: candidate?.published_version_verified === true, compatible: candidate?.compatibility_tested === true }];
+    }).slice(0, 3);
+  });
+  // Give every selected repository a place before adding further components; never fill with non-priority findings.
+  const focus = [];
+  for (let i = 0; i < 3 && focus.length < 5; i++) for (const group of groups) if (group[i] && focus.length < 5) focus.push(group[i]);
+  return { partial, focus };
+}
 
 export function render(batch, root) {
-  const repositories = ['matrixone', 'taas', 'matrixflow'];
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(batch.date) || !batch.three_repository_reports_accepted) throw Error('unaccepted_report_batch');
-  const sha = /^[0-9a-f]{40}$/;
-  let rows = '', sections = '';
-  for (const repo of repositories) {
-    const result = batch.results[repo];
-    if (!result || !sha.test(result.commit) || !result.independent_readback_verified || !result.kb_marker_retrieved) throw Error('report_acceptance_missing:' + repo);
-    const c = result.counts;
-    rows += `<tr><td><a href="#${repo}">${repo}</a></td><td>${repo === 'matrixflow' ? 'dev' : 'main'} / <code>${result.commit.slice(0, 8)}</code></td><td>${c.input_files}</td><td>${c.affected_component_names}</td><td>${c.unique_advisory_alias_groups}</td></tr>`;
-    const employee = fs.readFileSync(path.join(root, repo + '-fullzip-employee.md'), 'utf8');
-    const details = fs.readFileSync(path.join(root, repo + '-fullzip-details.md'), 'utf8');
-    sections += `<section id="${repo}"><h2>${repo} · ${escape(batch.date)}</h2><p class="meta">${repo === 'matrixflow' ? 'dev' : 'main'} · <code>${result.commit}</code></p><article>${markdown.parse(employee)}</article><details><summary>展开 ${repo} 完整漏洞明细、公告正文与覆盖范围</summary><article class="technical">${markdown.parse(details)}</article></details></section>`;
-  }
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><title>Matrix 三仓依赖安全完整报告 · ${batch.date}</title><style>
-:root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#f4f6fa;color:#18283a;font:16px/1.75 system-ui,-apple-system,"PingFang SC",sans-serif}main{max-width:1080px;margin:auto;padding:30px 20px 70px}h1{font-size:30px;line-height:1.4}h2{font-size:24px}h3{font-size:19px}p,li{overflow-wrap:anywhere}.meta{color:#52677e;font-size:14px}.notice{padding:16px 20px;background:#fff3dc;border:1px solid #ecd09c;border-radius:10px}nav{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}a{color:#195bb4}nav a{padding:7px 15px;border:1px solid #bdcce0;border-radius:7px;text-decoration:none;background:white}section{margin:30px 0;background:white;border:1px solid #dce3ed;border-radius:12px;padding:24px;scroll-margin-top:15px}table{border-collapse:collapse;width:100%;font-size:14px}th,td{border:1px solid #dce3ed;text-align:left;padding:9px 12px;vertical-align:top;overflow-wrap:anywhere}th{background:#edf2f8}code{font-size:13px;background:#edf2f8;padding:2px 4px;border-radius:3px}pre{padding:14px;background:#edf2f8;white-space:pre-wrap;overflow-wrap:anywhere;overflow:auto}pre code{padding:0}details{margin-top:24px;border-top:1px solid #dce3ed;padding-top:18px}summary{cursor:pointer;color:#195bb4;font-weight:650}.technical{font-size:14px}.technical h2,.technical h3{margin-top:32px}.overview{overflow:auto}blockquote{border-left:3px solid #ccd7e6;margin-left:0;padding-left:16px}footer{color:#52677e;font-size:13px}@media(max-width:640px){main{padding:18px 12px 45px}h1{font-size:25px}section{padding:16px}table{min-width:540px}article{overflow:auto}}@media print{body{background:white}main{max-width:none}section{break-before:page;border:0}nav{display:none}}
-</style></head><body><main><p class="meta">Matrix · 依赖安全检查 · ${batch.date}</p><h1>三仓依赖安全完整报告</h1><div class="notice">请研发优先评估报告中的重点组件，普通同事暂不需要操作。检查基于 MinIO 固定提交 ZIP 中的依赖声明和锁定版本，采用 OSV API 匹配。公告命中不等于线上可利用，升级候选仍需核实发布状态与兼容性。各仓公告组数分别去重，不能直接相加作为全局唯一数。</div><nav><a href="#overview">检查概况</a><a href="#matrixone">MatrixOne</a><a href="#taas">TaaS</a><a href="#matrixflow">MatrixFlow</a></nav><section id="overview"><h2>检查概况</h2><div class="overview"><table><thead><tr><th>仓库</th><th>分支 / 提交</th><th>清单路径</th><th>命中组件</th><th>公告组</th></tr></thead><tbody>${rows}</tbody></table></div><p class="meta">扫描日期为 ${batch.date}。范围与引用仍有未解析项，未进行运行可达性和升级兼容测试；无同口径历史基线，暂不判断新增或修复。各仓完整明细可在下方展开。</p></section>${sections}<footer>报告日期 ${batch.date} · MinIO 分享副本 · MOI 知识库 matrix_security_daily（80001）保留原始归档。链接有效期以群消息为准。</footer></main></body></html>`;
+  const { partial, focus } = collectFocus(batch, root);
+  const scope = partial ? 'MatrixOne 单仓结果 · 三仓日报尚未验收' : 'MatrixOne · TaaS · MatrixFlow';
+  const cards = focus.map((c, i) => `<article data-component="${escape(c.name)}"><div class="component-head"><div><span class="index">0${i + 1}</span><h2>${escape(c.label)}</h2></div><span class="version">当前 ${escape(c.versions.join(' / '))}</span></div><p class="origin">${escape(c.repo)} · ${c.commit.slice(0, 8)}</p><dl><div><dt>风险与条件</dt><dd>${escape(c.risk)}</dd></div><div class="action"><dt>先做什么</dt><dd>${escape(c.action)}</dd></div></dl><p class="candidate">评估候选 <strong>${escape(c.candidate)}</strong><span class="separator">·</span>${escape(c.review)}${c.published ? ' · 已核实发布' : ' · 发布未核实'}${c.compatible ? ' · 兼容性已测试' : ''}</p></article>`).join('');
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><title>依赖安全日报 · ${batch.date}</title><style>
+*{box-sizing:border-box}body{margin:0;background:#f6f7f9;color:#18283a;font:16px/1.65 system-ui,-apple-system,"PingFang SC",sans-serif}main{max-width:900px;margin:auto;padding:32px 24px 38px}.eyebrow{font-size:13px;color:#627084;margin:0 0 8px;letter-spacing:.03em}h1{font-size:30px;line-height:1.3;margin:0 0 8px}.scope{color:#627084;font-size:14px;margin:0}.intro{margin:22px 0;padding:12px 16px;border-left:3px solid #3872b5;background:#eaf1f9;font-size:14px}article{background:#fff;border:1px solid #dee4ec;border-radius:10px;margin:14px 0;padding:18px 22px}.component-head{display:flex;justify-content:space-between;align-items:center;gap:12px}.component-head>div{display:flex;align-items:center;gap:12px}.index{font-size:12px;color:#8090a3;font-weight:650}h2{font-size:21px;margin:0;line-height:1.35;overflow-wrap:anywhere}.version{font-size:13px;color:#425976;white-space:nowrap;background:#eef3f9;padding:3px 9px;border-radius:5px}.origin{font-size:12px;color:#6c7b8d;margin:5px 0 12px 28px}dl{margin:0}dl>div{display:grid;grid-template-columns:90px 1fr;gap:12px;margin:8px 0}dt{font-size:14px;color:#607085}dd{margin:0;font-size:15px;overflow-wrap:anywhere}.action dd{font-weight:600}.candidate{border-top:1px solid #edf0f4;padding-top:11px;margin:13px 0 0;font-size:13px;color:#53657c;overflow-wrap:anywhere}.separator{margin:0 8px}footer{font-size:12px;color:#6b7787;margin-top:20px;line-height:1.8}footer p{margin:4px 0}@media(max-width:600px){main{padding:22px 14px}h1{font-size:26px}article{padding:16px}.component-head{align-items:flex-start;flex-direction:column;gap:7px}.origin{margin-left:0}dl>div{grid-template-columns:1fr;gap:2px;margin:12px 0}.version{margin-left:28px}dt{font-size:12px}.candidate{line-height:1.8}}@media print{body{background:white}main{padding:0;max-width:none}article{break-inside:avoid}}
+</style></head><body><main><header><p class="eyebrow">MATRIX · ${batch.date}</p><h1>依赖安全日报</h1><p class="scope">${scope}</p></header><p class="intro">${focus.length ? `本期关注 ${focus.length} 个重点组件。研发先核实使用条件，再安排修复评估。` : '本期未选出需要优先评估的组件，完整扫描结果已归档。'}</p>${cards}<footer><p>公告匹配不等于线上可利用；候选版本仍需核实发布状态并完成兼容性回归。</p><p>这里只展示重点组件。完整扫描证据与公告正文保留在原归档中。</p></footer></main></body></html>`;
 }
 
-if (process.argv[2] === '--render') {
-  const [,, , receipt, source, destination] = process.argv;
+export function runCli() {
+  if (process.argv[2] !== '--render') return;
+  const [,,, receipt, source, destination] = process.argv;
   const batch = JSON.parse(fs.readFileSync(receipt, 'utf8'));
   fs.writeFileSync(destination, render(batch, source));
-  console.log(JSON.stringify({ output: destination, bytes: fs.statSync(destination).size, report_date: batch.date, repositories: Object.keys(batch.results) }));
+  console.log(JSON.stringify({ bytes: fs.statSync(destination).size, report_date: batch.date,
+    focus_components: collectFocus(batch, source).focus.map(c => c.name), presentation: 'daily-focus' }));
 }
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) runCli();
