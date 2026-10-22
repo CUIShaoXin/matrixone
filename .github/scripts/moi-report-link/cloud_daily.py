@@ -40,6 +40,18 @@ def json_bytes(value):
     return json.dumps(value, ensure_ascii=False, indent=2).encode()
 
 
+
+def yaml_inline(value):
+    """Keep jq quotes literal for MOI's raw-DSL template validation gate."""
+    if isinstance(value, str) and "{{" in value and "\n" not in value:
+        return "'" + value.replace("'", "''") + "'"
+    if isinstance(value, dict):
+        return "{" + ", ".join(json.dumps(key) + ": " + yaml_inline(item) for key, item in value.items()) + "}"
+    if isinstance(value, list):
+        return "[" + ", ".join(yaml_inline(item) for item in value) + "]"
+    return json.dumps(value, ensure_ascii=False)
+
+
 def file_evidence(fid, raw, **fields):
     return dict(file_id=fid, bytes=len(raw), sha256=sha256(raw), readback_verified=True, **fields)
 
@@ -172,7 +184,7 @@ class Runner:
         if stage["status"] == "planned":
             lines = ["workflow:", "  name: matrix_daily_" + label, "  root: root", "root:", "  chain:"]
             for node in nodes:
-                lines += ["    - work_item:", "        name: " + node["name"], "        id: " + node["id"], "        version: v1", "        input: " + json.dumps(node["input"], ensure_ascii=False)]
+                lines += ["    - work_item:", "        name: " + node["name"], "        id: " + node["id"], "        version: v1", "        input: " + yaml_inline(node["input"])]
                 if node.get("save"):
                     lines += ["        save:"] + ["          " + k + ": " + json.dumps(v) for k,v in node["save"].items()]
             stage["status"] = "deploying"
@@ -315,7 +327,7 @@ class Runner:
             normalized_nodes=[]
             for kind in values:
                 suffix=".json" if kind=="osv" else ".md"
-                name=run_prefix+"-accepted-v3-"+kind+suffix
+                name=run_prefix+"-accepted-v4-"+kind+suffix
                 original=generated["employee_report" if kind=="employee" else kind][0]
                 saved_key="normalize_"+kind
                 normalized_nodes.append(self.node("read_"+kind,"moi:parse",{
@@ -330,7 +342,7 @@ class Runner:
                     expression+=' | gsub('+json.dumps("原生导入并核对全部筛选清单",ensure_ascii=False)+'; '+json.dumps("由云端runner流式导入筛选清单，并核对全部字节哈希",ensure_ascii=False)+')'
                 normalized_nodes.append(self.sink(kind,"{{ "+expression+" }}",name,
                                                   130001 if kind=="osv" else 140002,"json" if kind=="osv" else "markdown"))
-            normalized=self.workflow(repo.name+"_store_accepted_v3",normalized_nodes)
+            normalized=self.workflow(repo.name+"_store_accepted_v4",normalized_nodes)
             saved["artifacts"]={kind:normalized[kind][0] for kind in values}
             for kind,body in values.items():
                 require(normalized[kind][1] == body if kind!="osv" else json.loads(normalized[kind][1])==json.loads(body),"normalized_report_readback_mismatch")
@@ -464,7 +476,9 @@ def main():
         status.update(status="passed",scope=scope,date=date,publication_file_id=artifact["file_id"],acceptance_file_id=journal.value["acceptance_file_id"],repositories=list(results),all_selected_repository_reports_accepted=True)
     except Exception as exc:
         # Only fixed error codes/types, never arbitrary URL-bearing exception text.
-        status.update(status="failed",error=str(exc) if isinstance(exc,Failure) else type(exc).__name__)
+        code = str(exc)
+        known_failure = isinstance(exc, (Failure, publication.Failure))
+        status.update(status="failed", error=code if known_failure and re.fullmatch(r"[a-z][a-z0-9_]{0,100}", code) else type(exc).__name__)
     status["finished_at_utc"]=dt.datetime.now(dt.timezone.utc).isoformat()
     (out/"matrix-daily-cloud-status.json").write_bytes(json_bytes(status))
     print(json.dumps(status),flush=True)
