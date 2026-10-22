@@ -1,8 +1,5 @@
 name: MOI dynamic daily cloud acceptance
 on:
-  push:
-    branches: [matrix-report-link-v1]
-    paths: [.github/workflows/moi-daily-cloud-acceptance.yml]
   workflow_dispatch:
     inputs:
       scope:
@@ -33,8 +30,8 @@ jobs:
         env:
           MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
           SCAN_GITHUB_TOKEN: ${{ secrets.SCAN_GITHUB_TOKEN }}
-          MATRIX_DAILY_SCOPE: ${{ inputs.scope || 'three-repositories' }}
-          MATRIX_RESUME_RUN_ID: ${{ inputs.resume_run_id || '39712487476-1' }}
+          MATRIX_DAILY_SCOPE: ${{ inputs.scope || 'matrixone-test' }}
+          MATRIX_RESUME_RUN_ID: ${{ inputs.resume_run_id }}
           MATRIX_NODE_MODULES: /tmp/matrix-report-renderer/node_modules
         run: python3 .github/scripts/moi-report-link/cloud_daily.py
       - name: Retain status without reports, links or credentials
