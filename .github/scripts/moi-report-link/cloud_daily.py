@@ -311,13 +311,26 @@ class Runner:
             require((facts["marker"]+"-EMPLOYEE").encode() in employee, "employee_marker_missing")
             require((facts["marker"]+"-DETAIL") in detail, "detail_marker_missing")
             values={"osv":json_bytes(osv),"details":detail.encode(),"employee":employee}
+            # Read generated artifacts inside MOI; large report bodies must not be embedded in deployment DSL.
             normalized_nodes=[]
-            for kind,body in values.items():
+            for kind in values:
                 suffix=".json" if kind=="osv" else ".md"
-                name=run_prefix+"-accepted-v2-"+kind+suffix
-                normalized_nodes.append(self.sink(kind,json.loads(body) if kind=="osv" else body.decode(),name,
+                name=run_prefix+"-accepted-v3-"+kind+suffix
+                original=generated["employee_report" if kind=="employee" else kind][0]
+                saved_key="normalize_"+kind
+                normalized_nodes.append(self.node("read_"+kind,"moi:parse",{
+                    "sources":[dict(file_id=original["file_id"],mime_type="text/plain",name=name+".txt")],
+                    "options":{"parse_tier":"native"}}, {saved_key:".documents[0].content"}))
+                expression=".state."+saved_key
+                if kind=="osv":
+                    expression+=' | fromjson | .facts.scope = '+json.dumps(facts["scope"])
+                    expression+=' | .facts.complete_details_entry = '+json.dumps(facts["complete_details_entry"])
+                    expression+=' | .report_presentation_normalized_by = '+json.dumps(osv["report_presentation_normalized_by"])
+                elif kind=="details":
+                    expression+=' | gsub('+json.dumps("原生导入并核对全部筛选清单",ensure_ascii=False)+'; '+json.dumps("由云端runner流式导入筛选清单，并核对全部字节哈希",ensure_ascii=False)+')'
+                normalized_nodes.append(self.sink(kind,"{{ "+expression+" }}",name,
                                                   130001 if kind=="osv" else 140002,"json" if kind=="osv" else "markdown"))
-            normalized=self.workflow(repo.name+"_store_accepted_v2",normalized_nodes)
+            normalized=self.workflow(repo.name+"_store_accepted_v3",normalized_nodes)
             saved["artifacts"]={kind:normalized[kind][0] for kind in values}
             for kind,body in values.items():
                 require(normalized[kind][1] == body if kind!="osv" else json.loads(normalized[kind][1])==json.loads(body),"normalized_report_readback_mismatch")
