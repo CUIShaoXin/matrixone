@@ -27,7 +27,7 @@ export function collectFocus(batch, root) {
     const scan = JSON.parse(artifact(root, repo, result, 'osv'));
     if (scan.commit !== result.commit || scan.facts.report_date_shanghai !== batch.date) throw Error('focus_source_date_or_commit_mismatch');
     const employee = artifact(root, repo, result, 'employee');
-    const bullets = employee.split(/\n\s*\n/).filter(p => /^\s*[-•]\s/.test(p));
+    const bullets = employee.match(/(?:^|\n)[ \t]*[-•][ \t]+[\s\S]*?(?=\n[ \t]*[-•][ \t]+|$)/g) || [];
     return (scan.facts.priority_components || []).flatMap(component => {
       const bullet = bullets.find(p => p.includes(component.name));
       if (!bullet) return [];
