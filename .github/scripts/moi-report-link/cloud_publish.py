@@ -288,7 +288,7 @@ def message(batch, employees, url, expires):
             rows.append(re.sub(r"^(?:\d+\.|[-•])\s*", "• ", excerpt).replace("\n", " "))
         rows.append("")
     local = dt.datetime.fromisoformat(expires).astimezone(dt.timezone(dt.timedelta(hours=8)))
-    rows.extend(["完整报告（免登录，含三仓员工版及全部漏洞明细）：", url,
+    rows.extend(["重点组件日报（免登录）：", url,
                  "链接有效期至 " + local.strftime("%Y-%m-%d %H:%M") + "（北京时间）。", "",
                  "公告命中不等于线上可利用。候选版本以报告中的发布核验状态为准，兼容性需研发验证。采用 OSV API 静态版本匹配，范围/动态及传递依赖仍有未解析项；无同口径历史基线，不统计新增/修复。各仓公告分别去重。"])
     text = "\n".join(rows) + "\n"
@@ -350,8 +350,9 @@ def publish(api, batch, files, destination, node, historical=False):
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     for repo in REPOSITORIES:
-        for kind in ("employee", "details"):
-            (destination / (repo + "-fullzip-" + kind + ".md")).write_bytes(files[(repo, kind)])
+        for kind in ("employee", "details", "osv"):
+            extension = ".json" if kind == "osv" else ".md"
+            (destination / (repo + "-fullzip-" + kind + extension)).write_bytes(files[(repo, kind)])
     accepted = destination / "acceptance.json"
     accepted.write_text(json.dumps(batch, ensure_ascii=False))
     report = destination / "matrix-security-complete.html"
