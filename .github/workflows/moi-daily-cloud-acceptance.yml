@@ -1,0 +1,43 @@
+name: MOI dynamic daily cloud acceptance
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Repository acceptance scope
+        type: choice
+        options: [matrixone-test, three-repositories]
+        default: three-repositories
+      resume_run_id:
+        description: Existing checkpoint run id, empty for new acquisition
+        required: false
+permissions:
+  contents: read
+concurrency:
+  group: moi-daily-cloud-acceptance
+  cancel-in-progress: false
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts/moi-report-link
+      - name: Install report renderer
+        run: npm install --prefix /tmp/matrix-report-renderer --ignore-scripts --no-audit --no-fund marked@17.0.5
+      - name: Acquire fixed ZIP, scan in MOI, verify KB, publish report without sending
+        env:
+          MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
+          SCAN_GITHUB_TOKEN: ${{ secrets.SCAN_GITHUB_TOKEN }}
+          MATRIX_DAILY_SCOPE: ${{ inputs.scope || 'three-repositories' }}
+          MATRIX_RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+          MATRIX_NODE_MODULES: /tmp/matrix-report-renderer/node_modules
+        run: python3 .github/scripts/moi-report-link/cloud_daily.py
+      - name: Retain status without reports, links or credentials
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: moi-daily-cloud-status-${{ github.run_id }}
+          path: out/matrix-daily-cloud-status.json
+          retention-days: 7
