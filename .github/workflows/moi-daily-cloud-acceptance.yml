@@ -1,8 +1,5 @@
 name: MOI dynamic daily cloud acceptance
 on:
-  push:
-    branches: [matrix-report-link-v1]
-    paths: [.github/workflows/moi-daily-cloud-acceptance.yml]
   workflow_dispatch:
     inputs:
       scope:
