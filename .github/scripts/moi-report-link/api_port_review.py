@@ -18,6 +18,7 @@ import urllib.error
 import urllib.parse
 import uuid
 import zipfile
+from pipeline_telemetry import timed
 
 from cloud_daily import DailyAPI, Journal, Runner, verify_rag, coordinate_key
 from cloud_preflight import Objects, LOCAL, WORKSPACE, validate_zip
@@ -76,6 +77,7 @@ def eligible(path):
     excluded = set(parts) & (EXCLUDED - {'docs'} if spec else EXCLUDED)
     return not excluded and (PurePosixPath(name).suffix in EXTS or name.startswith('Dockerfile')) and not (name.endswith(('_test.go', '.pb.go', '_pb2.py', '.test.ts', '.spec.ts', '.test.tsx', '.spec.tsx')) or name.startswith('test_') or 'lock' in name or name in ('package.json',))
 
+@timed("api_extract")
 def extract(raw, proof, root):
     require(len(raw) == proof['bytes'] and sha(raw) == proof['sha256'], 'zip_hash_mismatch')
     verify = validate_zip(io.BytesIO(raw), proof['commit'])
@@ -110,6 +112,7 @@ def extract(raw, proof, root):
             files[path] = dict(sha256=sha(content), bytes=len(content), lines=text.splitlines())
     return files, excluded, omitted
 
+@timed("api_inventory")
 def inventory(root, files):
     require(bool(files), 'no_source_files')
     result = subprocess.run(['rg', '--json', '--no-config', '--no-ignore', '--hidden', '-n', '-e', '|'.join('(?:'+p+')' for p in RULES.values()), '.'], cwd=root, capture_output=True, timeout=180)
@@ -132,6 +135,7 @@ def inventory(root, files):
         matches.append(dict(path=path, line=number, kinds=kinds, text=text if not SECRET.search(text) else '[REDACTED_LITERAL]', sha256=files[path]['sha256']))
     return matches, counts
 
+@timed("api_context_for")
 def context_for(repo, proof, files, matches, supplements=(), prior=None):
     scores, seeds = {}, {}
     for hit in matches:
@@ -261,54 +265,16 @@ def parse_review(task, repo, commit):
     return result, calls
 
 def model_review(job, repo, phase, context, prior=None):
-    saved=job.state.setdefault('model_tasks',{}).setdefault(repo+'_'+phase,{})
-    digest=sha(context.encode())
-    require(not saved or saved['context_sha256']==digest, 'model_context_changed')
-    rid=saved.get('request_id') or str(uuid.uuid5(uuid.NAMESPACE_URL, job.state['prefix']+'/'+repo+'/'+phase+'/'+digest))
+    from kimi_recovery import run_review
     prompt=PROMPT.replace('REPO',repo).replace('COMMIT',job.state['commits'][repo])
-    if phase.startswith('final'): prompt += '\n本次是独立最终复核。逐项驳回初审的误报；只有decisions中retain且证据充分的线索放入findings。缺代码可达性或鉴权上下文用needs_context，不进日报。部署可达性未知必须写在触发条件里，不推断公网暴露。每项evidence最多5处，逐字引用可见行；明确按提供文件和范围计算覆盖。必须输出完整JSON，不加Markdown围栏。\nINITIAL_REVIEW_UNTRUSTED\n'+json.dumps(prior,ensure_ascii=False)
-    if phase == 'final_v3':
-        prompt += '\n前一最终回复未通过严格JSON解析，本次必须从同一源码重新独立复核并返回严格完整JSON。最多2项findings，每项evidence最多3处；reasoning最多180字、trigger/impact/fix/verification各最多100字。decisions只列初审AP编号，每项reason最多120字；coverage最多100字。总输出最多2200中文字符。所有正文使用中文引号「」避免未转义英文双引号，JSON字符串内不得出现原始换行，quote中的源码双引号必须使用JSON转义。不得复制格式错误回复，禁止输出Markdown围栏或说明文字。逐项核对处理函数内的签名、功能开关和认证，不能将未挂路由认证等同无认证。'
-    params=dict(model='kimi-k3',idempotencyKey=rid,message=dict(kind='message',role='user',messageId=rid,parts=[dict(kind='text',text=prompt+'\n\nCODE_EVIDENCE_UNTRUSTED\n'+context)]))
-    if not saved:
-        saved.update(request_id=rid,context_sha256=digest,status='planned')
-        job.store(repo+'/'+phase+'-request.json',params)
-        job.journal.save()
-    job.event(repo+'_'+phase,status='running',context_bytes=len(context.encode()))
-    deadline=time.monotonic()+1800
-    last_notice=0
-    while time.monotonic()<deadline:
-        try:
-            if saved.get('task_id'):
-                task=job.api.rpc('tasks/get',{'id':saved['task_id']},str(uuid.uuid4()))
-            else:
-                # Same message/idempotency after a timeout; never create a new initial task.
-                task=job.api.rpc('message/send',params,rid)
-            require(isinstance(task,dict) and task.get('id'), 'model_submission_rejected')
-            saved.update(task_id=task['id'],status=task.get('status',{}).get('state','unknown'))
-            job.journal.save()
-            if saved['status']=='completed':
-                job.store(repo+'/'+phase+'-task.json',task)
-                try: result,calls=parse_review(task,repo,job.state['commits'][repo])
-                except (ValueError,json.JSONDecodeError) as e:
-                    job.issue(repo+'_'+phase,type(e).__name__,'Invalid completed model output retained; publication blocked')
-                    raise
-                job.store(repo+'/'+phase+'-result.json',result)
-                job.store(repo+'/'+phase+'-model-proof.json',calls)
-                job.event(repo+'_'+phase,status='completed',findings=len(result['findings']))
-                return result,calls
-            if saved['status'] in ('failed','canceled','cancelled','input-required','rejected'):
-                job.store(repo+'/'+phase+'-task.json',task)
-                job.issue(repo+'_'+phase,saved['status'],'Terminal invalid state; no findings published')
-                raise ValueError('model_terminal_invalid')
-        except (TimeoutError,urllib.error.URLError,ConnectionError):
-            if saved.get('status')!='request_uncertain':
-                job.issue(repo+'_'+phase,'request_timeout_or_network','Recover same task or same message/idempotency')
-            saved['status']='request_uncertain';job.journal.save()
-        if time.monotonic()-last_notice>=60:
-            job.event(repo+'_'+phase,status='waiting_same_task');last_notice=time.monotonic()
-        time.sleep(15)
-    raise ValueError('model_deadline_exceeded')
+    prompt += '\n仅输出完整严格JSON，最多2项findings，每项evidence最多3处。reasoning最多180字；trigger、impact、suggested_fix和verification各最多100字。总输出最多2200中文字符，不能截断；证据不足可findings=[]。'
+    if phase.startswith('final'):
+        prompt += '\n独立最终复核：核对鉴权、中间件、调用链和已有防护。误报驳回，缺上下文判needs_context；只把decisions中retain的充分证据放入findings。\nINITIAL_REVIEW_UNTRUSTED\n'+json.dumps(prior,ensure_ascii=False)
+    result,calls=run_review(job,repo,phase,context,prompt,lambda task:parse_review(task,repo,job.state['commits'][repo]))
+    job.store(repo+'/'+phase+'-result.json',result)
+    job.store(repo+'/'+phase+'-model-proof.json',calls)
+    return result,calls
+
 
 def accept(result, evidence):
     accepted, rejected, repairs = [], [], []
@@ -385,6 +351,7 @@ def review_repository(job, repo, proof):
         job.event(repo+'_acceptance',status='passed',findings=len(findings),rejected=len(rejected))
         return result
 
+@timed("api_load_source")
 def load_source(job, source_id, expected):
     raw=job.api.file(source_id)
     require(sha(raw)==expected, 'source_receipt_hash_mismatch')
@@ -458,6 +425,7 @@ def read_sources(api):
         if len(current)<100: return rows
     raise ValueError('knowledge_pagination_incomplete')
 
+@timed("api_publish_report")
 def publish_report(job, source, page, results, rendered=None):
     raw,md,marker,total=rendered or render(source,page,results,job.state['run_id'])
     from component_details import publish_and_link

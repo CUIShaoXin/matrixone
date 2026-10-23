@@ -22,90 +22,7 @@ def sha256(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
-class Objects:
-    def __init__(self, config):
-        self.endpoint = config["endpoint"].rstrip("/")
-        self.bucket = config["bucket_name"]
-        if self.endpoint != EXPECTED_ENDPOINT or self.bucket != EXPECTED_BUCKET:
-            raise ValueError("unexpected_report_destination")
-        self.region = config.get("region") or "us-east-1"
-        self._access = config["access_key_id"]
-        self._secret = config["access_key_secret"]
-        self.host = urllib.parse.urlsplit(self.endpoint).netloc
-
-    @classmethod
-    def from_workspace(cls, api):
-        result = api.request("/connectors/get", {"id": CONNECTOR_ID}, timeout=25)
-        if result["http_status"] != 200:
-            raise RuntimeError("minio_connector_unavailable")
-        connector = api.data(result)
-        connector = connector.get("connector", connector)
-        config = connector["config"]
-        config = json.loads(config) if isinstance(config, str) else config
-        return cls(config.get("s3", config.get("s3_config", {})))
-
-    def _path(self, key):
-        if not key or key.startswith("/") or ".." in key.split("/"):
-            raise ValueError("unsafe_object_key")
-        return urllib.parse.quote("/" + self.bucket + "/" + key, safe="/-_.~")
-
-    def _signature(self, date, message):
-        def hm(key, value):
-            return hmac.new(key, value.encode(), hashlib.sha256).digest()
-
-        key = hm(hm(hm(hm(("AWS4" + self._secret).encode(), date), self.region), "s3"), "aws4_request")
-        return hmac.new(key, message.encode(), hashlib.sha256).hexdigest()
-
-    def call(self, method, key, raw=None, headers=None, response_limit=32 * 1024 * 1024):
-        now = dt.datetime.now(dt.timezone.utc)
-        stamp, date = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
-        path = self._path(key)
-        hdr = {"host": self.host, "x-amz-content-sha256": sha256(raw or b""), "x-amz-date": stamp}
-        hdr.update({k.lower(): str(v).strip() for k, v in (headers or {}).items()})
-        signed = ";".join(sorted(hdr))
-        canonical_headers = "".join(k + ":" + hdr[k] + "\n" for k in sorted(hdr))
-        canonical = "\n".join([method, path, "", canonical_headers, signed, hdr["x-amz-content-sha256"]])
-        scope = date + "/" + self.region + "/s3/aws4_request"
-        message = "\n".join(["AWS4-HMAC-SHA256", stamp, scope, sha256(canonical.encode())])
-        hdr["Authorization"] = "AWS4-HMAC-SHA256 Credential=" + self._access + "/" + scope + ", SignedHeaders=" + signed + ", Signature=" + self._signature(date, message)
-        request = urllib.request.Request(self.endpoint + path, data=raw, headers=hdr, method=method)
-        try:
-            with urllib.request.build_opener(NoRedirect()).open(request, timeout=45) as response:
-                body = response.read(response_limit + 1)
-                if len(body) > response_limit:
-                    raise ValueError("report_object_exceeds_limit")
-                return response.status, dict(response.headers), body
-        except urllib.error.HTTPError as error:
-            raise RuntimeError("minio_http_" + str(error.code)) from None
-
-    def publish(self, key, raw, content_type):
-        digest = sha256(raw)
-        self.call("PUT", key, raw, {
-            "content-type": content_type,
-            "content-disposition": "inline",
-            "cache-control": "private, max-age=300",
-            "x-amz-meta-sha256": digest,
-        })
-        status, headers, received = self.call("GET", key)
-        if status != 200 or received != raw:
-            raise ValueError("minio_report_readback_mismatch")
-        return {"key": key, "bytes": len(raw), "sha256": digest, "readback_verified": True,
-                "content_type": headers.get("Content-Type"), "content_disposition": headers.get("Content-Disposition")}
-
-    def presign(self, key, seconds=604800, at=None):
-        if not 1 <= seconds <= 604800:
-            raise ValueError("invalid_link_lifetime")
-        now = at or dt.datetime.now(dt.timezone.utc)
-        stamp, date = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
-        scope = date + "/" + self.region + "/s3/aws4_request"
-        query = {"X-Amz-Algorithm": "AWS4-HMAC-SHA256", "X-Amz-Credential": self._access + "/" + scope,
-                 "X-Amz-Date": stamp, "X-Amz-Expires": str(seconds), "X-Amz-SignedHeaders": "host",
-                 "response-content-type": "text/html; charset=utf-8", "response-content-disposition": "inline"}
-        encoded = urllib.parse.urlencode(sorted(query.items()), quote_via=urllib.parse.quote, safe="-_.~")
-        canonical = "\n".join(["GET", self._path(key), encoded, "host:" + self.host + "\n", "host", "UNSIGNED-PAYLOAD"])
-        message = "\n".join(["AWS4-HMAC-SHA256", stamp, scope, sha256(canonical.encode())])
-        url = self.endpoint + self._path(key) + "?" + encoded + "&X-Amz-Signature=" + self._signature(date, message)
-        return url, (now + dt.timedelta(seconds=seconds)).isoformat()
+from resilient_storage import Objects
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -208,27 +125,9 @@ class GitHub:
         return raw if binary else json.loads(raw)
 
 def prepare_archive(github, objects, repository, run_id, date):
-    full_name = repository.owner + "/" + repository.name
-    commit = github.get(full_name, "/branches/" + repository.branch)["commit"]["sha"]
-    if not re.fullmatch(r"[0-9a-f]{40}", commit):
-        raise Failure("github_commit_invalid")
-    raw = github.get(full_name, "/zipball/" + commit, binary=True)
-    with tempfile.TemporaryFile() as stream:
-        stream.write(raw)
-        proof = validate_zip(stream, commit)
-    key = "snapshots/" + date.replace("-", "") + "/" + repository.name + "/" + repository.name + "-" + commit + "-gha-" + run_id + ".zip"
-    objects.call("PUT", key, raw, {"content-type": "application/zip", "x-amz-meta-sha256": proof["sha256"]})
-    http, _, readback = objects.call("GET", key, response_limit=len(raw))
-    if http != 200 or sha256(readback) != proof["sha256"] or len(readback) != proof["bytes"]:
-        raise Failure("minio_archive_readback_mismatch")
-    proof.update(repository=full_name, branch=repository.branch, key=key, report_date=date,
-                 acquisition_location="GitHub Actions cloud runner", download_method="fixed-commit GitHub repository archive API",
-                 daily_cloud_download_verified=True, minio_readback_verified=True,
-                 repository_code_executed=False, private_dependency_source_downloaded=False,
-                 acquired_at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
-    proof_raw = json.dumps(proof, ensure_ascii=False, indent=2).encode()
-    objects.publish(key[:-4] + "-inventory.json", proof_raw, "application/json")
-    return proof
+    from archive_transfer import prepare
+    return prepare(github, objects, repository, run_id, date, validate_zip, Failure)
+
 
 def main():
     receipt = {"schema": "matrix_cloud_zip_preflight_v1", "sent": False, "status": "running", "repositories": {}}

@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import time
 import uuid
+import threading
+from pipeline_telemetry import timed
 import zipfile
 
 import cloud_preflight as preflight
@@ -154,6 +156,7 @@ class DailyAPI(publication.ReportAPI):
 class Journal:
     def __init__(self, objects, key, initial):
         self.objects, self.key = objects, key
+        self._lock = threading.RLock()
         try:
             self.value = json.loads(objects.call("GET", key)[2])
             require(self.value["date"] == initial["date"] and self.value["scope"] == initial["scope"], "checkpoint_scope_mismatch")
@@ -163,7 +166,8 @@ class Journal:
             self.save()
 
     def save(self):
-        self.objects.publish(self.key, json_bytes(self.value), "application/json")
+        with self._lock:
+            self.objects.publish(self.key, json_bytes(self.value), "application/json")
 
 
 class Runner:
@@ -174,6 +178,7 @@ class Runner:
     def event(self, **fields):
         print(json.dumps(dict(stage=fields.pop("stage", "progress"), **fields)), flush=True)
 
+    @timed("component_workflow")
     def workflow(self, label, nodes):
         stages = self.state.setdefault("stages", {})
         stage = stages.setdefault(label, {})
@@ -238,6 +243,7 @@ class Runner:
         evidence, raw = self.workflow(label, nodes)["archive"]
         return evidence, json.loads(raw)
 
+    @timed("component_scan")
     def scan(self, repo, proof):
         saved = self.state.setdefault("repositories", {}).setdefault(repo.name, {})
         if saved.get("accepted"): return saved["result"]
@@ -360,6 +366,7 @@ class Runner:
         self.event(stage=repo.name,status="accepted",counts=saved["counts"])
         return result
 
+    @timed("component_knowledge")
     def knowledge(self, tag, saved, targets):
         if saved.get("rag_proof"):return
         if not saved.get("kb_appended"):
@@ -409,6 +416,7 @@ class Runner:
                 saved[key]["status"]="not_accepted";self.journal.save()
         raise Failure("rag_acceptance_failed")
 
+    @timed("component_publish")
     def publish(self,batch):
         files={(repo,kind):self.api.file(result["artifacts"][kind]["file_id"]) for repo,result in batch["results"].items() for kind in ("employee","details","osv")}
         for (repo,kind),body in files.items():
