@@ -394,6 +394,7 @@ def load_source(job, source_id, expected):
     batch=source['source_acceptance']
     files={(repo,kind):job.api.file(value['artifacts'][kind]['file_id']) for repo,value in batch['results'].items() for kind in ('employee','details','osv')}
     verify_batch(batch,files,job.state['date'])
+    job.component_osv={repo:json.loads(files[(repo,'osv')]) for repo in REPOS}
     for repo in REPOS:
         value=batch['results'][repo]
         require(value['commit']==source['commits'][repo] and value.get('kb_marker_retrieved'), 'component_source_not_accepted')
@@ -457,15 +458,18 @@ def read_sources(api):
         if len(current)<100: return rows
     raise ValueError('knowledge_pagination_incomplete')
 
-def publish_report(job, source, page, results):
-    raw,md,marker,total=render(source,page,results,job.state['run_id'])
+def publish_report(job, source, page, results, rendered=None):
+    raw,md,marker,total=rendered or render(source,page,results,job.state['run_id'])
+    from component_details import publish_and_link
+    raw,component_details,detail_md,signing_at=publish_and_link(job,source,raw)
+    md+=('\n\n'+detail_md).encode()
     job.store('matrix-security-daily.html',raw)
     job.store('matrix-security-daily.md',md)
-    accepted=dict(schema='matrix_api_port_combined_acceptance_v1',date=job.state['date'],run_id=job.state['run_id'],source_receipt_file_id=job.state['source_id'],source_receipt_sha256=job.state['source_sha256'],component_batch_reused=True,code_batch_reused=True,source_commits=source['commits'],repositories=results,added_findings=total,network_scan_executed=False,whole_repository_review=False,daily_automation_ready=False,sent=False)
+    accepted=dict(schema='matrix_api_port_combined_acceptance_v2',component_details=component_details,publication_only_revision=bool(job.state.get('publication_revision_source')),date=job.state['date'],run_id=job.state['run_id'],source_receipt_file_id=job.state['source_id'],source_receipt_sha256=job.state['source_sha256'],component_batch_reused=True,code_batch_reused=True,source_commits=source['commits'],repositories=results,added_findings=total,network_scan_executed=False,whole_repository_review=False,daily_automation_ready=False,sent=False)
     job.store('acceptance.json',accepted)
     runner=Runner(job.api,job.objects,job.journal)
     # Native final Markdown is saved once, in the KB raw volume only.
-    artifact,stored=runner.workflow('api_port_final_report_save',[runner.sink('report',md.decode(),'matrix-api-port-'+job.state['date']+'-'+job.state['run_id']+'.md',140002,'markdown')])['report']
+    artifact,stored=runner.workflow('api_port_component_details_final_report_save',[runner.sink('report',md.decode(),'matrix-api-port-'+job.state['date']+'-'+job.state['run_id']+'.md',140002,'markdown')])['report']
     require(stored==md, 'native_report_bytes_mismatch')
     fid=artifact['file_id'];job.state['markdown_artifact']=artifact;job.journal.save()
     deadline=time.monotonic()+1800
@@ -514,9 +518,10 @@ def publish_report(job, source, page, results):
     else: raise ValueError('knowledge_audit_deadline')
     key='reports/'+job.state['date'].replace('-','')+'/api-port-kimi-k3/'+sha(raw)[:16]+'/matrix-security-daily.html'
     published=job.objects.publish(key,raw,'text/html; charset=utf-8')
-    url,expiry=job.objects.presign(key)
+    url,expiry=job.objects.presign(key,at=signing_at)
+    require(all(x['expires_at_utc']==expiry for x in component_details),'detail_expiry_does_not_cover_report')
     verification=verify_login_free(url,raw)
-    receipt=dict(schema='matrix_api_port_publication_v1',report_date=job.state['date'],scope='three-repositories',run_id=job.state['run_id'],commits=source['commits'],source_receipt_file_id=job.state['source_id'],source_receipt_sha256=job.state['source_sha256'],model='kimi-k3',rg_cloud_execution=True,execution_location='GitHub Actions cloud runner',workflow_head=os.environ.get('GITHUB_SHA'),markdown_artifact=artifact,kb_marker_retrieved=True,knowledge_retrieval=proof,published=published,url=url,expires_at_utc=expiry,login_free_verification=verification,added_findings=total,source_review_only=True,network_scan_executed=False,sent=False,daily_automation_ready=False)
+    receipt=dict(schema='matrix_api_port_publication_v2',component_details=component_details,publication_revision_source=job.state.get('publication_revision_source'),publication_only_revision=bool(job.state.get('publication_revision_source')),report_date=job.state['date'],scope='three-repositories',run_id=job.state['run_id'],commits=source['commits'],source_receipt_file_id=job.state['source_id'],source_receipt_sha256=job.state['source_sha256'],model='kimi-k3',rg_cloud_execution=True,execution_location='GitHub Actions cloud runner',workflow_head=os.environ.get('GITHUB_SHA'),markdown_artifact=artifact,kb_marker_retrieved=True,knowledge_retrieval=proof,published=published,url=url,expires_at_utc=expiry,login_free_verification=verification,added_findings=total,source_review_only=True,network_scan_executed=False,sent=False,daily_automation_ready=False)
     receipt_artifact=job.api.upload('matrix-api-port-publication-'+job.state['run_id']+'.json',rawjson(receipt))
     receipt['receipt_artifact']=receipt_artifact
     job.store('publication-receipt-private.json',receipt)
@@ -549,12 +554,16 @@ def main():
         job.event('source_preflight',status='running')
         source,page=load_source(job,source_id,expected)
         job.event('source_preflight',status='passed',commits=source['commits'])
-        # Inventory in parallel, model work bounded to two repositories to avoid excessive load.
-        with futures.ThreadPoolExecutor(max_workers=2) as pool:
-            pending={pool.submit(review_repository,job,repo,source['source_acceptance']['results'][repo]['archive_proof']):repo for repo in REPOS}
-            results={}
-            for future in futures.as_completed(pending): results[pending[future]]=future.result()
-        receipt=publish_report(job,source,page,results)
+        if os.environ.get('MATRIX_PUBLICATION_ONLY')=='true':
+            from component_details import revise
+            receipt=revise(job,source)
+        else:
+            # Inventory in parallel; model work bounded to two repositories.
+            with futures.ThreadPoolExecutor(max_workers=2) as pool:
+                pending={pool.submit(review_repository,job,repo,source['source_acceptance']['results'][repo]['archive_proof']):repo for repo in REPOS}
+                results={}
+                for future in futures.as_completed(pending): results[pending[future]]=future.result()
+            receipt=publish_report(job,source,page,results)
         status.update(status='passed',receipt_file_id=receipt['receipt_artifact']['file_id'],added_findings=receipt['added_findings'],commits=source['commits'],rg_cloud_execution=True,source_review_only=True,kb_verified=True,minio_login_free_verified=True)
         job.event('publication',status='passed',added_findings=receipt['added_findings'])
     except Exception as exc:
