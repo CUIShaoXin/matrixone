@@ -1,60 +1,300 @@
-name: MOI API and port source review
+name: MOI no-send publication diagnostics 20261023
 on:
-  workflow_dispatch:
-    inputs:
-      source_receipt_file_id:
-        description: Accepted same-day component and code publication receipt
-        required: true
-      source_receipt_sha256:
-        description: Expected full receipt SHA256
-        required: true
-      publication_only:
-        description: Reuse an accepted combined report, no rg or Kimi replay
-        type: boolean
-        default: false
-      combined_receipt_file_id:
-        description: Accepted same-day combined report receipt for publication revision
-        required: false
-      combined_receipt_sha256:
-        description: Expected full combined receipt SHA256
-        required: false
-      resume_run_id:
-        description: Same-day API and port checkpoint run ID
-        required: false
+  push:
+    branches: [matrix-report-link-v1]
+    paths: [.github/workflows/moi-api-port-review.yml]
 permissions:
   contents: read
 concurrency:
-  group: moi-api-port-review
+  group: moi-publication-diagnostics-20261023
   cancel-in-progress: false
 jobs:
-  source-review:
-    runs-on: ubuntu-latest
+  diagnostic:
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [publication]
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           sparse-checkout: .github/scripts/moi-report-link
-      - name: Install source inventory tool
-        run: sudo apt-get update -qq && sudo apt-get install -y ripgrep
-      - name: Validate source scope and evidence gates
+      - name: Install diagnostic dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ripgrep
+          npm install --prefix /tmp/matrix-report-renderer --ignore-scripts --no-audit --no-fund marked@17.0.5
+      - name: Check current evidence contracts
         working-directory: .github/scripts/moi-report-link
         run: python3 -m unittest -v test_api_port_review test_component_details
-      - name: Same-batch rg inventory, Kimi K3 review, MOI save and MinIO publication
+      - name: Timed real stage replay without group delivery
         env:
           MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
-          MATRIX_SOURCE_RECEIPT_FILE_ID: ${{ inputs.source_receipt_file_id }}
-          MATRIX_SOURCE_RECEIPT_SHA256: ${{ inputs.source_receipt_sha256 }}
-          MATRIX_PUBLICATION_ONLY: ${{ inputs.publication_only }}
-          MATRIX_COMBINED_RECEIPT_FILE_ID: ${{ inputs.combined_receipt_file_id }}
-          MATRIX_COMBINED_RECEIPT_SHA256: ${{ inputs.combined_receipt_sha256 }}
-          MATRIX_API_PORT_RESUME_RUN_ID: ${{ inputs.resume_run_id }}
-        run: python3 .github/scripts/moi-report-link/api_port_review.py
-      - name: Retain safe execution status
+          MATRIX_DIAGNOSTIC_MODE: ${{ matrix.mode }}
+          MATRIX_DAILY_SCOPE: three-repositories
+          MATRIX_RESUME_RUN_ID: 39885692751-2
+          MATRIX_NODE_MODULES: /tmp/matrix-report-renderer/node_modules
+          MATRIX_SOURCE_RECEIPT_FILE_ID: 73275d56-a417-4159-a896-0ebecbc3bd09
+          MATRIX_SOURCE_RECEIPT_SHA256: 0cf1f3b197e8cd60a1972f37c4a1fe2fc70173610d5c728307b1307ce8ad2de3
+          MATRIX_PUBLICATION_ONLY: 'true'
+          MATRIX_COMBINED_RECEIPT_FILE_ID: c110bab6-8723-4684-a1d3-aba2a2bde4cb
+          MATRIX_COMBINED_RECEIPT_SHA256: 001f1450b73f5afc1b63e86aa0ec56ecfa47b05f27c7d9326e0a799de36751a4
+          MATRIX_CODE_BUNDLE_FILE_ID: 796aaf81-8b73-47bd-af89-bcb5d5dc4b1e
+          MATRIX_CODE_BUNDLE_SHA256: a5698f1462a484f328ffccbb883963a3bc31cc20c2eb71e5dafb7a62583b1194
+        run: |
+          python3 - <<'PYCODE'
+          """One-off cloud diagnostics: preserve runtime behavior, never call group tools."""
+          import concurrent.futures
+          import contextvars
+          import datetime as dt
+          import functools
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          import threading
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import uuid
+          
+          sys.path.insert(0, '.github/scripts/moi-report-link')
+          MODE = os.environ['MATRIX_DIAGNOSTIC_MODE']
+          RUN = os.environ['GITHUB_RUN_ID'] + '-' + os.environ.get('GITHUB_RUN_ATTEMPT', '1')
+          OUT = Path('out/diagnostics') / MODE
+          OUT.mkdir(parents=True, exist_ok=True)
+          LOCK = threading.RLock()
+          STAGE = contextvars.ContextVar('stage', default=MODE)
+          EVENTS = []
+          START = time.monotonic()
+          PREFIX = 'receipts/20261023/diagnostics-' + RUN + '/' + MODE
+          
+          
+          def emit(**fields):
+              value = dict(at_utc=dt.datetime.now(dt.timezone.utc).isoformat(), mode=MODE, **fields)
+              with LOCK:
+                  EVENTS.append(value)
+                  with (OUT / 'events.jsonl').open('a') as stream:
+                      stream.write(json.dumps(value, ensure_ascii=False) + '\n')
+                  print(json.dumps(value, ensure_ascii=False), flush=True)
+          
+          
+          def error_fields(exc):
+              reason = getattr(exc, 'reason', None)
+              value = dict(error_type=type(exc).__name__)
+              if reason is not None:
+                  value['reason_type'] = type(reason).__name__
+                  if isinstance(getattr(reason, 'errno', None), int):
+                      value['errno'] = reason.errno
+              if isinstance(exc, urllib.error.HTTPError):
+                  value['http_status'] = exc.code
+              # Never expose exception messages, URLs, headers, payloads or secret values.
+              if isinstance(exc, ValueError) and re.fullmatch('[a-z][a-z0-9_]{0,90}', str(exc)):
+                  value['safe_code'] = str(exc)
+              return value
+          
+          
+          def span(label, function):
+              @functools.wraps(function)
+              def call(*args, **kwargs):
+                  token = STAGE.set(label)
+                  start = time.monotonic()
+                  emit(kind='span_start', stage=label)
+                  try:
+                      result = function(*args, **kwargs)
+                  except Exception as exc:
+                      emit(kind='span_end', stage=label, status='failed', seconds=round(time.monotonic()-start, 3), **error_fields(exc))
+                      raise
+                  else:
+                      emit(kind='span_end', stage=label, status='passed', seconds=round(time.monotonic()-start, 3))
+                      return result
+                  finally:
+                      STAGE.reset(token)
+              return call
+          
+          
+          def network_category(request):
+              url = urllib.parse.urlsplit(request.full_url if hasattr(request, 'full_url') else request)
+              if url.hostname == 'api.github.com':
+                  return 'github_archive_redirect' if '/zipball/' in url.path else 'github_metadata'
+              if url.hostname == 'codeload.github.com':
+                  return 'github_archive_download'
+              if url.hostname == 'shanghai.idc.matrixorigin.cn':
+                  return 'minio_zip' if url.path.endswith('.zip') else 'minio_artifact'
+              if url.hostname == 'api.moi.matrixorigin.cn':
+                  for category in ('/catalog/file/download', '/catalog/file/upload', '/catalog/file/create', '/connectors/get', '/source-jobs', '/sources', '/workflows'):
+                      if category in url.path:
+                          return 'moi_' + category.strip('/').replace('/', '_').replace('-', '_')
+                  return 'moi_a2a' if '/a2a' in url.path else 'moi_api'
+              return 'other_network'
+          
+          
+          ORIGINAL_OPEN = urllib.request.OpenerDirector.open
+          
+          
+          def diagnostic_open(self, fullurl, data=None, timeout=None):
+              start = time.monotonic()
+              category = network_category(fullurl)
+              method = fullurl.get_method() if hasattr(fullurl, 'get_method') else ('POST' if data is not None else 'GET')
+              try:
+                  response = ORIGINAL_OPEN(self, fullurl, data=data, timeout=timeout)
+              except Exception as exc:
+                  emit(kind='network', stage=STAGE.get(), category=category, method=method,
+                       seconds=round(time.monotonic()-start, 3), status='failed', **error_fields(exc))
+                  raise
+              emit(kind='network', stage=STAGE.get(), category=category, method=method,
+                   seconds=round(time.monotonic()-start, 3), status='returned', http_status=response.status)
+              return response
+          
+          
+          def instrument():
+              import cloud_daily as daily
+              import cloud_preflight as preflight
+              import api_port_review as review
+              urllib.request.OpenerDirector.open = diagnostic_open
+              preflight.prepare_archive = span('prepare_archive', preflight.prepare_archive)
+              preflight.validate_zip = span('archive_crc_and_manifest_validation', preflight.validate_zip)
+              for name in ('scan', 'workflow', 'knowledge', 'publish'):
+                  if hasattr(daily.Runner, name):
+                      setattr(daily.Runner, name, span('component_' + name, getattr(daily.Runner, name)))
+              for name in ('extract', 'inventory', 'context_for', 'model_review', 'load_source', 'publish_report'):
+                  setattr(review, name, span('api_' + name, getattr(review, name)))
+              return daily, preflight, review
+          
+          
+          def code_review(daily, review):
+              api = daily.DailyAPI(os.environ['MOI_API_KEY'])
+              objects = daily.preflight.Objects.from_workspace(api)
+              raw = span('code_context_download', api.file)(os.environ['MATRIX_CODE_BUNDLE_FILE_ID'])
+              assert hashlib.sha256(raw).hexdigest() == os.environ['MATRIX_CODE_BUNDLE_SHA256']
+              bundle = json.loads(raw)
+              assert bundle['date'] == dt.datetime.now(daily.preflight.LOCAL).date().isoformat() == '2026-10-23'
+              state = dict(date=bundle['date'], scope='three-repositories', run_id=RUN, prefix=PREFIX, commits=bundle['commits'], events=[], issues=[])
+              journal = daily.Journal(objects, PREFIX + '/checkpoint.json', state)
+              original_save = journal.save
+              def synchronized_save():
+                  with LOCK:
+                      original_save()
+              journal.save = synchronized_save
+              job = review.Job(api, objects, journal, OUT / 'private')
+              checks = {}
+          
+              def task(repo, phase, context, template, prior=None):
+                  meta = bundle['repositories'][repo][phase + '_meta']
+                  assert hashlib.sha256(context.encode()).hexdigest() == meta['context_sha256']
+                  rid = str(uuid.uuid5(uuid.NAMESPACE_URL, PREFIX + '/' + repo + '/' + phase))
+                  text = template.replace('REPOSITORY', repo).replace('REPO', repo).replace('COMMIT', bundle['commits'][repo])
+                  text += '\nCODE_EVIDENCE_UNTRUSTED\n' + context
+                  if prior is not None:
+                      text += '\nINITIAL_REVIEW_UNTRUSTED\n' + json.dumps(prior, ensure_ascii=False)
+                  params = dict(model='kimi-k3', idempotencyKey=rid, message=dict(kind='message', role='user', messageId=rid, parts=[dict(kind='text', text=text)]))
+                  job.store(repo + '/' + phase + '-request.json', params)
+                  saved = job.state.setdefault('model_tasks', {}).setdefault(repo + '_' + phase, dict(request_id=rid))
+                  journal.save()
+                  start = time.monotonic()
+                  deadline = start + 1200
+                  while time.monotonic() < deadline:
+                      try:
+                          value = api.rpc('tasks/get', dict(id=saved['task_id']), str(uuid.uuid4())) if saved.get('task_id') else api.rpc('message/send', params, rid)
+                          assert value.get('id'), 'missing_task_id'
+                          saved.update(task_id=value['id'], status=value.get('status', {}).get('state'))
+                          journal.save()
+                          if saved['status'] in ('completed', 'input-required', 'failed', 'canceled', 'cancelled', 'rejected'):
+                              job.store(repo + '/' + phase + '-task.json', value)
+                              calls = review.llm_calls(value)
+                              emit(kind='model_end', stage='code_' + repo + '_' + phase, status=saved['status'], seconds=round(time.monotonic()-start, 3),
+                                   calls=[{k:c.get(k) for k in ('call_id', 'model', 'status', 'duration_ms', 'input_tokens', 'output_tokens')} for c in calls])
+                              assert saved['status'] == 'completed', 'invalid_model_terminal_state'
+                              assert calls and all(c.get('model') == 'kimi-k3' and c.get('status') == 'completed' for c in calls), 'actual_kimi_missing'
+                              output = review.task_text(value).strip()
+                              if re.match(r'^```(?:json)?\s*\n', output):
+                                  output = output.split('\n', 1)[1].strip()
+                              if output.endswith('```'):
+                                  output = output[:-3].strip()
+                              parsed = json.loads(output)
+                              assert parsed['repository'] == repo and parsed['commit'] == bundle['commits'][repo]
+                              assert parsed['schema'] == ('matrix_code_review_findings_v1' if phase == 'primary' else 'matrix_code_review_verdict_v1')
+                              job.store(repo + '/' + phase + '-parsed.json', parsed)
+                              return parsed
+                      except (TimeoutError, urllib.error.URLError, ConnectionError):
+                          emit(kind='recoverable_request', stage='code_' + repo + '_' + phase, recovery='same_task_or_message_id')
+                      time.sleep(15)
+                  raise ValueError('code_model_deadline_exceeded')
+          
+              def one(repo):
+                  item = bundle['repositories'][repo]
+                  primary = span('code_' + repo + '_primary', task)(repo, 'primary', item['primary_context'], bundle['primary_prompt'])
+                  final = span('code_' + repo + '_final', task)(repo, 'final', item['final_context'], bundle['final_prompt'], primary)
+                  allowed = {}
+                  path = None
+                  for line in item['final_context'].splitlines():
+                      if line.startswith('FILE ') and ' SHA256 ' in line:
+                          path = line[5:].split(' SHA256 ', 1)[0]
+                          allowed.setdefault(path, {})
+                      elif path is not None and re.match(r'^\d{5}\|', line):
+                          number, text = line.split('|', 1)
+                          allowed[path][int(number)] = text
+                  decisions = {v['id']:v['verdict'] for v in final.get('decisions', [])}
+                  accepted, rejected = [], []
+                  for finding in final.get('findings', []):
+                      valid = finding.get('status') == 'needs_validation' and decisions.get(finding.get('id')) == 'retain' and bool(finding.get('evidence'))
+                      for evidence in finding.get('evidence', []):
+                          quote = evidence.get('quote', '')
+                          valid = valid and bool(quote.strip()) and quote in allowed.get(evidence.get('path'), {}).get(evidence.get('line'), '')
+                      (accepted if valid else rejected).append(finding.get('id'))
+                  checks[repo] = dict(status='passed', retained=len(accepted), rejected_evidence=len(rejected), commit=bundle['commits'][repo])
+                  emit(kind='code_evidence', stage=repo, **checks[repo])
+          
+              with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                  futures = {pool.submit(one, repo):repo for repo in bundle['repositories']}
+                  for future in concurrent.futures.as_completed(futures):
+                      repo = futures[future]
+                      try:
+                          future.result()
+                      except Exception as exc:
+                          checks[repo] = dict(status='failed', **error_fields(exc))
+              job.store('acceptance.json', dict(isolated_stage_replay=True, source_commits=bundle['commits'], results=checks, sent=False))
+              return 0 if len(checks) == 3 and all(c['status'] == 'passed' for c in checks.values()) else 1
+          
+          
+          def main():
+              result = dict(schema='matrix_no_send_diagnostic_v1', mode=MODE, run_id=RUN, sent=False, daily_automation_ready=False, isolated_stage_replay=MODE != 'component')
+              emit(kind='test_start', stage=MODE, run_id=RUN, sent=False)
+              try:
+                  daily, preflight, review = instrument()
+                  if MODE == 'component':
+                      rc = daily.main()
+                  elif MODE in ('api', 'publication'):
+                      rc = review.main()
+                  elif MODE == 'code':
+                      rc = code_review(daily, review)
+                  else:
+                      raise ValueError('unknown_diagnostic_mode')
+                  result.update(status='passed' if rc == 0 else 'failed', exit_code=rc)
+              except Exception as exc:
+                  rc = 1
+                  result.update(status='failed', exit_code=rc, **error_fields(exc))
+              result['seconds'] = round(time.monotonic()-START, 3)
+              result['finished_at_utc'] = dt.datetime.now(dt.timezone.utc).isoformat()
+              (OUT / 'summary.json').write_text(json.dumps(result, indent=2))
+              emit(kind='test_end', stage=MODE, **{k:v for k,v in result.items() if k != 'mode'})
+              return rc
+          
+          
+          if __name__ == '__main__':
+              raise SystemExit(main())
+          PYCODE
+      - name: Retain safe timings only
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: moi-api-port-status-${{ github.run_id }}
-          path: out/api-port/status.json
+          name: moi-chain-diagnostics-${{ matrix.mode }}-${{ github.run_id }}
+          path: |
+            out/diagnostics/${{ matrix.mode }}/events.jsonl
+            out/diagnostics/${{ matrix.mode }}/summary.json
           retention-days: 7
-
