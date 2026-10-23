@@ -267,6 +267,8 @@ def model_review(job, repo, phase, context, prior=None):
     rid=saved.get('request_id') or str(uuid.uuid5(uuid.NAMESPACE_URL, job.state['prefix']+'/'+repo+'/'+phase+'/'+digest))
     prompt=PROMPT.replace('REPO',repo).replace('COMMIT',job.state['commits'][repo])
     if phase.startswith('final'): prompt += '\n本次是独立最终复核。逐项驳回初审的误报；只有decisions中retain且证据充分的线索放入findings。缺代码可达性或鉴权上下文用needs_context，不进日报。部署可达性未知必须写在触发条件里，不推断公网暴露。每项evidence最多5处，逐字引用可见行；明确按提供文件和范围计算覆盖。必须输出完整JSON，不加Markdown围栏。\nINITIAL_REVIEW_UNTRUSTED\n'+json.dumps(prior,ensure_ascii=False)
+    if phase == 'final_v3':
+        prompt += '\n前一最终回复未通过严格JSON解析，本次必须从同一源码重新独立复核并返回严格完整JSON。最多2项findings，每项evidence最多3处；reasoning最多180字、trigger/impact/fix/verification各最多100字。decisions只列初审AP编号，每项reason最多120字；coverage最多100字。总输出最多2200中文字符。所有正文使用中文引号「」避免未转义英文双引号，JSON字符串内不得出现原始换行，quote中的源码双引号必须使用JSON转义。不得复制格式错误回复，禁止输出Markdown围栏或说明文字。逐项核对处理函数内的签名、功能开关和认证，不能将未挂路由认证等同无认证。'
     params=dict(model='kimi-k3',idempotencyKey=rid,message=dict(kind='message',role='user',messageId=rid,parts=[dict(kind='text',text=prompt+'\n\nCODE_EVIDENCE_UNTRUSTED\n'+context)]))
     if not saved:
         saved.update(request_id=rid,context_sha256=digest,status='planned')
@@ -364,11 +366,20 @@ def review_repository(job, repo, proof):
         context,meta,evidence=context_for(repo,proof,files,hits,supplements,primary)
         job.store(repo+'/final_v2-context.txt',context.encode())
         job.store(repo+'/final_v2-context.json',meta)
-        final,last_calls=model_review(job,repo,'final_v2',context,primary)
+        final_phase='final_v2'
+        try:
+            final,last_calls=model_review(job,repo,final_phase,context,primary)
+        except json.JSONDecodeError:
+            job.issue(repo+'_structured_recovery','invalid_final_json','Retain malformed task; Kimi independently re-reviews same source with compact JSON contract')
+            final_phase='final_v3'
+            job.store(repo+'/'+final_phase+'-context.txt',context.encode())
+            job.store(repo+'/'+final_phase+'-context.json',meta)
+            final,last_calls=model_review(job,repo,final_phase,context,primary)
         findings,rejected,repairs=accept(final,evidence)
         supplied={f['path'] for f in meta['files']}
         unresolved=[r for r in requests if r.get('path','').split('(RANGE')[0].strip() not in supplied]
         result=dict(schema=SCHEMA,date=proof['report_date'],repository=repo,commit=proof['commit'],archive_proof=proof,model='kimi-k3',model_entry='MOI existing Agent A2A',inventory_artifact=inventory_artifact,counts=counts,searched_files=len(files),selected_files=meta['selected_files'],selected_lines=meta['selected_lines'],context_sha256=meta['context_sha256'],context_requests=requests,unresolved_context_requests=unresolved,final_context_requests=final.get('context_requests',[]),omitted_files=omitted,excluded_match_files=meta['excluded_match_files'],findings=findings,rejected_evidence=rejected,evidence_repairs=repairs,decisions=final.get('decisions',[]),actual_model_execution_proof={'primary':first_calls,'final':last_calls},whole_repository_review=False,network_scan_executed=False,application_tests_executed=False)
+        result['final_phase']=final_phase
         artifact=job.store(repo+'/accepted.json',result)
         saved.update(accepted=True,result=artifact);job.journal.save()
         job.event(repo+'_acceptance',status='passed',findings=len(findings),rejected=len(rejected))
