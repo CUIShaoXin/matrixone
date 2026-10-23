@@ -6,6 +6,18 @@ from pathlib import Path
 import api_port_review as m
 
 class SourceReviewTests(unittest.TestCase):
+    def test_actual_event_types_and_unclosed_presentation_fence(self):
+        import json
+        result={'schema':m.SCHEMA,'repository':'taas','commit':'a'*40,'findings':[]}
+        events=[{'type':['object','null']}, {'type':'matrixflow.explore.llm_call','call_id':'one','model':'kimi-k3','status':'completed'}, {'type':'matrixflow.explore.llm_call','call_id':'one','model':'kimi-k3','status':'started'}]
+        task={'status':{'state':'completed','message':{'parts':[{'kind':'text','text':'```json\n'+json.dumps(result)}]}},'metadata':events}
+        parsed,calls=m.parse_review(task,'taas','a'*40)
+        self.assertEqual(parsed,result)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(calls[0]['status'],'completed')
+        task['status']['message']['parts'][0]['text']='```json\n'+json.dumps(result)[:-1]
+        with self.assertRaises(json.JSONDecodeError):m.parse_review(task,'taas','a'*40)
+
     def test_routes_listener_and_auth_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
