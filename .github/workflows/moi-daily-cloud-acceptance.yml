@@ -1,12 +1,15 @@
 name: MOI dynamic daily cloud acceptance
 on:
+  push:
+    branches: [matrix-report-link-v1]
+    paths: [.github/workflows/moi-daily-cloud-acceptance.yml]
   workflow_dispatch:
     inputs:
       scope:
         description: Repository acceptance scope
         type: choice
         options: [matrixone-test, three-repositories]
-        default: matrixone-test
+        default: three-repositories
       resume_run_id:
         description: Existing checkpoint run id, empty for new acquisition
         required: false
@@ -30,7 +33,7 @@ jobs:
         env:
           MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
           SCAN_GITHUB_TOKEN: ${{ secrets.SCAN_GITHUB_TOKEN }}
-          MATRIX_DAILY_SCOPE: ${{ inputs.scope || 'matrixone-test' }}
+          MATRIX_DAILY_SCOPE: ${{ inputs.scope || 'three-repositories' }}
           MATRIX_RESUME_RUN_ID: ${{ inputs.resume_run_id }}
           MATRIX_NODE_MODULES: /tmp/matrix-report-renderer/node_modules
         run: python3 .github/scripts/moi-report-link/cloud_daily.py
