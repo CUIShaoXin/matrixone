@@ -1,5 +1,8 @@
 name: MOI API and port source review
 on:
+  push:
+    branches: [matrix-report-link-v1]
+    paths: [.github/workflows/moi-api-port-review.yml]
   workflow_dispatch:
     inputs:
       source_receipt_file_id:
@@ -8,6 +11,16 @@ on:
       source_receipt_sha256:
         description: Expected full receipt SHA256
         required: true
+      publication_only:
+        description: Reuse an accepted combined report, no rg or Kimi replay
+        type: boolean
+        default: false
+      combined_receipt_file_id:
+        description: Accepted same-day combined report receipt for publication revision
+        required: false
+      combined_receipt_sha256:
+        description: Expected full combined receipt SHA256
+        required: false
       resume_run_id:
         description: Same-day API and port checkpoint run ID
         required: false
@@ -29,12 +42,15 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y ripgrep
       - name: Validate source scope and evidence gates
         working-directory: .github/scripts/moi-report-link
-        run: python3 -m unittest -v test_api_port_review
+        run: python3 -m unittest -v test_api_port_review test_component_details
       - name: Same-batch rg inventory, Kimi K3 review, MOI save and MinIO publication
         env:
           MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
-          MATRIX_SOURCE_RECEIPT_FILE_ID: ${{ inputs.source_receipt_file_id }}
-          MATRIX_SOURCE_RECEIPT_SHA256: ${{ inputs.source_receipt_sha256 }}
+          MATRIX_SOURCE_RECEIPT_FILE_ID: ${{ inputs.source_receipt_file_id || '73275d56-a417-4159-a896-0ebecbc3bd09' }}
+          MATRIX_SOURCE_RECEIPT_SHA256: ${{ inputs.source_receipt_sha256 || '0cf1f3b197e8cd60a1972f37c4a1fe2fc70173610d5c728307b1307ce8ad2de3' }}
+          MATRIX_PUBLICATION_ONLY: ${{ github.event_name == 'push' && 'true' || inputs.publication_only }}
+          MATRIX_COMBINED_RECEIPT_FILE_ID: ${{ inputs.combined_receipt_file_id || 'c110bab6-8723-4684-a1d3-aba2a2bde4cb' }}
+          MATRIX_COMBINED_RECEIPT_SHA256: ${{ inputs.combined_receipt_sha256 || '001f1450b73f5afc1b63e86aa0ec56ecfa47b05f27c7d9326e0a799de36751a4' }}
           MATRIX_API_PORT_RESUME_RUN_ID: ${{ inputs.resume_run_id }}
         run: python3 .github/scripts/moi-report-link/api_port_review.py
       - name: Retain safe execution status
