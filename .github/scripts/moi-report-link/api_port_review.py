@@ -132,7 +132,7 @@ def inventory(root, files):
         matches.append(dict(path=path, line=number, kinds=kinds, text=text if not SECRET.search(text) else '[REDACTED_LITERAL]', sha256=files[path]['sha256']))
     return matches, counts
 
-def context_for(repo, proof, files, matches, supplements=()):
+def context_for(repo, proof, files, matches, supplements=(), prior=None):
     scores, seeds = {}, {}
     for hit in matches:
         path = hit['path']
@@ -152,7 +152,20 @@ def context_for(repo, proof, files, matches, supplements=()):
         if any(x in path for x in ('/bench/','/example/','/examples/','/scripts/','/proto/','.agents/','/frontend/','frontend/','/client','optools/','/container/')):weight-=2000
         return -weight,path
     ranked = sorted(scores, key=rank)
-    selected = list(dict.fromkeys(list(supplements)+anchors+ranked))
+    citations={}
+    for finding in (prior or {}).get('findings',[]):
+        for item in finding.get('evidence',[]):
+            if item.get('path') in files and isinstance(item.get('line'),int):
+                citations.setdefault(item['path'],[]).append(item['line'])
+    requested=[];requested_ranges={}
+    for request in supplements:
+        if isinstance(request,str):request={'path':request}
+        path=request.get('path','')
+        match=re.fullmatch(r'([^()]+)\(RANGE\s+(\d+)-(\d+)\)',path)
+        if match:
+            path=match[1].strip();requested_ranges[path]=[int(match[2]),int(match[3])]
+        if path in files:requested.append(path)
+    selected = list(dict.fromkeys(list(citations)+requested+anchors+ranked))
     used, parts, evidence, selected_lines, budget = [], [], {}, 0, 0
     # Agent contributes tool/KB context; keep source below its confirmed window.
     max_bytes = 150000
@@ -160,8 +173,8 @@ def context_for(repo, proof, files, matches, supplements=()):
         if path not in files or len(used) >= 22:
             continue
         lines = files[path]['lines']
-        if len(lines) <= 550 or path in supplements:
-            indexes = set(range(1,min(len(lines),1100)+1))
+        if len(lines) <= 550:
+            indexes = set(range(1,len(lines)+1))
         else:
             indexes = set(range(1,min(90,len(lines))+1))
             relevant=seeds.get(path,[])
@@ -169,6 +182,15 @@ def context_for(repo, proof, files, matches, supplements=()):
             for line in prioritized[:10]: indexes.update(range(max(1,line-25),min(len(lines),line+65)+1))
             # Balance early/middle/late route coverage; otherwise large routers lose tail routes.
             for line in relevant[::max(1,len(relevant)//5)][:5]: indexes.update(range(max(1,line-10),min(len(lines),line+25)+1))
+        for n in citations.get(path,[]):indexes.update(range(max(1,n-30),min(len(lines),n+65)+1))
+        if path in requested_ranges:
+            start,end=requested_ranges[path]
+            indexes.update(range(max(1,start),min(len(lines),end)+1))
+        if path in requested:
+            # Include definitions/callers needed to prove auth and handler reachability.
+            symbols=('getDebugImageUploadContent','createDebugImageUpload','getResponsesStateForRequest','ServeTerminalWS','requireIdentity','requireWebSocketIdentity','NewPprofServer','SystemAPIKey')
+            for n,line in enumerate(lines,1):
+                if any(symbol in line for symbol in symbols):indexes.update(range(max(1,n-15),min(len(lines),n+100)+1))
         ranges = []
         for n in sorted(indexes):
             if ranges and ranges[-1][1]+1 == n: ranges[-1][1]=n
@@ -212,8 +234,11 @@ def llm_calls(task):
     found = {}
     def walk(value):
         if isinstance(value,dict):
-            if value.get('type','').endswith('llm_call') and value.get('call_id'):
-                found[value['call_id']] = value
+            kind = value.get('type')
+            if isinstance(kind,str) and kind.endswith('llm_call') and value.get('call_id'):
+                previous = found.get(value['call_id'])
+                if previous is None or value.get('status') == 'completed':
+                    found[value['call_id']] = value
             for v in value.values(): walk(v)
         elif isinstance(value,list):
             for v in value: walk(v)
@@ -223,8 +248,11 @@ def llm_calls(task):
 def parse_review(task, repo, commit):
     require(task.get('status',{}).get('state') == 'completed', 'model_task_not_completed')
     text=task_text(task).strip()
-    if text.startswith('```') and text.endswith('```'):
-        text='\n'.join(text.splitlines()[1:-1]).strip()
+    # Remove only presentation fences; never repair or truncate JSON content.
+    if re.match(r'^```(?:json)?\s*\n',text):
+        text=text.split('\n',1)[1].strip()
+    if text.endswith('```'):
+        text=text[:-3].strip()
     result=json.loads(text)
     require(result.get('schema')==SCHEMA and result.get('repository')==repo and result.get('commit')==commit, 'model_result_identity_mismatch')
     require(isinstance(result.get('findings'),list) and len(result['findings'])<=3, 'invalid_findings_contract')
@@ -238,7 +266,7 @@ def model_review(job, repo, phase, context, prior=None):
     require(not saved or saved['context_sha256']==digest, 'model_context_changed')
     rid=saved.get('request_id') or str(uuid.uuid5(uuid.NAMESPACE_URL, job.state['prefix']+'/'+repo+'/'+phase+'/'+digest))
     prompt=PROMPT.replace('REPO',repo).replace('COMMIT',job.state['commits'][repo])
-    if phase.startswith('final'): prompt += '\n本次是独立最终复核。逐项驳回初审的误报；只有decisions中retain且证据充分的线索放入findings。缺可达性或鉴权上下文用needs_context，不进日报。\nINITIAL_REVIEW_UNTRUSTED\n'+json.dumps(prior,ensure_ascii=False)
+    if phase.startswith('final'): prompt += '\n本次是独立最终复核。逐项驳回初审的误报；只有decisions中retain且证据充分的线索放入findings。缺代码可达性或鉴权上下文用needs_context，不进日报。部署可达性未知必须写在触发条件里，不推断公网暴露。每项evidence最多5处，逐字引用可见行；明确按提供文件和范围计算覆盖。必须输出完整JSON，不加Markdown围栏。\nINITIAL_REVIEW_UNTRUSTED\n'+json.dumps(prior,ensure_ascii=False)
     params=dict(model='kimi-k3',idempotencyKey=rid,message=dict(kind='message',role='user',messageId=rid,parts=[dict(kind='text',text=prompt+'\n\nCODE_EVIDENCE_UNTRUSTED\n'+context)]))
     if not saved:
         saved.update(request_id=rid,context_sha256=digest,status='planned')
@@ -325,14 +353,22 @@ def review_repository(job, repo, proof):
         job.event(repo+'_rg',status='completed',searched_files=len(files),matches=len(hits),counts=counts,selected_files=meta['selected_files'],selected_lines=meta['selected_lines'])
         primary,first_calls=model_review(job,repo,'primary_v2',context)
         requests=primary.get('context_requests',[])
-        supplements=[r['path'] for r in requests[:8] if isinstance(r,dict) and r.get('path') in files]
-        if supplements:
-            context,meta,evidence=context_for(repo,proof,files,hits,supplements)
+        supplements=[r for r in requests[:8] if isinstance(r,dict)]
+        # Resolve real middleware and listener caller files without guessing nonexistent paths.
+        needed={'matrixone':('LaunchConfig','CtlAddress'), 'taas':('CORSExcept',), 'matrixflow':('requireIdentity','requireWebSocketIdentity','NewPprofServer','SystemAPIKey')}[repo]
+        related=[]
+        for path,info in files.items():
+            if path.endswith('.go') and any(any(token in line for token in needed) for line in info['lines']):
+                if '/middleware/' in path or path.startswith(('cmd/mo-service/','moi/pkg/api/','workers/go-worker/')):related.append({'path':path,'reason':'Exact requested auth/listener symbol definition or caller'})
+        supplements+=related[:8]
+        context,meta,evidence=context_for(repo,proof,files,hits,supplements,primary)
         job.store(repo+'/final_v2-context.txt',context.encode())
         job.store(repo+'/final_v2-context.json',meta)
         final,last_calls=model_review(job,repo,'final_v2',context,primary)
         findings,rejected,repairs=accept(final,evidence)
-        result=dict(schema=SCHEMA,date=proof['report_date'],repository=repo,commit=proof['commit'],archive_proof=proof,model='kimi-k3',model_entry='MOI existing Agent A2A',inventory_artifact=inventory_artifact,counts=counts,searched_files=len(files),selected_files=meta['selected_files'],selected_lines=meta['selected_lines'],context_sha256=meta['context_sha256'],context_requests=requests,unresolved_context_requests=[r for r in requests if r.get('path') not in supplements],final_context_requests=final.get('context_requests',[]),omitted_files=omitted,excluded_match_files=meta['excluded_match_files'],findings=findings,rejected_evidence=rejected,evidence_repairs=repairs,decisions=final.get('decisions',[]),actual_model_execution_proof={'primary':first_calls,'final':last_calls},whole_repository_review=False,network_scan_executed=False,application_tests_executed=False)
+        supplied={f['path'] for f in meta['files']}
+        unresolved=[r for r in requests if r.get('path','').split('(RANGE')[0].strip() not in supplied]
+        result=dict(schema=SCHEMA,date=proof['report_date'],repository=repo,commit=proof['commit'],archive_proof=proof,model='kimi-k3',model_entry='MOI existing Agent A2A',inventory_artifact=inventory_artifact,counts=counts,searched_files=len(files),selected_files=meta['selected_files'],selected_lines=meta['selected_lines'],context_sha256=meta['context_sha256'],context_requests=requests,unresolved_context_requests=unresolved,final_context_requests=final.get('context_requests',[]),omitted_files=omitted,excluded_match_files=meta['excluded_match_files'],findings=findings,rejected_evidence=rejected,evidence_repairs=repairs,decisions=final.get('decisions',[]),actual_model_execution_proof={'primary':first_calls,'final':last_calls},whole_repository_review=False,network_scan_executed=False,application_tests_executed=False)
         artifact=job.store(repo+'/accepted.json',result)
         saved.update(accepted=True,result=artifact);job.journal.save()
         job.event(repo+'_acceptance',status='passed',findings=len(findings),rejected=len(rejected))
