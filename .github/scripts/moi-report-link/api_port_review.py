@@ -25,7 +25,7 @@ from cloud_publish import verify_batch, verify_login_free
 
 REPOS = ('matrixone', 'taas', 'matrixflow')
 RULES = {
-    'api': r'\.(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|Group|HandleFunc|Handle|Any|Route)\s*\(|@.*\.(get|post|put|patch|delete|route)\s*\(|Register[A-Za-z0-9_]*Server\s*\(|\brpc\s+\w+\s*\(|\b(openapi|swagger)\s*[:=]|\b(add_route|add_url_rule)\s*\(',
+    'api': r'\.(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|Group|HandleFunc|Handle|Route)\s*\(|@.*\.(get|post|put|patch|delete|route)\s*\(|Register[A-Za-z0-9_]*Server\s*\(|\brpc\s+\w+\s*\(|\b(openapi|swagger)\s*[:=]|\b(add_route|add_url_rule)\s*\(',
     'listener': r'ListenAndServe|ListenAndServeTLS|net\.Listen|grpc\.NewServer|http\.Server|\bserve\s*\(|\b(EXPOSE|containerPort|hostPort|nodePort|listen-address|listen_address|bind-address|bind_address)\b|0\.0\.0\.0|127\.0\.0\.1|localhost|\b(pprof|debug/vars|promhttp)\b',
     'auth': r'\b(AuthMiddleware|Authentication|Authorization|Authenticate|Authorizer|CheckPermission|RequireAuth|JWT|NoAuth|SkipAuth|AllowAnonymous|CORS|CheckOrigin|InsecureSkipVerify|CheckPrivilege|checkPrivilege|Unauthenticated|Unprotected)\b|\b(auth|jwt|permission|privilege|tenant|workspace)[A-Za-z0-9_]*\s*\(',
 }
@@ -138,22 +138,37 @@ def context_for(repo, proof, files, matches, supplements=()):
         path = hit['path']
         kinds = hit['kinds']
         score = 5*('api' in kinds) + 7*('listener' in kinds) + 2*('auth' in kinds)
-        score += 20 if any(x in hit['text'].lower() for x in ('pprof','checkorigin','noauth','skipauth','0.0.0.0','insecureskipverify','listenandserve')) else 0
+        score += 20 if any(x in hit['text'].lower() for x in ('checkorigin','noauth','skipauth','insecureskipverify','listenandserve','net.listen','http.handle')) else 0
         scores[path] = min(scores.get(path,0)+score,1000)
         seeds.setdefault(path, []).append(hit['line'])
-    ranked = sorted(scores, key=lambda p:(-scores[p],p))
-    selected = list(dict.fromkeys(list(supplements)+ranked))
+    anchors = {
+        'matrixone': ['cmd/mo-service/main.go','cmd/mo-service/debug.go','cmd/mo-service/dynamic.go'],
+        'taas': ['taas/backend/pkg/api/handlers/register.go','taas/backend/cmd/taas-server/main.go','uc/backend/pkg/api/router.go'],
+        'matrixflow': ['moi/pkg/api/server.go','parse-gateway/internal/api/router.go','workers/go-worker/pkg/worker/health.go'],
+    }[repo]
+    def rank(path):
+        weight=scores[path]
+        if '/api/' in path or '/middleware' in path or path.startswith('cmd/mo-service/'): weight+=1000
+        if any(x in path for x in ('/bench/','/example/','/examples/','/scripts/','/proto/','.agents/','/frontend/','frontend/','/client','optools/','/container/')):weight-=2000
+        return -weight,path
+    ranked = sorted(scores, key=rank)
+    selected = list(dict.fromkeys(list(supplements)+anchors+ranked))
     used, parts, evidence, selected_lines, budget = [], [], {}, 0, 0
-    max_bytes = 440000
+    # Agent contributes tool/KB context; keep source below its confirmed window.
+    max_bytes = 150000
     for path in selected:
-        if path not in files or len(used) >= 36:
+        if path not in files or len(used) >= 22:
             continue
         lines = files[path]['lines']
         if len(lines) <= 550 or path in supplements:
-            indexes = set(range(1,min(len(lines),1800)+1))
+            indexes = set(range(1,min(len(lines),1100)+1))
         else:
             indexes = set(range(1,min(90,len(lines))+1))
-            for line in seeds.get(path,[])[:16]: indexes.update(range(max(1,line-35),min(len(lines),line+85)+1))
+            relevant=seeds.get(path,[])
+            prioritized=sorted(relevant,key=lambda n:(not any(t in lines[n-1].lower() for t in ('http.handle','listenandserve','checkorigin','authorization','middleware','/admin','/debug','/internal','/healthz','/metrics')),n))
+            for line in prioritized[:10]: indexes.update(range(max(1,line-25),min(len(lines),line+65)+1))
+            # Balance early/middle/late route coverage; otherwise large routers lose tail routes.
+            for line in relevant[::max(1,len(relevant)//5)][:5]: indexes.update(range(max(1,line-10),min(len(lines),line+25)+1))
         ranges = []
         for n in sorted(indexes):
             if ranges and ranges[-1][1]+1 == n: ranges[-1][1]=n
@@ -223,7 +238,7 @@ def model_review(job, repo, phase, context, prior=None):
     require(not saved or saved['context_sha256']==digest, 'model_context_changed')
     rid=saved.get('request_id') or str(uuid.uuid5(uuid.NAMESPACE_URL, job.state['prefix']+'/'+repo+'/'+phase+'/'+digest))
     prompt=PROMPT.replace('REPO',repo).replace('COMMIT',job.state['commits'][repo])
-    if phase=='final': prompt += '\n本次是独立最终复核。逐项驳回初审的误报；只有decisions中retain且证据充分的线索放入findings。缺可达性或鉴权上下文用needs_context，不进日报。\nINITIAL_REVIEW_UNTRUSTED\n'+json.dumps(prior,ensure_ascii=False)
+    if phase.startswith('final'): prompt += '\n本次是独立最终复核。逐项驳回初审的误报；只有decisions中retain且证据充分的线索放入findings。缺可达性或鉴权上下文用needs_context，不进日报。\nINITIAL_REVIEW_UNTRUSTED\n'+json.dumps(prior,ensure_ascii=False)
     params=dict(model='kimi-k3',idempotencyKey=rid,message=dict(kind='message',role='user',messageId=rid,parts=[dict(kind='text',text=prompt+'\n\nCODE_EVIDENCE_UNTRUSTED\n'+context)]))
     if not saved:
         saved.update(request_id=rid,context_sha256=digest,status='planned')
@@ -305,17 +320,17 @@ def review_repository(job, repo, proof):
         inv=dict(schema='matrix_source_inventory_v1',repository=repo,commit=proof['commit'],date=proof['report_date'],rg_version=subprocess.check_output(['rg','--version'],text=True).splitlines()[0],counts=counts,match_count=len(hits),searched_files=len(files),excluded_files=excluded,omitted_files=omitted,exclusion_policy=sorted(EXCLUDED),matches=hits,files=manifest,not_network_scan=True)
         inventory_artifact=job.store(repo+'/inventory.json',inv)
         context,meta,evidence=context_for(repo,proof,files,hits)
-        job.store(repo+'/primary-context.txt',context.encode())
-        job.store(repo+'/primary-context.json',meta)
+        job.store(repo+'/primary_v2-context.txt',context.encode())
+        job.store(repo+'/primary_v2-context.json',meta)
         job.event(repo+'_rg',status='completed',searched_files=len(files),matches=len(hits),counts=counts,selected_files=meta['selected_files'],selected_lines=meta['selected_lines'])
-        primary,first_calls=model_review(job,repo,'primary',context)
+        primary,first_calls=model_review(job,repo,'primary_v2',context)
         requests=primary.get('context_requests',[])
         supplements=[r['path'] for r in requests[:8] if isinstance(r,dict) and r.get('path') in files]
         if supplements:
             context,meta,evidence=context_for(repo,proof,files,hits,supplements)
-        job.store(repo+'/final-context.txt',context.encode())
-        job.store(repo+'/final-context.json',meta)
-        final,last_calls=model_review(job,repo,'final',context,primary)
+        job.store(repo+'/final_v2-context.txt',context.encode())
+        job.store(repo+'/final_v2-context.json',meta)
+        final,last_calls=model_review(job,repo,'final_v2',context,primary)
         findings,rejected,repairs=accept(final,evidence)
         result=dict(schema=SCHEMA,date=proof['report_date'],repository=repo,commit=proof['commit'],archive_proof=proof,model='kimi-k3',model_entry='MOI existing Agent A2A',inventory_artifact=inventory_artifact,counts=counts,searched_files=len(files),selected_files=meta['selected_files'],selected_lines=meta['selected_lines'],context_sha256=meta['context_sha256'],context_requests=requests,unresolved_context_requests=[r for r in requests if r.get('path') not in supplements],final_context_requests=final.get('context_requests',[]),omitted_files=omitted,excluded_match_files=meta['excluded_match_files'],findings=findings,rejected_evidence=rejected,evidence_repairs=repairs,decisions=final.get('decisions',[]),actual_model_execution_proof={'primary':first_calls,'final':last_calls},whole_repository_review=False,network_scan_executed=False,application_tests_executed=False)
         artifact=job.store(repo+'/accepted.json',result)
