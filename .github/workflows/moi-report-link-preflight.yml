@@ -1,11 +1,6 @@
 name: MOI ZIP and report delivery preflight
 on:
   workflow_dispatch:
-  push:
-    branches: [matrix-report-link-v1]
-    paths:
-      - .github/scripts/moi-report-link/cloud_preflight.py
-      - .github/workflows/moi-report-link-preflight.yml
 permissions:
   contents: read
 concurrency:

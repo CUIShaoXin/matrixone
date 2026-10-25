@@ -1,11 +1,10 @@
 name: MOI accepted report MinIO publication
 on:
-  push:
-    branches: [matrix-report-link-v1]
-    paths:
-      - .github/scripts/moi-report-link/cloud_publish.py
-      - .github/scripts/moi-report-link/render_report.mjs
-      - .github/workflows/moi-report-publication-test.yml
+  workflow_dispatch:
+    inputs:
+      acceptance_file_id:
+        description: Accepted current batch file ID
+        required: true
 permissions:
   contents: read
 concurrency:
@@ -25,7 +24,7 @@ jobs:
       - name: Verify accepted MOI report and publish to MinIO
         env:
           MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
-          MATRIX_ACCEPTANCE_FILE_ID: 79c2f249-f1c5-4a7c-8d84-b94976fe5209
+          MATRIX_ACCEPTANCE_FILE_ID: ${{ inputs.acceptance_file_id }}
           MATRIX_ACCEPTANCE_SHA256: 986a29aca4c9516af379167a7f00c2d446d3741ca24aa90958c85641bd998957
           MATRIX_HISTORICAL_PUBLICATION_TEST: 'true'
           MATRIX_NODE_MODULES: /tmp/matrix-report-renderer/node_modules

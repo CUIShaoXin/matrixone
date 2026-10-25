@@ -1,43 +1,55 @@
-name: MOI dynamic daily cloud acceptance
+name: MOI unified security daily - no send
+run-name: MOI security ${{ inputs.mode }} - ${{ inputs.resume_run_id || 'new batch' }}
 on:
   workflow_dispatch:
     inputs:
-      scope:
-        description: Repository acceptance scope
+      mode:
+        description: Verify archives, source reviews, or full same-batch pipeline
         type: choice
-        options: [matrixone-test, three-repositories]
-        default: three-repositories
+        options: [archives, reviews, full]
+        default: full
+      runtime_ref:
+        description: Reviewed runtime commit SHA or existing test branch
+        required: true
+        default: matrix-report-link-v1
       resume_run_id:
-        description: Existing checkpoint run id, empty for new acquisition
+        description: Same-day unified checkpoint run ID; blank acquires a new batch
         required: false
 permissions:
   contents: read
 concurrency:
-  group: moi-daily-cloud-acceptance
+  group: moi-security-daily-cloud
   cancel-in-progress: false
 jobs:
-  acceptance:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: ${{ inputs.runtime_ref }}
           persist-credentials: false
           sparse-checkout: .github/scripts/moi-report-link
-      - name: Install report renderer
-        run: npm install --prefix /tmp/matrix-report-renderer --ignore-scripts --no-audit --no-fund marked@17.0.5
-      - name: Acquire fixed ZIP, scan in MOI, verify KB, publish report without sending
+      - name: Record actual runtime revision
+        run: echo "MATRIX_RUNTIME_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Install source inventory tool
+        run: sudo apt-get update -qq && sudo apt-get install -y ripgrep
+      - name: Check evidence and recovery gates
+        working-directory: .github/scripts/moi-report-link
+        run: python3 -m unittest -v test_pipeline_recovery test_api_port_review test_component_details test_unified_pipeline
+      - name: Same-batch cloud verification without group delivery
         env:
           MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
           SCAN_GITHUB_TOKEN: ${{ secrets.SCAN_GITHUB_TOKEN }}
-          MATRIX_DAILY_SCOPE: ${{ inputs.scope || 'three-repositories' }}
-          MATRIX_RESUME_RUN_ID: ${{ inputs.resume_run_id }}
-          MATRIX_NODE_MODULES: /tmp/matrix-report-renderer/node_modules
-        run: python3 .github/scripts/moi-report-link/cloud_daily.py
-      - name: Retain status without reports, links or credentials
+          MATRIX_PIPELINE_MODE: ${{ inputs.mode }}
+          MATRIX_PIPELINE_RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+        run: python3 .github/scripts/moi-report-link/daily_pipeline.py
+      - name: Retain safe timings and status even on failure
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: moi-daily-cloud-status-${{ github.run_id }}
-          path: out/matrix-daily-cloud-status.json
-          retention-days: 7
+          name: moi-security-no-send-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            out/pipeline/status.json
+            out/pipeline-events.jsonl
+          retention-days: 14
