@@ -6,6 +6,34 @@ from source_code_review import accepted,context_for,review_repository
 from test_pipeline_recovery import Job
 
 class UnifiedTests(unittest.TestCase):
+ def test_reconcile_conflict_reobserves_same_sources_without_reappend(self):
+  from cloud_daily import Failure
+  class API:
+   def __init__(self):self.reconciles=0
+   @staticmethod
+   def data(x):return x
+   def request(self,path,payload=None,**kw):
+    if path.endswith('/reconcile'):self.reconciles+=1;raise Failure('moi_http_409')
+    return {'items':[],'reconcile_required':True}
+  api=API();job=Job(api)
+  with patch.object(kb,'rows',side_effect=[[dict(source_file_id='fid',ingest_status='running')],[dict(source_file_id='fid',ingest_status='succeeded')]]),patch.object(kb.time,'sleep'):
+   kb.ensure_sources(job,[dict(file_id='fid',name='x.md')])
+  self.assertEqual(api.reconciles,1);self.assertEqual(job.state['knowledge_conflicts'][0]['operation'],'source_jobs_reconcile')
+  self.assertTrue(job.state['knowledge_registration']['fid']['succeeded']);self.assertNotIn('append_attempted',job.state['knowledge_registration']['fid'])
+ def test_registration_conflict_never_repeats_uncertain_append(self):
+  from cloud_daily import Failure
+  class API:
+   def __init__(self):self.appends=0
+   @staticmethod
+   def data(x):return x
+   def request(self,path,payload=None,**kw):
+    if path.endswith('/sources'):self.appends+=1;raise Failure('moi_http_409')
+    return {'items':[]}
+  api=API();job=Job(api)
+  with patch.object(kb,'rows',side_effect=[[],[],[],[],[dict(source_file_id='fid',ingest_status='succeeded')]]),patch.object(kb.time,'sleep'):
+   kb.ensure_sources(job,[dict(file_id='fid',name='x.md')])
+  self.assertEqual(api.appends,1);self.assertTrue(job.state['knowledge_registration']['fid']['succeeded'])
+  self.assertEqual(job.state['knowledge_conflicts'][0]['operation'],'source_registration')
  def test_knowledge_transient_gateway_error_reobserves_same_source(self):
   from cloud_daily import Failure
   job=Job(None)
