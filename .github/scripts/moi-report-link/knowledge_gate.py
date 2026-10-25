@@ -39,7 +39,10 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15):
                         state['observed']=True
                         if all(v.get('ingest_status')=='failed' for v in found):
                             job.store('knowledge-failure-'+fid+'.json',found)
-                            raise ValueError('knowledge_ingestion_failed_requires_backend_repair')
+                            jobs=job.api.data(job.api.request('/semantic-models/80001/source-jobs',timeout=90))
+                            active=[v for v in jobs.get('items',[]) if fid in (v.get('source_file_id'),v.get('kb_file_id')) and v.get('job_status') in ('pending','queued','running')]
+                            if not active:raise ValueError('knowledge_ingestion_failed_requires_backend_repair')
+                            emit('knowledge_status_reconciling',active_jobs=len(active))
                     else:
                         seen_rounds[fid]=seen_rounds.get(fid,0)+1
                         # Native raw-volume save may enqueue registration. Let it become visible first.
@@ -55,8 +58,12 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15):
                     if jobs.get('reconcile_required'):
                         job.api.request('/semantic-models/80001/source-jobs/reconcile',{},method='POST',timeout=90)
                     last_reconcile=time.monotonic();emit('knowledge_waiting',sources=len(artifacts))
-            except (TimeoutError,urllib.error.URLError,ConnectionError):
-                emit('knowledge_read_recovery',same_sources=True)
+            except Exception as exc:
+                transient=isinstance(exc,(TimeoutError,urllib.error.URLError,ConnectionError)) or str(exc) in ('moi_http_429','moi_http_500','moi_http_502','moi_http_503','moi_http_504')
+                if not transient:raise
+                # Re-observe the same source/jobs after an uncertain append or reconcile.
+                # Persisted append_attempted prevents replaying a source registration.
+                emit('knowledge_read_recovery',same_sources=True,error_type=type(exc).__name__)
             time.sleep(poll_seconds)
         raise ValueError('knowledge_ingestion_deadline')
 

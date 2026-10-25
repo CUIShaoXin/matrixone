@@ -45,7 +45,7 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
                 request = dict(model='kimi-k3',idempotencyKey=rid,message=dict(kind='message',role='user',messageId=rid,parts=[dict(kind='text',text=prompt+'\n\nCODE_EVIDENCE_UNTRUSTED\n'+context)]))
                 attempt = dict(number=number+1,request_id=rid,status='planned',started_epoch=time.time())
                 job.store(repo+'/'+phase+'/attempt-'+str(number+1)+'-request.json',request)
-                attempts.append(attempt);job.journal.save()
+                attempts.append(attempt);saved.update(status='planned');saved.pop('task_id',None);job.journal.save()
             attempt = attempts[-1]
             rid = attempt['request_id']
             # The request is immutable across process restarts and uncertain responses.

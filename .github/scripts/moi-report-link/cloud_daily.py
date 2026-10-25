@@ -14,7 +14,8 @@ import tempfile
 import time
 import uuid
 import threading
-from pipeline_telemetry import timed
+import urllib.error
+from pipeline_telemetry import timed,span,emit
 import zipfile
 
 import cloud_preflight as preflight
@@ -139,6 +140,27 @@ def extract_manifests(raw, proof):
 
 
 class DailyAPI(publication.ReportAPI):
+    def request(self,path,payload=None,method=None,timeout=35):
+        read_only=(method or ('GET' if payload is None else 'POST'))=='GET' or path=='/connectors/get'
+        for attempt in range(3 if read_only else 1):
+            try:
+                with span('moi_catalog_read' if read_only else 'moi_catalog_mutation',attempt=attempt+1):
+                    return super().request(path,payload,method,timeout)
+            except Exception as exc:
+                transient=isinstance(exc,(TimeoutError,urllib.error.URLError,ConnectionError)) or str(exc) in ('moi_http_429','moi_http_500','moi_http_502','moi_http_503','moi_http_504')
+                if not read_only or not transient or attempt==2:raise
+                emit('moi_read_recovery',attempt=attempt+1)
+                time.sleep(2**attempt)
+
+    def file(self,fid):
+        for attempt in range(3):
+            try:
+                with span('moi_file_read',attempt=attempt+1):return super().file(fid)
+            except (TimeoutError,urllib.error.URLError,ConnectionError) as exc:
+                if isinstance(exc,urllib.error.HTTPError) and exc.code not in (429,500,502,503,504):raise
+                if attempt==2:raise
+                emit('moi_file_read_recovery',attempt=attempt+1);time.sleep(2**attempt)
+
     @staticmethod
     def data(result):
         payload = result["payload"]

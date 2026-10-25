@@ -74,7 +74,8 @@ def main():
                             kind,r=pending[future]
                             try:(code if kind=='code' else api_results)[r]=future.result()
                             except Exception as exc:
-                                failures.append((kind,r,type(exc).__name__));job.issue(kind+'_'+r,type(exc).__name__,'Keep exact task and checkpoint; publication remains blocked')
+                                error=str(exc) if re.fullmatch('[a-z][a-z0-9_]{0,100}',str(exc)) else type(exc).__name__
+                                failures.append((kind,r,error));job.issue(kind+'_'+r,error,'Keep exact task and checkpoint; publication remains blocked')
                         if failures:raise ValueError('source_review_incomplete')
                 with futures.ThreadPoolExecutor(max_workers=1) as model_pool:
                     model_future=model_pool.submit(all_reviews)
@@ -82,8 +83,14 @@ def main():
                         component_journal=open_journal(objects,prefix+'/components/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix+'/components',archives=archives,commits=commits,sent=False))
                         require(component_journal.value['archives']==archives,'component_resume_archive_mismatch')
                         runner=Runner(api,objects,component_journal)
-                        with span('three_repository_component_scan'):
-                            results={repo.name:runner.scan(repo,archives[repo.name]) for repo in preflight.REPOSITORIES}
+                        try:
+                            with span('three_repository_component_scan'):
+                                results={repo.name:runner.scan(repo,archives[repo.name]) for repo in preflight.REPOSITORIES}
+                        except Exception as exc:
+                            failure=dict(stage='components',**error_fields(exc),at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
+                            if re.fullmatch('[a-z][a-z0-9_]{0,100}',str(exc)):failure['safe_code']=str(exc)
+                            root.value.setdefault('failures',[]).append(failure);root.save()
+                            raise
                         batch=dict(schema='matrix_daily_acceptance_v1',date=date,workspace=WORKSPACE,knowledge_base_id=80001,results=results,three_repository_reports_accepted=True,single_repository_test=False,daily_cloud_download_verified=True,sent=False,daily_automation_ready=False)
                     model_future.result()
                 if mode=='reviews':

@@ -6,6 +6,33 @@ from source_code_review import accepted,context_for,review_repository
 from test_pipeline_recovery import Job
 
 class UnifiedTests(unittest.TestCase):
+ def test_knowledge_transient_gateway_error_reobserves_same_source(self):
+  from cloud_daily import Failure
+  job=Job(None)
+  with patch.object(kb,'rows',side_effect=[Failure('moi_http_504'),[dict(source_file_id='fid',ingest_status='succeeded')]]),patch.object(kb.time,'sleep'):
+   kb.ensure_sources(job,[dict(file_id='fid',name='x.md')])
+  self.assertTrue(job.state['knowledge_registration']['fid']['succeeded']);self.assertNotIn('append_attempted',job.state['knowledge_registration']['fid'])
+ def test_moi_transient_read_recovers_but_uncertain_write_is_not_repeated(self):
+  from cloud_daily import DailyAPI,Failure,publication
+  api=DailyAPI('test-key')
+  with patch.object(publication.ReportAPI,'request',side_effect=[Failure('moi_http_504'),{'ok':True}]) as request,patch('cloud_daily.time.sleep'):
+   self.assertEqual(api.request('/semantic-models/80001/sources'),{'ok':True});self.assertEqual(request.call_count,2)
+  with patch.object(publication.ReportAPI,'request',side_effect=TimeoutError()) as request:
+   with self.assertRaises(TimeoutError):api.request('/workflow/v2/workflow-apps/example/executions',{'trigger_now':True})
+   self.assertEqual(request.call_count,1)
+ def test_moi_file_read_recovers_without_reupload(self):
+  from cloud_daily import DailyAPI,publication
+  with patch.object(publication.ReportAPI,'file',side_effect=[TimeoutError(),b'original']) as download,patch('cloud_daily.time.sleep'):
+   self.assertEqual(DailyAPI('test-key').file('fid'),b'original');self.assertEqual(download.call_count,2)
+ def test_failed_source_view_waits_for_active_job_without_reappend(self):
+  class API:
+   @staticmethod
+   def data(x):return x
+   def request(self,*a,**kw):return {'items':[dict(source_file_id='fid',job_status='running')]}
+  job=Job(API())
+  with patch.object(kb,'rows',side_effect=[[dict(source_file_id='fid',ingest_status='failed')],[dict(source_file_id='fid',ingest_status='succeeded')]]),patch.object(kb.time,'sleep'):
+   kb.ensure_sources(job,[dict(file_id='fid',name='x.md')])
+  self.assertTrue(job.state['knowledge_registration']['fid']['succeeded']);self.assertNotIn('append_attempted',job.state['knowledge_registration']['fid'])
  def test_cached_code_rejects_another_archive_even_with_matching_hash(self):
   import types
   from api_port_review import sha
@@ -46,7 +73,8 @@ class UnifiedTests(unittest.TestCase):
    with self.assertRaises(ValueError):kb.ensure_sources(job,[dict(file_id='fid',name='x.md')],deadline_seconds=1000,poll_seconds=0)
   self.assertEqual(api.appends,1)
  def test_failed_existing_source_never_reappended(self):
-  job=Job(None)
+  import types
+  job=Job(types.SimpleNamespace(data=lambda x:x,request=lambda *a,**k:{'items':[]}))
   with patch.object(kb,'rows',return_value=[dict(source_file_id='fid',ingest_status='failed')]):
    with self.assertRaisesRegex(ValueError,'requires_backend_repair'):kb.ensure_sources(job,[dict(file_id='fid',name='x.md')])
  def test_workflow_has_no_send_schedule_push_or_historical_fallback(self):
