@@ -1,0 +1,55 @@
+name: MOI unified security daily - no send
+run-name: MOI security ${{ inputs.mode }} - ${{ inputs.resume_run_id || 'new batch' }}
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Verify archives, source reviews, or full same-batch pipeline
+        type: choice
+        options: [archives, reviews, full]
+        default: full
+      runtime_ref:
+        description: Reviewed runtime commit SHA or existing test branch
+        required: true
+        default: matrix-report-link-v1
+      resume_run_id:
+        description: Same-day unified checkpoint run ID; blank acquires a new batch
+        required: false
+permissions:
+  contents: read
+concurrency:
+  group: moi-security-daily-cloud
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.runtime_ref }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/moi-report-link
+      - name: Record actual runtime revision
+        run: echo "MATRIX_RUNTIME_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Install source inventory tool
+        run: sudo apt-get update -qq && sudo apt-get install -y ripgrep
+      - name: Check evidence and recovery gates
+        working-directory: .github/scripts/moi-report-link
+        run: python3 -m unittest -v test_pipeline_recovery test_api_port_review test_component_details test_unified_pipeline
+      - name: Same-batch cloud verification without group delivery
+        env:
+          MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
+          SCAN_GITHUB_TOKEN: ${{ secrets.SCAN_GITHUB_TOKEN }}
+          MATRIX_PIPELINE_MODE: ${{ inputs.mode }}
+          MATRIX_PIPELINE_RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+        run: python3 .github/scripts/moi-report-link/daily_pipeline.py
+      - name: Retain safe timings and status even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: moi-security-no-send-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            out/pipeline/status.json
+            out/pipeline-events.jsonl
+          retention-days: 14
