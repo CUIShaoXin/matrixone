@@ -31,9 +31,11 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
     if saved and (saved.get('context_sha256')!=digest or saved.get('contract_sha256')!=contract):
         raise ValueError('model_context_or_contract_changed')
     if not saved:
-        saved.update(context_sha256=digest,contract_sha256=contract,attempts=[],started_epoch=time.time(),status='planned')
+        saved.update(context_sha256=digest,contract_sha256=contract,attempts=[],status='queued')
         job.journal.save()
     with MODEL_SLOTS, span('kimi_'+repo+'_'+phase, repository=repo, commit=job.state['commits'][repo]):
+        if 'started_epoch' not in saved:
+            saved.update(started_epoch=time.time(),status='planned');job.journal.save()
         while time.time()-saved['started_epoch'] < deadline_seconds:
             attempts = saved['attempts']
             if not attempts or attempts[-1].get('retry_authorized'):
@@ -77,6 +79,11 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
                     attempt.update(retry_authorized=True,recovery_reason='stream_transport');job.journal.save()
                     job.issue(key,'stream_transport','Terminal task retained; next bounded attempt uses same source and Kimi K3')
                     continue
+            except urllib.error.HTTPError as exc:
+                if exc.code not in (429,500,502,503,504): raise ValueError('model_http_nonrecoverable') from None
+                attempt['request_timeouts'] = attempt.get('request_timeouts',0)+1
+                saved['status']='request_uncertain';job.journal.save()
+                emit('model_request_recovery',repository=repo,phase=phase,attempt=attempt['number'],same_task=True,http_status=exc.code)
             except (TimeoutError,urllib.error.URLError,ConnectionError):
                 attempt['request_timeouts'] = attempt.get('request_timeouts',0)+1
                 saved['status']='request_uncertain';job.journal.save()

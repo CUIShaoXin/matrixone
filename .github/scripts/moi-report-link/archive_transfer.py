@@ -30,7 +30,7 @@ def prepare(github, objects, repository, run_id, date, validate, failure):
     if proof and objects.verify_object(key,proof['bytes'],proof['sha256']):
         raw = None
     else:
-        cache = Path(tempfile.gettempdir())/'matrix-archive-cache'/commit
+        cache = Path(tempfile.gettempdir())/'matrix-archive-cache'/(repository.owner+'-'+repository.name+'-'+commit)
         cache.parent.mkdir(parents=True,exist_ok=True)
         raw = cache.read_bytes() if cache.exists() else None
         if raw is not None and proof and sha256(raw)!=proof['sha256']:

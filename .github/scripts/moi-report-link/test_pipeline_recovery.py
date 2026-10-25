@@ -1,4 +1,5 @@
 import copy,hashlib,json,types,unittest,xml.etree.ElementTree as ET
+from unittest.mock import patch
 from resilient_storage import Objects, PART_SIZE, sha256
 from kimi_recovery import run_review
 
@@ -42,6 +43,50 @@ class Model:
 def task(state,reason=None,id='t1'):return dict(id=id,status={'state':state},metadata={'reason_display':{'i18n_key':reason}})
 
 class RecoveryTests(unittest.TestCase):
+ def test_lost_initiation_reuses_exact_upload(self):
+  class LostInitiation(Storage):
+   def call(self,method,key,*args,**kwargs):
+    if kwargs.get('query',{}).get('uploads')=='':
+     if method=='GET':return 200,{},b'<ListMultipartUploadsResult><IsTruncated>false</IsTruncated><Upload><Key>new.zip</Key><UploadId>upload-1</UploadId></Upload></ListMultipartUploadsResult>'
+     super().call(method,key,*args,**kwargs);raise TimeoutError()
+    return super().call(method,key,*args,**kwargs)
+  store=LostInitiation();raw=b'z'*(PART_SIZE+1);state={}
+  store.put_verified('new.zip',raw,sha256(raw),state,lambda:None)
+  self.assertEqual(store.uploads,1);self.assertEqual(state['upload_id'],'upload-1');self.assertEqual(store.raw,raw)
+ def test_uncertain_small_artifact_put_readback_prevents_duplicate(self):
+  class Uncertain(Objects):
+   def __init__(self):self.writes=0;self.raw=None
+   def call(self,method,key,raw=None,*args,**kwargs):
+    if method=='PUT':self.writes+=1;self.raw=raw;raise TimeoutError()
+    return 200,{},self.raw
+  store=Uncertain();result=store.publish('receipt.json',b'bytes','application/json')
+  self.assertEqual(store.writes,1);self.assertTrue(result['readback_verified'])
+ def test_archive_commit_is_frozen_before_upload_and_resume(self):
+  import archive_transfer as transfer
+  class Memory:
+   def __init__(self):self.data={};self.verified=False;self.fail=True
+   def call(self,method,key):
+    if key not in self.data:raise RuntimeError('minio_http_404')
+    return 200,{},self.data[key]
+   def publish(self,key,raw,kind):self.data[key]=raw
+   def verify_object(self,*args):return self.verified
+   def put_verified(self,key,raw,digest,state,save):
+    saved=json.loads(next(raw for key,raw in self.data.items() if '/acquisition-' in key))
+    assert saved['commit']=='a'*40 and saved['proof']['sha256']==sha256(raw)
+    if self.fail:self.fail=False;raise TimeoutError()
+    self.verified=True
+  class GitHub:
+   def __init__(self):self.branches=0
+   def get(self,repo,path,binary=False):
+    if '/branches/' in path:self.branches+=1;return {'commit':{'sha':('a' if self.branches==1 else 'b')*40}}
+    return b'fixed-code'
+  import tempfile
+  store=Memory();github=GitHub();repo=types.SimpleNamespace(owner='owner',name='repo',branch='main')
+  validate=lambda stream,commit:dict(commit=commit,bytes=10,sha256=sha256(b'fixed-code'),manifests=[])
+  with tempfile.TemporaryDirectory() as tmp,patch.object(transfer.tempfile,'gettempdir',return_value=tmp):
+   with self.assertRaises(TimeoutError):transfer.prepare(github,store,repo,'test','2026-10-25',validate,ValueError)
+   proof=transfer.prepare(github,store,repo,'test','2026-10-25',validate,ValueError)
+  self.assertEqual(github.branches,1);self.assertEqual(proof['commit'],'a'*40)
  def test_lost_part_and_completion_responses_reconcile(self):
   store=Storage(True,True);raw=b'x'*(PART_SIZE+123);state={};store.put_verified('new.zip',raw,sha256(raw),state,lambda:None)
   self.assertEqual(store.raw,raw);self.assertEqual(state['status'],'verified');self.assertEqual(store.part_puts,[1,2]);self.assertEqual(store.completed,1)

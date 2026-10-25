@@ -144,6 +144,7 @@ class DailyAPI(publication.ReportAPI):
         payload = result["payload"]
         return payload.get("data", payload.get("result", payload))
 
+    @timed("moi_a2a_request")
     def rpc(self, method, params, rid):
         # JSON-RPC responses do not have the catalog API's code/data envelope.
         raw = self.binary("/workspaces/" + WORKSPACE + "/agents/" + AGENT + "/a2a?agent_workspace_id=" + WORKSPACE,
@@ -183,8 +184,11 @@ class Runner:
         stages = self.state.setdefault("stages", {})
         stage = stages.setdefault(label, {})
         if not stage:
-            stage.update(workflow_id=str(uuid.uuid4()), status="planned")
+            stage.update(workflow_id=str(uuid.uuid5(uuid.NAMESPACE_URL,WORKSPACE+"/matrix-daily-reusable-v2/"+label)), status="planned")
             self.journal.save()
+        input_digest=sha256(json_bytes(nodes))
+        require(stage.get("input_sha256",input_digest)==input_digest,"workflow_resume_input_changed")
+        stage["input_sha256"]=input_digest
         wid = stage["workflow_id"]
         if stage["status"] == "planned":
             lines = ["workflow:", "  name: matrix_daily_" + label, "  root: root", "root:", "  chain:"]
@@ -311,7 +315,7 @@ class Runner:
             docs.append(".state."+key)
         nodes += [self.node("finalize",OPERATOR+"matrix_osv_staged_finalize",dict(common,documents="{{ "+" + ".join(docs)+" }}",source_files=sources),dict(raw=".scan_result",facts=".report_facts_text",details=".detail_markdown",validation=".validation")),
                   self.sink("osv","{{ .state.raw }}",run_prefix+"-osv.json"),
-                  self.sink("details","{{ .state.details }}",run_prefix+"-details.md",140002,"markdown"),
+                  self.sink("details","{{ .state.details }}",run_prefix+"-details.md",130001,"markdown"),
                   self.node("employee", "moi:llm.output.generate",dict(prompt=EMPLOYEE_PROMPT,text="{{ .state.facts }}",temperature=0.1,max_tokens=3000),{"employee":".text"}),
                   self.sink("employee_report","{{ .state.employee }}",run_prefix+"-employee.md",140002,"markdown"),
                   self.sink("validation","{{ .state.validation }}",run_prefix+"-validation.json")]
@@ -347,7 +351,7 @@ class Runner:
                 elif kind=="details":
                     expression+=' | gsub('+json.dumps("原生导入并核对全部筛选清单",ensure_ascii=False)+'; '+json.dumps("由云端runner流式导入筛选清单，并核对全部字节哈希",ensure_ascii=False)+')'
                 normalized_nodes.append(self.sink(kind,"{{ "+expression+" }}",name,
-                                                  130001 if kind=="osv" else 140002,"json" if kind=="osv" else "markdown"))
+                                                  140002 if kind=="employee" else 130001,"json" if kind=="osv" else "markdown"))
             normalized=self.workflow(repo.name+"_store_accepted_v4",normalized_nodes)
             saved["artifacts"]={kind:normalized[kind][0] for kind in values}
             for kind,body in values.items():
@@ -357,10 +361,16 @@ class Runner:
                 if key.startswith("rag"):saved.pop(key)
             saved.update(artifact_storage_version=2,marker=facts["marker"],counts={key:facts[key] for key in COUNTS},validation=json.loads(generated["validation"][1]))
             self.journal.save()
-        targets=[dict(file_id=saved["artifacts"][kind]["file_id"],marker=saved["marker"]+suffix) for kind,suffix in (("details","-DETAIL"),("employee","-EMPLOYEE"))]
+        if not saved.get("knowledge_index"):
+            index = {"schema":"matrix_component_evidence_index_v1","date":self.state["date"],"repository":repo.name,"commit":proof["commit"],"marker":saved["marker"]+"-DETAIL","counts":saved["counts"],"artifacts":saved["artifacts"],"archive_sha256":proof["sha256"],"knowledge_mode":"compact_index_with_full_evidence_binding","full_advisory_text_indexed":False}
+            index_text = "# "+repo.name+" dependency evidence index\n"+saved["marker"]+"-DETAIL\n\nFull advisory records are preserved in the exact artifacts below; this compact KB index is not their full text.\n\n"+json.dumps(index,ensure_ascii=False,indent=2)
+            artifact,stored=self.workflow(repo.name+"_compact_evidence_index",[self.sink("index",index_text,run_prefix+"-evidence-index.md",140002,"markdown")])["index"]
+            require(stored==index_text.encode(),"knowledge_index_bytes_mismatch")
+            saved["knowledge_index"]=artifact;self.journal.save()
+        targets=[dict(file_id=saved["knowledge_index"]["file_id"],marker=saved["marker"]+"-DETAIL"),dict(file_id=saved["artifacts"]["employee"]["file_id"],marker=saved["marker"]+"-EMPLOYEE")]
         self.knowledge(repo.name,saved,targets)
         result=dict(commit=proof["commit"],branch=proof["branch"],counts=saved["counts"],artifacts=saved["artifacts"],
-                    independent_readback_verified=True,kb_marker_retrieved=True,knowledge_retrieval=saved["rag_proof"],archive_proof=proof)
+                    independent_readback_verified=True,kb_marker_retrieved=True,knowledge_retrieval=saved["rag_proof"],knowledge_sources={"details":dict(saved["knowledge_index"],binding="compact_index_with_full_evidence_binding",full_advisory_text_indexed=False),"employee":saved["artifacts"]["employee"]},archive_proof=proof)
         saved.update(accepted=True,result=result)
         self.journal.save()
         self.event(stage=repo.name,status="accepted",counts=saved["counts"])
@@ -369,52 +379,14 @@ class Runner:
     @timed("component_knowledge")
     def knowledge(self, tag, saved, targets):
         if saved.get("rag_proof"):return
-        if not saved.get("kb_appended"):
-            self.api.request("/semantic-models/80001/sources", {"sources":[dict(source_type="local_file",upload_kind="unstructured",file_id=saved["artifacts"][kind]["file_id"],file_name=saved["artifacts"][kind]["name"]) for kind in ("details","employee")]},timeout=45)
-            saved["kb_appended"]=True;self.journal.save()
-        deadline=time.monotonic()+3600
-        wanted={x["file_id"] for x in targets}
-        last_reconcile=0
-        while time.monotonic()<deadline:
-            if time.monotonic()-last_reconcile>=60:
-                jobs=self.api.data(self.api.request("/semantic-models/80001/source-jobs"))
-                if jobs.get("reconcile_required"):
-                    self.api.request("/semantic-models/80001/source-jobs/reconcile",{},method="POST",timeout=45)
-                self.event(stage=tag+"_knowledge", status="waiting_for_ingestion")
-                last_reconcile=time.monotonic()
-            rows=[]
-            for page in range(1,21):
-                data=self.api.data(self.api.request("/semantic-models/80001/sources?page="+str(page)+"&page_size=100"))
-                current=knowledge_rows(data);rows.extend(current)
-                if len(current)<100:break
-            failed=[row for row in rows if row.get("ingest_status")=="failed" and row.get("source_file_id") in wanted]
-            require(not failed,"kb_ingestion_failed")
-            found={fid for row in rows for fid in wanted if fid in (row.get("source_file_id"),row.get("kb_file_id"),row.get("source_id")) and row.get("ingest_status")=="succeeded"}
-            if found==wanted:break
-            time.sleep(15)
-        require(found==wanted,"kb_ingestion_incomplete")
-        for attempt in range(3):
-            key="rag_"+str(attempt)
-            if key not in saved or not saved[key].get("task_id"):
-                rid="matrix-daily-"+tag+"-"+self.state["run_id"]+"-audit-"+str(attempt)
-                prompt="mode=audit。只执行只读知识库验收，不要扫描、读GitHub、上传、改配置或发群。分别用实际search_rag_chunks以每个精确file_id检索其marker，max_hits=1,max_rows=1，取完整短content_preview，然后select_final_sources选择这两个实际来源。不得依据文件名或助手断言成功，必要时读取真实工具结果。目标："+json.dumps(targets,ensure_ascii=False)
-                params=dict(model="deepseek-v4.1-flash",idempotencyKey=rid,message=dict(kind="message",role="user",messageId=rid,parts=[dict(kind="text",text=prompt)]))
-                saved[key]={"idempotency_key":rid,"status":"submitting"};self.journal.save()
-                task=self.api.rpc("message/send",params,rid)
-                saved[key] = {"task_id":task["id"]}
-                self.journal.save()
-            tid=saved[key]["task_id"]
-            deadline=time.monotonic()+600
-            while time.monotonic()<deadline:
-                task=self.api.rpc("tasks/get",{"id":tid},"matrix-daily-audit-get-"+str(uuid.uuid4()))
-                if task.get("status",{}).get("state") in ("completed","failed","canceled","cancelled"):break
-                time.sleep(12)
-            try:
-                saved["rag_proof"]=verify_rag(task,targets)
-                self.journal.save();return
-            except Failure:
-                saved[key]["status"]="not_accepted";self.journal.save()
-        raise Failure("rag_acceptance_failed")
+        from api_port_review import Job
+        from knowledge_gate import ensure_sources,audit
+        self.state.setdefault("prefix",self.journal.key.rsplit("/",1)[0])
+        self.state.setdefault("commits",{name:proof["commit"] for name,proof in self.state.get("archives",{}).items()})
+        job=Job(self.api,self.objects,self.journal,Path("out/knowledge"))
+        artifacts=[saved["knowledge_index"],saved["artifacts"]["employee"]]
+        ensure_sources(job,artifacts)
+        saved["rag_proof"]=audit(job,targets,tag);self.journal.save()
 
     @timed("component_publish")
     def publish(self,batch):

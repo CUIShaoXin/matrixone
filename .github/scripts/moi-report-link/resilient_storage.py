@@ -34,14 +34,21 @@ class SignedObjects:
 
     @classmethod
     def from_workspace(cls, api):
-        result = api.request("/connectors/get", {"id": CONNECTOR_ID}, timeout=25)
-        if result["http_status"] != 200:
-            raise RuntimeError("minio_connector_unavailable")
-        connector = api.data(result)
-        connector = connector.get("connector", connector)
-        config = connector["config"]
-        config = json.loads(config) if isinstance(config, str) else config
-        return cls(config.get("s3", config.get("s3_config", {})))
+        import time
+        for attempt in range(3):
+            try:
+                result = api.request("/connectors/get", {"id": CONNECTOR_ID}, timeout=35)
+                if result["http_status"] != 200:
+                    raise RuntimeError("moi_http_"+str(result['http_status']))
+                connector = api.data(result)
+                connector = connector.get("connector", connector)
+                config = connector["config"]
+                config = json.loads(config) if isinstance(config, str) else config
+                return cls(config.get("s3", config.get("s3_config", {})))
+            except Exception as exc:
+                transient = isinstance(exc,(TimeoutError,urllib.error.URLError,ConnectionError)) or str(exc) in ('moi_http_429','moi_http_500','moi_http_502','moi_http_503','moi_http_504')
+                if not transient or attempt == 2: raise
+                time.sleep(2**attempt)
 
     def _path(self, key):
         if not key or key.startswith("/") or ".." in key.split("/"):
@@ -58,7 +65,10 @@ class SignedObjects:
     def call(self, method, key, raw=None, headers=None, response_limit=32 * 1024 * 1024, timeout=None, query=None):
         now = dt.datetime.now(dt.timezone.utc)
         stamp, date = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
-        path = self._path(key)
+        if key == "" and method == "GET" and query and "uploads" in query and query.get("prefix"):
+            path = "/" + urllib.parse.quote(self.bucket, safe="-_.~")
+        else:
+            path = self._path(key)
         encoded = urllib.parse.urlencode(sorted((query or {}).items()), quote_via=urllib.parse.quote, safe="-_.~")
         hdr = {"host": self.host, "x-amz-content-sha256": sha256(raw or b""), "x-amz-date": stamp}
         hdr.update({k.lower(): str(v).strip() for k, v in (headers or {}).items()})
@@ -147,8 +157,34 @@ def xml_values(raw, name):
 
 class Objects(SignedObjects):
     def call(self, method, key, raw=None, headers=None, response_limit=32*1024*1024, timeout=None, query=None):
-        with span('minio_zip' if key.endswith('.zip') else 'minio_artifact', method=method, request_bytes=len(raw or b'')):
-            return super().call(method, key, raw, headers, response_limit, timeout, query)
+        for attempt in range(3):
+            try:
+                with span('minio_zip' if key.endswith('.zip') else 'minio_artifact', method=method, request_bytes=len(raw or b''), attempt=attempt+1):
+                    return super().call(method, key, raw, headers, response_limit, timeout, query)
+            except TRANSIENT:
+                # Uncertain writes must be reconciled by the transfer state machine.
+                if method not in ('GET','HEAD') or attempt == 2: raise
+            except RuntimeError as exc:
+                if str(exc) not in ('minio_http_429','minio_http_500','minio_http_502','minio_http_503','minio_http_504') or method not in ('GET','HEAD','PUT') or attempt == 2: raise
+            emit('network_retry', category='minio', method=method, attempt=attempt+1)
+            time.sleep(2**attempt)
+
+    def publish(self, key, raw, content_type):
+        digest = sha256(raw)
+        for attempt in range(3):
+            try:
+                self.call('PUT',key,raw,{'content-type':content_type,'content-disposition':'inline','cache-control':'private, max-age=300','x-amz-meta-sha256':digest})
+            except TRANSIENT:
+                emit('artifact_put_uncertain',attempt=attempt+1)
+            try:
+                status, headers, received = self.call('GET',key,response_limit=max(len(raw),32*1024*1024))
+            except RuntimeError as exc:
+                if str(exc) != 'minio_http_404': raise
+                status,headers,received=404,{},b''
+            if status == 200 and received == raw:
+                return dict(key=key,bytes=len(raw),sha256=digest,readback_verified=True,content_type=headers.get('Content-Type'),content_disposition=headers.get('Content-Disposition'))
+            time.sleep(attempt+1)
+        raise ValueError('minio_report_readback_mismatch')
 
     def verify_object(self, key, size, digest):
         try:
@@ -185,14 +221,29 @@ class Objects(SignedObjects):
                 time.sleep(attempt+1)
             raise ValueError('archive_put_attempts_exhausted')
         if not transfer.get('upload_id'):
-            if transfer.get('status') == 'initiation_uncertain':
-                raise ValueError('multipart_initiation_requires_reconciliation')
-            transfer.update(status='initiation_uncertain'); save()
-            body = self.call('POST', key, headers={'content-type':'application/zip', 'x-amz-meta-sha256':digest}, query={'uploads':''})[2]
-            ids = xml_values(body, 'UploadId')
-            if len(ids) != 1 or not ids[0]:
-                raise ValueError('multipart_upload_id_missing')
-            transfer.update(upload_id=ids[0], status='uploading', parts={}); save()
+            for initiation in range(3):
+                if transfer.get('status') == 'initiation_uncertain':
+                    body = self.call('GET', '', query={'uploads':'','prefix':key})[2]
+                    root = ET.fromstring(body)
+                    if xml_values(body,'IsTruncated') == ['true']:
+                        raise ValueError('multipart_initiation_listing_truncated')
+                    ids = []
+                    for upload in root.iter():
+                        if upload.tag.rsplit('}',1)[-1] == 'Upload':
+                            fields = {n.tag.rsplit('}',1)[-1]:n.text for n in upload}
+                            if fields.get('Key') == key: ids.append(fields['UploadId'])
+                    if len(ids) > 1: raise ValueError('multipart_initiation_ambiguous')
+                    if ids:
+                        transfer.update(upload_id=ids[0],status='uploading',parts={});save();break
+                transfer.update(status='initiation_uncertain');save()
+                try:
+                    body = self.call('POST', key, headers={'content-type':'application/zip','x-amz-meta-sha256':digest},query={'uploads':''})[2]
+                    ids = xml_values(body,'UploadId')
+                    if len(ids) != 1 or not ids[0]: raise ValueError('multipart_upload_id_missing')
+                    transfer.update(upload_id=ids[0],status='uploading',parts={});save();break
+                except TRANSIENT:
+                    emit('upload_recovery',operation='initiate',attempt=initiation+1)
+            if not transfer.get('upload_id'): raise ValueError('multipart_initiation_attempts_exhausted')
         upload_id = transfer['upload_id']
         # ListParts reconciles a lost part response or a restarted cloud job.
         remote = self._parts(key, upload_id)

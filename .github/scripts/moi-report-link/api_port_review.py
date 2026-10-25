@@ -305,7 +305,11 @@ def review_repository(job, repo, proof):
     out=job.out/repo
     saved=job.state.setdefault('repositories',{}).setdefault(repo,{})
     if saved.get('accepted'):
-        return json.loads(job.objects.call('GET',saved['result']['key'])[2])
+        raw=job.objects.call('GET',saved['result']['key'])[2]
+        require(sha(raw)==saved['result']['sha256'] and len(raw)==saved['result']['bytes'],'api_cached_result_hash_mismatch')
+        value=json.loads(raw)
+        require(value['repository']==repo and value['commit']==proof['commit'] and value['date']==proof['report_date'] and value['archive_proof']['sha256']==proof['sha256'],'api_cached_result_identity_mismatch')
+        return value
     job.event(repo+'_zip',status='reading_verified_snapshot')
     raw=job.objects.call('GET',proof['key'],response_limit=proof['bytes'])[2]
     with tempfile.TemporaryDirectory(prefix='matrix-source-') as tmp:
@@ -433,57 +437,18 @@ def publish_report(job, source, page, results, rendered=None):
     md+=('\n\n'+detail_md).encode()
     job.store('matrix-security-daily.html',raw)
     job.store('matrix-security-daily.md',md)
-    accepted=dict(schema='matrix_api_port_combined_acceptance_v2',component_details=component_details,publication_only_revision=bool(job.state.get('publication_revision_source')),date=job.state['date'],run_id=job.state['run_id'],source_receipt_file_id=job.state['source_id'],source_receipt_sha256=job.state['source_sha256'],component_batch_reused=True,code_batch_reused=True,source_commits=source['commits'],repositories=results,added_findings=total,network_scan_executed=False,whole_repository_review=False,daily_automation_ready=False,sent=False)
+    accepted=dict(schema='matrix_api_port_combined_acceptance_v2',component_details=component_details,publication_only_revision=bool(job.state.get('publication_revision_source')),date=job.state['date'],run_id=job.state['run_id'],source_receipt_file_id=job.state['source_id'],source_receipt_sha256=job.state['source_sha256'],component_batch_reused=not job.state.get('unified_current_batch',False),code_batch_reused=not job.state.get('unified_current_batch',False),source_commits=source['commits'],repositories=results,added_findings=total,network_scan_executed=False,whole_repository_review=False,daily_automation_ready=False,sent=False)
     job.store('acceptance.json',accepted)
     runner=Runner(job.api,job.objects,job.journal)
     # Native final Markdown is saved once, in the KB raw volume only.
     artifact,stored=runner.workflow('api_port_component_details_final_report_save',[runner.sink('report',md.decode(),'matrix-api-port-'+job.state['date']+'-'+job.state['run_id']+'.md',140002,'markdown')])['report']
     require(stored==md, 'native_report_bytes_mismatch')
     fid=artifact['file_id'];job.state['markdown_artifact']=artifact;job.journal.save()
-    deadline=time.monotonic()+1800
-    last_notice=0
-    while time.monotonic()<deadline:
-        try:
-            rows=read_sources(job.api)
-            found=[r for r in rows if fid in (r.get('source_file_id'),r.get('kb_file_id'))]
-            if any(r.get('ingest_status')=='succeeded' for r in found):
-                job.store('knowledge-sources.json',found);break
-            if not found and not job.state.get('kb_append_attempted'):
-                job.state['kb_append_attempted']=True;job.journal.save()
-                job.api.request('/semantic-models/80001/sources',{'sources':[dict(source_type='local_file',upload_kind='unstructured',file_id=fid,file_name=artifact['name'])]},timeout=90)
-            jobs=job.api.data(job.api.request('/semantic-models/80001/source-jobs',timeout=90))
-            if jobs.get('reconcile_required'): job.api.request('/semantic-models/80001/source-jobs/reconcile',{},method='POST',timeout=90)
-            if found and all(r.get('ingest_status')=='failed' for r in found):
-                job.store('knowledge-failure.json',dict(sources=found,jobs=jobs))
-                raise ValueError('knowledge_ingestion_failed')
-        except (TimeoutError,urllib.error.URLError):
-            job.issue('knowledge','read_timeout','Retry read and discover existing source; do not repeat native save')
-        if time.monotonic()-last_notice>=60:
-            job.event('knowledge',status='waiting');last_notice=time.monotonic()
-        time.sleep(15)
-    else: raise ValueError('knowledge_ingestion_deadline')
+    from knowledge_gate import ensure_sources,audit
+    ensure_sources(job,[artifact])
     targets=[dict(file_id=fid,marker=marker)]
-    rid=job.state.get('audit_request_id') or str(uuid.uuid5(uuid.NAMESPACE_URL,job.state['prefix']+'/kb-audit/'+fid))
-    job.state['audit_request_id']=rid;job.journal.save()
-    prompt='mode=audit。只执行只读知识库验收，不扫描、不审代码、不修改、不上传、不发消息。用实际search_rag_chunks以精确file_id检索marker，max_hits=1,max_rows=1，返回包含marker的完整content_preview，随后select_final_sources选择这一来源。不依赖文件名或叙述断言成功。目标：'+json.dumps(targets)
-    params=dict(model='kimi-k3',idempotencyKey=rid,message=dict(kind='message',role='user',messageId=rid,parts=[dict(kind='text',text=prompt)]))
-    deadline=time.monotonic()+900
-    while time.monotonic()<deadline:
-        try:
-            tid=job.state.get('audit_task_id')
-            task=job.api.rpc('tasks/get',{'id':tid},str(uuid.uuid4())) if tid else job.api.rpc('message/send',params,rid)
-            require(task.get('id'), 'knowledge_audit_rejected')
-            job.state['audit_task_id']=task['id'];job.journal.save()
-            status=task.get('status',{}).get('state')
-            if status=='completed':
-                proof=verify_rag(task,targets)
-                job.store('knowledge-tool-task.json',task)
-                job.store('knowledge-tool-proof.json',proof)
-                break
-            require(status not in ('failed','canceled','cancelled','input-required'), 'knowledge_audit_failed')
-        except (TimeoutError,urllib.error.URLError): job.issue('knowledge_audit','request_timeout','Recover same task/message')
-        time.sleep(15)
-    else: raise ValueError('knowledge_audit_deadline')
+    proof=audit(job,targets,'final_report')
+    job.store('knowledge-tool-proof.json',proof)
     key='reports/'+job.state['date'].replace('-','')+'/api-port-kimi-k3/'+sha(raw)[:16]+'/matrix-security-daily.html'
     published=job.objects.publish(key,raw,'text/html; charset=utf-8')
     url,expiry=job.objects.presign(key,at=signing_at)
