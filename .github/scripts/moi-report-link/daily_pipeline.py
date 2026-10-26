@@ -35,6 +35,18 @@ def open_journal(objects,key,initial):
     return journal
 
 
+def scan_components(runner,archives,on_failure):
+    results={};failures=[]
+    for repo in preflight.REPOSITORIES:
+        try:results[repo.name]=runner.scan(repo,archives[repo.name])
+        except Exception as exc:
+            on_failure(repo.name,exc);failures.append(repo.name)
+    # Each repository keeps its own real accepted checkpoint. One failed KB
+    # gate must not prevent the other repositories from doing useful work.
+    if failures:raise ValueError('component_scan_incomplete')
+    return results
+
+
 def main():
     date=dt.datetime.now(preflight.LOCAL).date().isoformat();start=time.monotonic()
     run_id=os.environ.get('MATRIX_PIPELINE_RESUME_RUN_ID') or os.environ['GITHUB_RUN_ID']+'-'+os.environ.get('GITHUB_RUN_ATTEMPT','1')
@@ -83,9 +95,13 @@ def main():
                         component_journal=open_journal(objects,prefix+'/components/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix+'/components',archives=archives,commits=commits,sent=False))
                         require(component_journal.value['archives']==archives,'component_resume_archive_mismatch')
                         runner=Runner(api,objects,component_journal)
+                        def component_failure(repo,exc):
+                            failure=dict(stage='components',repository=repo,**error_fields(exc),at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
+                            if re.fullmatch('[a-z][a-z0-9_]{0,100}',str(exc)):failure['safe_code']=str(exc)
+                            root.value.setdefault('failures',[]).append(failure);root.save()
                         try:
                             with span('three_repository_component_scan'):
-                                results={repo.name:runner.scan(repo,archives[repo.name]) for repo in preflight.REPOSITORIES}
+                                results=scan_components(runner,archives,component_failure)
                         except Exception as exc:
                             failure=dict(stage='components',**error_fields(exc),at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
                             if re.fullmatch('[a-z][a-z0-9_]{0,100}',str(exc)):failure['safe_code']=str(exc)

@@ -6,6 +6,17 @@ from source_code_review import accepted,context_for,review_repository
 from test_pipeline_recovery import Job
 
 class UnifiedTests(unittest.TestCase):
+ def test_one_failed_repository_does_not_skip_remaining_scans_or_allow_publication(self):
+  from daily_pipeline import scan_components
+  import types
+  calls=[];failures=[]
+  def scan(repo,proof):
+   calls.append(repo.name)
+   if repo.name=='matrixone':raise ValueError('knowledge_ingestion_failed_requires_backend_repair')
+   return {'accepted':True}
+  with self.assertRaisesRegex(ValueError,'component_scan_incomplete'):
+   scan_components(types.SimpleNamespace(scan=scan),{r:{} for r in ('matrixone','taas','matrixflow')},lambda r,e:failures.append((r,str(e))))
+  self.assertEqual(calls,['matrixone','taas','matrixflow']);self.assertEqual(failures,[('matrixone','knowledge_ingestion_failed_requires_backend_repair')])
  def test_missing_runtime_source_view_is_reobserved_without_duplicate_registration(self):
   class API:
    @staticmethod
