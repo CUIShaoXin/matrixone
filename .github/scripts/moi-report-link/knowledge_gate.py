@@ -45,6 +45,7 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
                                 state['failure_evidence']=job.store('knowledge-failure-'+fid+'.json',found)
                                 # Retain the first failed view unchanged throughout recovery.
                                 state['failure_evidence_recorded']=True
+                                job.journal.save()
                             operation='source_jobs'
                             jobs=job.api.data(job.api.request('/semantic-models/80001/source-jobs',timeout=90))
                             active=[v for v in jobs.get('items',[]) if fid in (v.get('source_file_id'),v.get('kb_file_id')) and v.get('job_status') in ('pending','queued','running')]
@@ -53,13 +54,15 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
                                 # before its real file-runtime facts are visible. Re-observe
                                 # these exact source IDs only; never reappend or accept failure.
                                 invisible=all(re.fullmatch(r'workflow execution [0-9a-f-]{36} not found: domain object not found',v.get('error') or '') for v in found)
-                                first=state.setdefault('missing_runtime_first_observed_epoch',time.time()) if invisible else 0
+                                dispatch_busy=all(re.fullmatch(r'workflow has an active volume dispatch job: job [0-9a-f-]{36} status (?:pending|queued|running)',v.get('error') or '') for v in found)
+                                field='active_dispatch' if dispatch_busy else 'missing_runtime'
+                                first=state.setdefault(field+'_first_observed_epoch',time.time()) if invisible or dispatch_busy else 0
                                 elapsed=time.time()-first
-                                if not invisible or elapsed>=runtime_visibility_grace_seconds:
+                                if not (invisible or dispatch_busy) or elapsed>=runtime_visibility_grace_seconds:
                                     raise ValueError('knowledge_ingestion_failed_requires_backend_repair')
-                                state['missing_runtime_observations']=state.get('missing_runtime_observations',0)+1
+                                state[field+'_observations']=state.get(field+'_observations',0)+1
                                 job.journal.save()
-                                emit('knowledge_runtime_visibility_wait',same_sources=True,elapsed_seconds=round(elapsed,3),grace_seconds=runtime_visibility_grace_seconds)
+                                emit('knowledge_runtime_visibility_wait',same_sources=True,projection_reason=field,elapsed_seconds=round(elapsed,3),grace_seconds=runtime_visibility_grace_seconds)
                             else:emit('knowledge_status_reconciling',active_jobs=len(active))
                     else:
                         seen_rounds[fid]=seen_rounds.get(fid,0)+1

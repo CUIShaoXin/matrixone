@@ -6,6 +6,28 @@ from source_code_review import accepted,context_for,review_repository
 from test_pipeline_recovery import Job
 
 class UnifiedTests(unittest.TestCase):
+ def test_exact_active_volume_dispatch_projection_waits_without_reappend(self):
+  class API:
+   @staticmethod
+   def data(x):return x
+   def request(self,path,payload=None,**kw):
+    self_test.assertIsNone(payload);return {'items':[]}
+  self_test=self;job=Job(API())
+  failed=dict(source_file_id='fid',ingest_status='failed',error='workflow has an active volume dispatch job: job 213472d9-decc-4bf1-b52f-6306c74360a8 status running')
+  with patch.object(kb,'rows',side_effect=[[failed],[dict(source_file_id='fid',ingest_status='succeeded')]]),patch.object(kb.time,'sleep'):
+   kb.ensure_sources(job,[dict(file_id='fid',name='x.md')])
+  state=job.state['knowledge_registration']['fid']
+  self.assertTrue(state['succeeded']);self.assertEqual(state['active_dispatch_observations'],1)
+  self.assertNotIn('append_attempted',state)
+ def test_active_dispatch_grace_cannot_accept_persistent_failure(self):
+  import types
+  job=Job(types.SimpleNamespace(data=lambda x:x,request=lambda *a,**kw:{'items':[]}))
+  failed=dict(source_file_id='fid',ingest_status='failed',error='workflow has an active volume dispatch job: job 213472d9-decc-4bf1-b52f-6306c74360a8 status running')
+  with patch.object(kb,'rows',return_value=[failed]):
+   with self.assertRaisesRegex(ValueError,'requires_backend_repair'):
+    kb.ensure_sources(job,[dict(file_id='fid',name='x.md')],runtime_visibility_grace_seconds=0)
+  self.assertTrue(job.state['knowledge_registration']['fid']['failure_evidence_recorded'])
+  self.assertNotIn('succeeded',job.state['knowledge_registration']['fid'])
  def test_kb_audit_explicitly_omits_volume_filter_and_preserves_old_phase(self):
   job=Job(None)
   with patch('kimi_recovery.run_review',return_value=[]) as run:
