@@ -6,6 +6,26 @@ from pathlib import Path
 import api_port_review as m
 
 class SourceReviewTests(unittest.TestCase):
+    def test_split_fence_and_repeated_complete_result_are_not_duplicate_json(self):
+        import json
+        value={'schema':m.SCHEMA,'repository':'taas','commit':'a'*40,'findings':[]}
+        raw=json.dumps(value)
+        task={'status':{'message':{'parts':[{'kind':'text','text':'```json\n'+raw},{'kind':'text','text':'```'},{'kind':'text','text':'```json\n'+raw+'\n```'}]}}}
+        self.assertEqual(m.task_json(task),value)
+
+    def test_transport_fragments_are_joined_without_changing_string_content(self):
+        task={'status':{'message':{'parts':[{'kind':'text','text':'{"value":"frag'},{'kind':'text','text':'mented"}'}]}}}
+        self.assertEqual(m.task_json(task),{'value':'fragmented'})
+
+    def test_conflicting_complete_results_cannot_be_silently_selected(self):
+        task={'status':{'message':{'parts':[{'kind':'text','text':'{"findings":[]}'}]}},'artifacts':[{'parts':[{'kind':'text','text':'{"findings":[1]}'}]}]}
+        with self.assertRaisesRegex(ValueError,'model_result_ambiguous'):m.task_json(task)
+
+    def test_extra_prose_or_incomplete_duplicate_is_not_repaired(self):
+        import json
+        for text in ('{"findings":[]} unfinished','{"findings":[]}{"findings":['):
+            with self.assertRaises(json.JSONDecodeError):m.task_json({'status':{'message':{'parts':[{'kind':'text','text':text}]}}})
+
     def test_actual_event_types_and_unclosed_presentation_fence(self):
         import json
         result={'schema':m.SCHEMA,'repository':'taas','commit':'a'*40,'findings':[]}

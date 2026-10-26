@@ -234,6 +234,25 @@ def task_text(task):
     # Some A2A responses repeat the artifact verbatim in the status message.
     return '\n'.join(dict.fromkeys(pieces))
 
+def task_json(task):
+    # A2A may split a presentation fence into a separate part, then repeat the
+    # complete answer in the same message. Parse every full document, accepting
+    # only identical copies. Never repair JSON or discard conflicting output.
+    groups=[task.get('status',{}).get('message',{}).get('parts',[])]
+    groups.extend(a.get('parts',[]) for a in task.get('artifacts',[]))
+    values=[];decoder=json.JSONDecoder()
+    for parts in groups:
+        text=''.join(p.get('text','') for p in parts if p.get('kind')=='text').strip()
+        while text:
+            fence=re.match(r'^```(?:json)?(?:\s*\n|\s*$|(?=```))',text)
+            if fence:
+                text=text[fence.end():].lstrip();continue
+            value,end=decoder.raw_decode(text);values.append(value)
+            text=text[end:].lstrip()
+    if not values:raise json.JSONDecodeError('Empty model result','',0)
+    require(all(v==values[0] for v in values),'model_result_ambiguous')
+    return values[0]
+
 def llm_calls(task):
     found = {}
     def walk(value):
@@ -251,13 +270,7 @@ def llm_calls(task):
 
 def parse_review(task, repo, commit):
     require(task.get('status',{}).get('state') == 'completed', 'model_task_not_completed')
-    text=task_text(task).strip()
-    # Remove only presentation fences; never repair or truncate JSON content.
-    if re.match(r'^```(?:json)?\s*\n',text):
-        text=text.split('\n',1)[1].strip()
-    if text.endswith('```'):
-        text=text[:-3].strip()
-    result=json.loads(text)
+    result=task_json(task)
     require(result.get('schema')==SCHEMA and result.get('repository')==repo and result.get('commit')==commit, 'model_result_identity_mismatch')
     require(isinstance(result.get('findings'),list) and len(result['findings'])<=3, 'invalid_findings_contract')
     calls=llm_calls(task)

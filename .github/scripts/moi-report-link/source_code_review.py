@@ -5,7 +5,7 @@ import re
 import tempfile
 from pathlib import Path
 
-from api_port_review import extract, task_text, llm_calls, sha, require, SECRET
+from api_port_review import extract, task_json, llm_calls, sha, require, SECRET
 from kimi_recovery import run_review
 from pipeline_telemetry import timed
 
@@ -59,10 +59,7 @@ def context_for(repo,proof,files,requests=(),prior=None):
 
 def parse(task,repo,commit,phase):
     require(task.get('status',{}).get('state')=='completed','code_model_not_completed')
-    text=task_text(task).strip()
-    if re.match(r'^```(?:json)?\s*\n',text):text=text.split('\n',1)[1].strip()
-    if text.endswith('```'):text=text[:-3].strip()
-    value=json.loads(text);schema='matrix_code_review_findings_v1' if phase=='primary' else 'matrix_code_review_verdict_v1'
+    value=task_json(task);schema='matrix_code_review_findings_v1' if phase=='primary' else 'matrix_code_review_verdict_v1'
     require(value.get('schema')==schema and value.get('repository')==repo and value.get('commit')==commit,'code_result_identity_mismatch')
     require(isinstance(value.get('findings'),list) and len(value['findings'])<=2,'code_findings_contract_invalid')
     calls=llm_calls(task)
