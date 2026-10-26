@@ -12,7 +12,7 @@ from cloud_daily import DailyAPI,Journal,Runner,require,json_bytes,WORKSPACE
 from api_port_review import Job,REPOS,review_repository as api_review,publish_report,sha
 from source_code_review import review_repository as code_review
 from cloud_publish import verify_batch
-from combined_renderer import render
+from combined_renderer import render,build_focus
 from pipeline_telemetry import span,error_fields
 from resilient_storage import verify_login_free
 
@@ -115,8 +115,10 @@ def main():
                     files={(r,k):api.file(v['artifacts'][k]['file_id']) for r,v in results.items() for k in ('employee','details','osv')}
                     verify_batch(batch,files,date)
                     job.component_osv={r:json.loads(files[(r,'osv')]) for r in REPOS}
-                    page,ncomp,ncode=render(batch,files,code)
-                    source=dict(schema='matrix_unified_scan_source_v1',report_date=date,scope='three-repositories',run_id=run_id,commits=commits,source_acceptance=batch,code_review=dict(model='kimi-k3',repositories=code),component_focus_count=ncomp,code_findings=ncode,kb_marker_retrieved=True,sent=False)
+                    with span('component_focus_summary'):
+                        focus=build_focus(job,batch,files)
+                    page,ncomp,ncode=render(batch,files,code,focus=focus)
+                    source=dict(schema='matrix_unified_scan_source_v1',report_date=date,scope='three-repositories',run_id=run_id,commits=commits,source_acceptance=batch,component_focus=focus,code_review=dict(model='kimi-k3',repositories=code),component_focus_count=ncomp,code_findings=ncode,kb_marker_retrieved=True,sent=False)
                     body=json_bytes(source);job.store('same-batch-source.json',body)
                     artifact=review_journal.value.get('source_artifact')
                     if artifact:require(api.file(artifact['file_id'])==body,'pipeline_source_artifact_mismatch')

@@ -6,6 +6,52 @@ from source_code_review import accepted,context_for,review_repository
 from test_pipeline_recovery import Job
 
 class UnifiedTests(unittest.TestCase):
+ def focus_fixture(self):
+  expected={'date':'2026-10-26','components':[dict(repo='matrixone',name='golang.org/x/crypto',advisories=[dict(id='GHSA-test',details='SSH servers which use the affected certificate callback may panic.')])]}
+  item=dict(repo='matrixone',name='golang.org/x/crypto',risk='在使用受影响证书回调时可能触发服务崩溃。',action='核对SSH证书回调的配置与实际调用路径。',evidence=[dict(id='GHSA-test',quote='affected certificate callback')])
+  value=dict(schema='matrix_component_focus_v1',date=expected['date'],components=[item])
+  return expected,value
+ def test_focus_accepts_only_structured_final_with_exact_advisory_quote(self):
+  from combined_renderer import parse_focus
+  expected,value=self.focus_fixture();calls=[dict(model='kimi-k3',status='completed')]
+  with patch('api_port_review.task_json',return_value=value),patch('api_port_review.llm_calls',return_value=calls):
+   self.assertEqual(parse_focus(dict(status={'state':'completed'}),expected),(value,calls))
+ def test_focus_rejects_unmatched_quote_and_extra_components(self):
+  from combined_renderer import parse_focus
+  expected,value=self.focus_fixture()
+  with patch('api_port_review.task_json',return_value=value),patch('api_port_review.llm_calls',return_value=[dict(model='kimi-k3',status='completed')]):
+   value['components'][0]['evidence'][0]['quote']='invented advisory quote'
+   with self.assertRaisesRegex(ValueError,'quote_mismatch'):parse_focus(dict(status={'state':'completed'}),expected)
+   value['components'].append(copy.deepcopy(value['components'][0]))
+   with self.assertRaisesRegex(ValueError,'coverage_mismatch'):parse_focus(dict(status={'state':'completed'}),expected)
+ def test_focus_rejects_wrong_model_and_unexpected_tool_calls(self):
+  from combined_renderer import parse_focus
+  expected,value=self.focus_fixture()
+  with patch('api_port_review.task_json',return_value=value),patch('api_port_review.llm_calls',return_value=[dict(model='other',status='completed')]):
+   with self.assertRaisesRegex(ValueError,'actual_kimi_missing'):parse_focus(dict(status={'state':'completed'}),expected)
+  with patch('api_port_review.task_json',return_value=value),patch('api_port_review.llm_calls',return_value=[dict(model='kimi-k3',status='completed')]):
+   with self.assertRaisesRegex(ValueError,'unexpected_tool'):parse_focus(dict(status={'state':'completed'},events=[{'type':'moi.tool.call'}]),expected)
+ def test_focus_never_parses_reasoning_markdown_and_binds_original_hashes(self):
+  from combined_renderer import focus_inputs
+  from api_port_review import sha
+  files={};results={}
+  for repo in ('matrixone','taas','matrixflow'):
+   scan=dict(commit='a'*40,facts=dict(report_date_shanghai='2026-10-26',priority_components=[dict(name='package',ecosystem='Go',versions={'1.0.0':[]},vulnerability_ids=['id'])]),full_advisories={'id':dict(details='The affected API can panic when a callback is absent.')})
+   files[(repo,'osv')]=json.dumps(scan).encode();files[(repo,'employee')]=b'We need to draft a report. No completed final answer.'
+   results[repo]=dict(commit='a'*40,artifacts={k:dict(bytes=len(files[(repo,k)]),sha256=sha(files[(repo,k)])) for k in ('osv','employee')})
+  batch=dict(date='2026-10-26',results=results)
+  self.assertEqual(len(focus_inputs(batch,files)['components']),3)
+  files[('taas','employee')]=b'tampered'
+  with self.assertRaisesRegex(ValueError,'hash_mismatch'):focus_inputs(batch,files)
+ def test_structured_focus_render_bypasses_free_form_markdown_parser(self):
+  from combined_renderer import render
+  scan=json.dumps(dict(package_version_results=[dict(package={'name':'package'},version='1.0.0')])).encode()
+  batch=dict(date='2026-10-26',results={r:dict(commit='a'*40) for r in ('matrixone','taas','matrixflow')})
+  focus=[dict(repo='matrixone',commit='a'*40,name='package',label='package',risk='触发条件',action='核对实际路径')]
+  code={r:dict(commit='a'*40,retained_findings=[],selected_files=1,selected_lines=1) for r in batch['results']}
+  with patch('combined_renderer.subprocess.run',side_effect=AssertionError('legacy parser must not run')):
+   page,count,findings=render(batch,{('matrixone','osv'):scan},code,focus=focus)
+  self.assertEqual((count,findings),(1,0));self.assertIn('核对实际路径'.encode(),page)
  def test_exact_active_volume_dispatch_projection_waits_without_reappend(self):
   class API:
    @staticmethod
