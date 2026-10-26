@@ -43,6 +43,19 @@ class Model:
 def task(state,reason=None,id='t1'):return dict(id=id,status={'state':state},metadata={'reason_display':{'i18n_key':reason}})
 
 class RecoveryTests(unittest.TestCase):
+ def test_successful_primary_can_be_reused_after_its_original_deadline(self):
+  api=Model([task('completed'),task('completed')]);job=Job(api)
+  run_review(job,'repo','primary','source','prompt',lambda t:t['id'],poll_seconds=0)
+  job.state['model_tasks']['repo_primary']['started_epoch']=0
+  self.assertEqual(run_review(job,'repo','primary','source','prompt',lambda t:t['id'],poll_seconds=0),'t1')
+  self.assertEqual([r[0] for r in api.requests],['message/send','tasks/get'])
+ def test_expired_working_task_only_gets_one_read_and_no_new_inference(self):
+  api=Model([task('completed'),task('working')]);job=Job(api)
+  run_review(job,'repo','primary','source','prompt',lambda t:t,poll_seconds=0)
+  job.state['model_tasks']['repo_primary']['started_epoch']=0
+  with self.assertRaisesRegex(ValueError,'deadline_exceeded'):
+   run_review(job,'repo','primary','source','prompt',lambda t:t,poll_seconds=0)
+  self.assertEqual([r[0] for r in api.requests],['message/send','tasks/get'])
  def test_parser_fix_revalidates_completed_task_after_budget_without_new_inference(self):
   api=Model([task('completed'),task('completed')]);job=Job(api)
   def old_parser(t):raise json.JSONDecodeError('Old transport duplication','',0)

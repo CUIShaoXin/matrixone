@@ -40,7 +40,7 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
         # was previously rejected. Re-read it once before spending another
         # attempt, even when the original inference budget is exhausted.
         previous=saved['attempts'][-1] if saved['attempts'] else {}
-        revalidate=previous.get('status')=='completed' and previous.get('recovery_reason')=='invalid_json'
+        revalidate=bool(previous.get('task_id'))
         while time.time()-saved['started_epoch'] < deadline_seconds or revalidate:
             attempts = saved['attempts']
             revalidating=revalidate;revalidate=False
@@ -68,7 +68,7 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
                 saved.update(task_id=task['id'],status=status);job.journal.save()
                 if status=='completed' or status in TERMINAL:
                     job.store(repo+'/'+phase+'/attempt-'+str(attempt['number'])+'-task.json',task)
-                    if not revalidating:
+                    if not revalidating or 'seconds' not in attempt:
                         attempt['seconds'] = round(time.time()-attempt['started_epoch'],3)
                         emit('model_terminal', repository=repo, phase=phase, status=status, attempt=attempt['number'], seconds=attempt['seconds'])
                 if status=='completed':
