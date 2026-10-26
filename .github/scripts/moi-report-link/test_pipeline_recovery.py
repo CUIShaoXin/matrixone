@@ -43,6 +43,25 @@ class Model:
 def task(state,reason=None,id='t1'):return dict(id=id,status={'state':state},metadata={'reason_display':{'i18n_key':reason}})
 
 class RecoveryTests(unittest.TestCase):
+ def test_semantic_parser_failure_persists_terminal_clock_before_restart(self):
+  class PersistentJob(Job):
+   def save(self):
+    super().save();self.persisted=copy.deepcopy(self.state)
+  api=Model([task('completed'),task('completed')]);job=PersistentJob(api)
+  def reject(t):raise ValueError('focus_quote_mismatch')
+  with patch('kimi_recovery.time.time',return_value=100):
+   with self.assertRaisesRegex(ValueError,'focus_quote_mismatch'):
+    run_review(job,'repo','primary','source','prompt',reject,poll_seconds=0)
+  original=job.persisted['model_tasks']['repo_primary']['attempts'][0]
+  self.assertEqual(original['seconds'],0);self.assertIn('terminal_observed_at_utc',original)
+  restarted=PersistentJob(api);restarted.state=copy.deepcopy(job.persisted)
+  with patch('kimi_recovery.time.time',return_value=10000):
+   self.assertEqual(run_review(restarted,'repo','primary','source','prompt',lambda t:t['id'],poll_seconds=0),'t1')
+  restored=restarted.state['model_tasks']['repo_primary']['attempts'][0]
+  self.assertEqual(restored['seconds'],original['seconds'])
+  self.assertEqual(restored['terminal_observed_at_utc'],original['terminal_observed_at_utc'])
+  self.assertEqual([r[0] for r in api.requests],['message/send','tasks/get'])
+
  def test_successful_primary_can_be_reused_after_its_original_deadline(self):
   api=Model([task('completed'),task('completed')]);job=Job(api)
   run_review(job,'repo','primary','source','prompt',lambda t:t['id'],poll_seconds=0)
