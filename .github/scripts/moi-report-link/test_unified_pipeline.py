@@ -6,6 +6,41 @@ from source_code_review import accepted,context_for,review_repository
 from test_pipeline_recovery import Job
 
 class UnifiedTests(unittest.TestCase):
+ def rag_artifact_task(self):
+  events=[]
+  def pair(cid,tool,args,output):
+   events.extend([dict(type='moi.tool.call',callId=cid,toolId=tool,arguments=args),dict(type='moi.tool.result',callId=cid,toolId=tool,output=output)])
+  pair('search','search_rag_chunks',{'file_ids':['fid']},{'type':'astra.external_tool_result_summary.v1','truncated':True,'preview':'not full evidence'})
+  identity=dict(artifact_id='rag_chunks_search',file_id='fid',chunk_id='chunk',semantic_model_id=80001)
+  pair('read','read_artifact',dict(identity,cursor=0),dict(identity,cursor=0,content='exact marker',has_more=False))
+  pair('select','select_final_sources',{'sources':[identity]},dict(accepted=True,sources=[identity]))
+  return dict(status={'state':'completed'},events=events)
+ def test_actual_search_full_artifact_and_exact_selection_prove_marker(self):
+  from cloud_daily import verify_rag
+  proof=verify_rag(self.rag_artifact_task(),[dict(file_id='fid',marker='marker')])
+  self.assertEqual(proof[0]['hits'][0]['read_call_id'],'read')
+ def test_truncated_search_summary_does_not_prove_marker(self):
+  from cloud_daily import verify_rag
+  task=self.rag_artifact_task();task['events']=[e for e in task['events'] if e['callId']!='read']
+  with self.assertRaisesRegex(Exception,'rag_marker_missing'):verify_rag(task,[dict(file_id='fid',marker='marker')])
+ def test_full_artifact_from_another_search_cannot_prove_marker(self):
+  from cloud_daily import verify_rag
+  task=self.rag_artifact_task()
+  for e in task['events']:
+   if e['callId']=='read':e.get('arguments',e.get('output'))['artifact_id']='rag_chunks_other_search'
+  with self.assertRaisesRegex(Exception,'rag_marker_missing'):verify_rag(task,[dict(file_id='fid',marker='marker')])
+ def test_partial_artifact_read_is_not_accepted(self):
+  from cloud_daily import verify_rag
+  task=self.rag_artifact_task();task['events'][3]['output']['has_more']=True
+  with self.assertRaisesRegex(Exception,'rag_marker_missing'):verify_rag(task,[dict(file_id='fid',marker='marker')])
+ def test_selected_different_chunk_in_same_file_is_rejected(self):
+  from cloud_daily import verify_rag
+  task=self.rag_artifact_task();task['events'][-1]['output']['sources']=[dict(file_id='fid',chunk_id='other',artifact_id='rag_chunks_search')]
+  with self.assertRaisesRegex(Exception,'rag_sources_not_selected'):verify_rag(task,[dict(file_id='fid',marker='marker')])
+ def test_legacy_complete_search_result_still_supported(self):
+  from cloud_daily import verify_rag
+  task=self.rag_artifact_task();task['events']=[e for e in task['events'] if e['callId']!='read'];task['events'][1]['output']={'items':[dict(source_id='fid',item_id='chunk',content_preview='exact marker',content_preview_truncated=False)]}
+  self.assertEqual(verify_rag(task,[dict(file_id='fid',marker='marker')])[0]['file_id'],'fid')
  def test_reconcile_conflict_reobserves_same_sources_without_reappend(self):
   from cloud_daily import Failure
   class API:

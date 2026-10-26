@@ -114,13 +114,35 @@ def verify_rag(audit, targets):
         hits = []
         for cid, call in calls.items():
             if "search_rag_chunks" not in call.get("toolId", "") or call.get("arguments", {}).get("file_ids") != [target["file_id"]]: continue
-            for item in results.get(cid, {}).get("output", {}).get("items", []):
+            search_result=results.get(cid,{})
+            if search_result.get('toolId')!=call.get('toolId'):continue
+            for item in search_result.get("output", {}).get("items", []):
                 if item.get("source_id") == target["file_id"] and not item.get("content_preview_truncated") and target["marker"] in item.get("content_preview", ""):
                     hits.append({"call_id":cid, "chunk_id":item["item_id"], "marker":target["marker"]})
+            # New MOI returns a bounded external-tool summary. Only actual full
+            # artifact reads tied to this exact search call can prove the marker.
+            # Never parse or trust its truncated preview as complete evidence.
+            artifact_id='rag_chunks_'+cid
+            for read_id,read_call in calls.items():
+                if read_call.get('toolId')!='read_artifact':continue
+                args=read_call.get('arguments',{});read_result=results.get(read_id,{})
+                full=read_result.get('output',{})
+                if args.get('artifact_id')!=artifact_id or args.get('file_id')!=target['file_id'] or args.get('semantic_model_id')!=80001:continue
+                if read_result.get('toolId')!='read_artifact':continue
+                if any(full.get(k)!=args.get(k) for k in ('artifact_id','file_id','chunk_id','semantic_model_id')):continue
+                if not args.get('chunk_id') or args.get('cursor',0)!=0 or full.get('cursor')!=0 or full.get('has_more') is not False:continue
+                if full.get('truncated') or full.get('content_preview_truncated') or target['marker'] not in full.get('content',''):continue
+                hits.append(dict(call_id=cid,read_call_id=read_id,artifact_id=artifact_id,chunk_id=args['chunk_id'],marker=target['marker'],evidence_protocol='search_then_full_artifact'))
         require(bool(hits), "rag_marker_missing")
         proofs.append({"file_id":target["file_id"], "hits":hits})
     selections = [x.get("output", {}) for x in results.values() if "select_final_sources" in x.get("toolId", "")]
-    require(any(x.get("accepted") and {s["file_id"] for s in x.get("sources", [])} == {t["file_id"] for t in targets} for x in selections), "rag_sources_not_selected")
+    def selected_exact_hits(selection):
+        sources=selection.get('sources',[])
+        if not selection.get('accepted') or {s.get('file_id') for s in sources}!={t['file_id'] for t in targets}:return False
+        for proof in proofs:
+            if not any(s.get('file_id')==proof['file_id'] and any(s.get('chunk_id')==h['chunk_id'] and (not h.get('artifact_id') or s.get('artifact_id')==h['artifact_id']) for h in proof['hits']) for s in sources):return False
+        return True
+    require(any(selected_exact_hits(x) for x in selections), "rag_sources_not_selected")
     return proofs
 
 

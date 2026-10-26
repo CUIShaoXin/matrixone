@@ -86,7 +86,7 @@ def audit(job,targets,label):
     from kimi_recovery import run_review
     from api_port_review import llm_calls
     repo=sorted(job.state['commits'])[0]
-    prompt='mode=audit。只执行只读知识库验收，不扫描、不审代码、不修改文件、不上传、不发消息。必须实际调用search_rag_chunks，以每个精确file_id检索marker，max_hits=1,max_rows=1，取包含marker的完整content_preview，再实际调用select_final_sources选择这些来源。不要凭文件名或助手叙述断言通过。'
+    prompt='mode=audit。只执行只读知识库验收，不扫描、不审代码、不修改文件、不上传、不发消息。必须实际调用search_rag_chunks，以每个精确file_id检索marker，max_hits=1,max_rows=1。若返回完整未截断的content_preview，直接核对marker；若返回工具摘要或截断预览，必须实际调用read_artifact，使用该次search返回的artifact_id、精确file_id、chunk_id、semantic_model_id=80001、cursor=0读取完整chunk，确认has_more=false且全文包含marker。然后实际调用select_final_sources，选择同一file_id、chunk_id和artifact_id，必须返回accepted=true。摘要、文件名或助手叙述不能替代真实正文与最终来源选择。'
     context=json.dumps(targets,sort_keys=True)
     def parser(task):
         calls=llm_calls(task)
