@@ -61,8 +61,13 @@ def parse_focus(task, expected):
         for ref in refs:
             require(isinstance(ref,dict),'focus_evidence_invalid')
             quote=ref.get('quote');advisory=next((a for a in source['advisories'] if a['id']==ref.get('id')),None)
-            require(advisory is not None and isinstance(quote,str) and 12<=len(quote)<=300
+            require(advisory is not None and isinstance(quote,str) and 12<=len(quote)<=600
                     and quote in advisory['details'],'focus_quote_mismatch')
+            # The original task is retained unchanged. An exact overlong quote
+            # can be shortened to its exact prefix without another inference.
+            if len(quote)>300:
+                ref['original_quote_chars']=len(quote)
+                ref['quote']=quote[:300]
     return value,calls
 
 

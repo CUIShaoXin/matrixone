@@ -24,6 +24,15 @@ class UnifiedTests(unittest.TestCase):
    with self.assertRaisesRegex(ValueError,'quote_mismatch'):parse_focus(dict(status={'state':'completed'}),expected)
    value['components'].append(copy.deepcopy(value['components'][0]))
    with self.assertRaisesRegex(ValueError,'coverage_mismatch'):parse_focus(dict(status={'state':'completed'}),expected)
+ def test_focus_shortens_only_exact_long_quote_after_full_source_match(self):
+  from combined_renderer import parse_focus
+  expected,value=self.focus_fixture();quote='verified advisory source '*14
+  expected['components'][0]['advisories'][0]['details']=quote
+  value['components'][0]['evidence'][0]['quote']=quote
+  with patch('api_port_review.task_json',return_value=value),patch('api_port_review.llm_calls',return_value=[dict(model='kimi-k3',status='completed')]):
+   result,_=parse_focus(dict(status={'state':'completed'}),expected)
+  ref=result['components'][0]['evidence'][0]
+  self.assertEqual(ref['quote'],quote[:300]);self.assertEqual(ref['original_quote_chars'],len(quote))
  def test_focus_rejects_wrong_model_and_unexpected_tool_calls(self):
   from combined_renderer import parse_focus
   expected,value=self.focus_fixture()
