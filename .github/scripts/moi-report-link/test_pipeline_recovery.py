@@ -43,6 +43,17 @@ class Model:
 def task(state,reason=None,id='t1'):return dict(id=id,status={'state':state},metadata={'reason_display':{'i18n_key':reason}})
 
 class RecoveryTests(unittest.TestCase):
+ def test_parser_fix_revalidates_completed_task_after_budget_without_new_inference(self):
+  api=Model([task('completed'),task('completed')]);job=Job(api)
+  def old_parser(t):raise json.JSONDecodeError('Old transport duplication','',0)
+  with self.assertRaisesRegex(ValueError,'attempts_exhausted'):
+   run_review(job,'repo','primary','source','prompt',old_parser,max_attempts=1,poll_seconds=0)
+  saved=job.state['model_tasks']['repo_primary'];original_seconds=saved['attempts'][0]['seconds'];saved['started_epoch']=0
+  result=run_review(job,'repo','primary','source','prompt',lambda t:t['id'],max_attempts=1,poll_seconds=0)
+  self.assertEqual(result,'t1');self.assertEqual([r[0] for r in api.requests],['message/send','tasks/get'])
+  self.assertEqual(len(saved['attempts']),1);self.assertEqual(saved['attempts'][0]['seconds'],original_seconds)
+  self.assertEqual(saved['attempts'][0]['recovery_reason'],'invalid_json');self.assertTrue(saved['attempts'][0]['output_revalidated_without_inference'])
+
  def test_lost_initiation_reuses_exact_upload(self):
   class LostInitiation(Storage):
    def call(self,method,key,*args,**kwargs):

@@ -36,9 +36,15 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
     with MODEL_SLOTS, span('kimi_'+repo+'_'+phase, repository=repo, commit=job.state['commits'][repo]):
         if 'started_epoch' not in saved:
             saved.update(started_epoch=time.time(),status='planned');job.journal.save()
-        while time.time()-saved['started_epoch'] < deadline_seconds:
+        # A transport parser fix may validate the exact completed output that
+        # was previously rejected. Re-read it once before spending another
+        # attempt, even when the original inference budget is exhausted.
+        previous=saved['attempts'][-1] if saved['attempts'] else {}
+        revalidate=previous.get('status')=='completed' and previous.get('recovery_reason')=='invalid_json'
+        while time.time()-saved['started_epoch'] < deadline_seconds or revalidate:
             attempts = saved['attempts']
-            if not attempts or attempts[-1].get('retry_authorized'):
+            revalidating=revalidate;revalidate=False
+            if not revalidating and (not attempts or attempts[-1].get('retry_authorized')):
                 if len(attempts)>=max_attempts: raise ValueError('model_recovery_attempts_exhausted')
                 number = len(attempts)
                 rid = str(uuid.uuid5(uuid.NAMESPACE_URL,job.state['prefix']+'/'+key+'/'+digest+'/'+contract+'/'+str(number)))
@@ -62,15 +68,19 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
                 saved.update(task_id=task['id'],status=status);job.journal.save()
                 if status=='completed' or status in TERMINAL:
                     job.store(repo+'/'+phase+'/attempt-'+str(attempt['number'])+'-task.json',task)
-                    attempt['seconds'] = round(time.time()-attempt['started_epoch'],3)
-                    emit('model_terminal', repository=repo, phase=phase, status=status, attempt=attempt['number'], seconds=attempt['seconds'])
+                    if not revalidating:
+                        attempt['seconds'] = round(time.time()-attempt['started_epoch'],3)
+                        emit('model_terminal', repository=repo, phase=phase, status=status, attempt=attempt['number'], seconds=attempt['seconds'])
                 if status=='completed':
                     try:
                         value = parser(task)
                     except json.JSONDecodeError:
                         attempt.update(retry_authorized=True,recovery_reason='invalid_json');job.journal.save()
-                        job.issue(key,'invalid_json','Retain failed output and independently review immutable source with a new bounded attempt')
+                        if not revalidating:job.issue(key,'invalid_json','Retain failed output and independently review immutable source with a new bounded attempt')
                         continue
+                    if revalidating:
+                        attempt['output_revalidated_without_inference']=True
+                        emit('model_output_revalidated',repository=repo,phase=phase,attempt=attempt['number'],same_task=True,new_inference=False)
                     job.store(repo+'/'+phase+'-task.json',task)
                     job.journal.save()
                     return value
