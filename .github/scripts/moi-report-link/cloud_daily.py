@@ -114,6 +114,7 @@ def verify_rag(audit, targets):
         hits = []
         for cid, call in calls.items():
             if "search_rag_chunks" not in call.get("toolId", "") or call.get("arguments", {}).get("file_ids") != [target["file_id"]]: continue
+            if str(call.get('arguments',{}).get('volume_id',''))=='80001':continue
             search_result=results.get(cid,{})
             if search_result.get('toolId')!=call.get('toolId'):continue
             for item in search_result.get("output", {}).get("items", []):

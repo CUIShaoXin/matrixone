@@ -102,10 +102,14 @@ def audit(job,targets,label):
     from api_port_review import llm_calls
     repo=sorted(job.state['commits'])[0]
     prompt='mode=audit。只执行只读知识库验收，不扫描、不审代码、不修改文件、不上传、不发消息。必须实际调用search_rag_chunks，以每个精确file_id检索marker，max_hits=1,max_rows=1。若返回完整未截断的content_preview，直接核对marker；若返回工具摘要或截断预览，必须实际调用read_artifact，使用该次search返回的artifact_id、精确file_id、chunk_id、semantic_model_id=80001、cursor=0读取完整chunk，确认has_more=false且全文包含marker。然后实际调用select_final_sources，选择同一file_id、chunk_id和artifact_id，必须返回accepted=true。摘要、文件名或助手叙述不能替代真实正文与最终来源选择。'
+    # A semantic model ID is not a Catalog volume ID. The optional volume
+    # filter silently excludes every source when the two are confused.
+    prompt+='\n知识库semantic_model_id为80001；它不是volume_id。search_rag_chunks必须省略volume_id，只传file_ids=[目标file_id]、keywords=[目标marker]、max_hits=1、max_rows=1。禁止把80001填入volume_id。read_artifact才使用semantic_model_id=80001。按目标依次完成search→完整read→select；零命中立即结束并如实报告失败，不循环猜测编号或等待。完成工具核验后立即结束，不需要长篇解释。'
     context=json.dumps(targets,sort_keys=True)
     def parser(task):
         calls=llm_calls(task)
         if not calls or any(c.get('model')!='kimi-k3' or c.get('status')!='completed' for c in calls):
             raise ValueError('knowledge_actual_kimi_missing')
         return verify_rag(task,targets)
-    return run_review(job,repo,'kb_'+label,context,prompt,parser,deadline_seconds=1200)
+    # Retain the prior incorrect-scope task and its original inference budget.
+    return run_review(job,repo,'kb_'+label+'_scope_v2',context,prompt,parser,deadline_seconds=1200)

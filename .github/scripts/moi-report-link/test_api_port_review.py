@@ -6,6 +6,17 @@ from pathlib import Path
 import api_port_review as m
 
 class SourceReviewTests(unittest.TestCase):
+    def test_large_router_does_not_starve_cited_handler_or_listener_in_focused_review(self):
+        server='moi/pkg/api/server.go';handler='moi/pkg/api/handlers/sandbox_terminal.go';listener='workers/go-worker/pkg/worker/health.go'
+        lines=['// '+('large route unrelated text '*9) for _ in range(2600)]
+        lines[450]='productGroup.HandleFunc("GET /terminal/ws", sandboxHandler.ServeTerminalWS)'
+        files={server:dict(lines=lines,sha256='router',bytes=800000),handler:dict(lines=['package handlers','func (s *Sandbox) ServeTerminalWS() {','  validateTerminalToken()','}'],sha256='handler',bytes=100),listener:dict(lines=['package worker','func NewPprofServer(addr string) {}'],sha256='listener',bytes=60)}
+        prior={'findings':[{'evidence':[{'path':server,'line':451}]}]}
+        context,meta,evidence=m.context_for('matrixflow',{'commit':'a'*40,'report_date':'2026-10-26'},files,[],[{'path':handler},{'path':listener}],prior,focused=True)
+        self.assertIn(handler,evidence);self.assertIn(listener,evidence);self.assertIn(451,evidence[server])
+        self.assertIn('validateTerminalToken()',context);self.assertLess(meta['context_bytes'],91000)
+        self.assertEqual(meta['context_policy'],'balanced_final_focus_v1')
+
     def test_split_fence_and_repeated_complete_result_are_not_duplicate_json(self):
         import json
         value={'schema':m.SCHEMA,'repository':'taas','commit':'a'*40,'findings':[]}

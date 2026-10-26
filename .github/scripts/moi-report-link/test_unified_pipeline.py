@@ -6,6 +6,18 @@ from source_code_review import accepted,context_for,review_repository
 from test_pipeline_recovery import Job
 
 class UnifiedTests(unittest.TestCase):
+ def test_kb_audit_explicitly_omits_volume_filter_and_preserves_old_phase(self):
+  job=Job(None)
+  with patch('kimi_recovery.run_review',return_value=[]) as run:
+   kb.audit(job,[dict(file_id='fid',marker='marker')],'matrixone')
+  args=run.call_args.args
+  self.assertEqual(args[2],'kb_matrixone_scope_v2')
+  self.assertIn('search_rag_chunks必须省略volume_id',args[4])
+  self.assertIn('不是volume_id',args[4])
+ def test_knowledge_id_used_as_volume_cannot_prove_retrieval(self):
+  from cloud_daily import verify_rag
+  task=self.rag_artifact_task();task['events'][0]['arguments']['volume_id']='80001'
+  with self.assertRaisesRegex(Exception,'rag_marker_missing'):verify_rag(task,[dict(file_id='fid',marker='marker')])
  def test_one_failed_repository_does_not_skip_remaining_scans_or_allow_publication(self):
   from daily_pipeline import scan_components
   import types
