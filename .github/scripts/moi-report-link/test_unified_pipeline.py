@@ -96,6 +96,30 @@ class UnifiedTests(unittest.TestCase):
   from cloud_daily import verify_rag
   proof=verify_rag(self.rag_artifact_task(),[dict(file_id='fid',marker='marker')])
   self.assertEqual(proof[0]['hits'][0]['read_call_id'],'read')
+ def test_failed_selection_text_before_corrected_call_does_not_hide_real_proof(self):
+  from cloud_daily import verify_rag
+  task=self.rag_artifact_task()
+  failed=[dict(type='moi.tool.call',callId='bad-select',toolId='select_final_sources',arguments={'sources':[]}),dict(type='moi.tool.result',callId='bad-select',toolId='select_final_sources',output='select_final_sources: unsupported final answer source type ""')]
+  task['events'][-2:-2]=failed
+  self.assertEqual(verify_rag(task,[dict(file_id='fid',marker='marker')])[0]['file_id'],'fid')
+ def test_failed_full_read_text_before_corrected_call_does_not_crash(self):
+  from cloud_daily import verify_rag
+  task=self.rag_artifact_task();args=task['events'][2]['arguments'].copy()
+  failed=[dict(type='moi.tool.call',callId='bad-read',toolId='read_artifact',arguments=args),dict(type='moi.tool.result',callId='bad-read',toolId='read_artifact',output='Agent Binding MCP JSON-RPC error -32602')]
+  task['events'][2:2]=failed
+  self.assertEqual(verify_rag(task,[dict(file_id='fid',marker='marker')])[0]['hits'][0]['read_call_id'],'read')
+ def test_failed_selection_text_alone_never_proves_acceptance(self):
+  from cloud_daily import verify_rag
+  task=self.rag_artifact_task();task['events'][-1]['output']='unsupported final answer source type'
+  with self.assertRaisesRegex(Exception,'rag_sources_not_selected'):verify_rag(task,[dict(file_id='fid',marker='marker')])
+ def test_malformed_selected_sources_do_not_count_as_acceptance(self):
+  from cloud_daily import verify_rag
+  task=self.rag_artifact_task();task['events'][-1]['output']={'accepted':True,'sources':['fid']}
+  with self.assertRaisesRegex(Exception,'rag_sources_not_selected'):verify_rag(task,[dict(file_id='fid',marker='marker')])
+ def test_unpaired_selection_result_never_proves_acceptance(self):
+  from cloud_daily import verify_rag
+  task=self.rag_artifact_task();task['events']=[e for e in task['events'] if not (e['callId']=='select' and e['type']=='moi.tool.call')]
+  with self.assertRaisesRegex(Exception,'rag_sources_not_selected'):verify_rag(task,[dict(file_id='fid',marker='marker')])
  def test_truncated_search_summary_does_not_prove_marker(self):
   from cloud_daily import verify_rag
   task=self.rag_artifact_task();task['events']=[e for e in task['events'] if e['callId']!='read']

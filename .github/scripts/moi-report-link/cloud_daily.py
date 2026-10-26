@@ -117,7 +117,9 @@ def verify_rag(audit, targets):
             if str(call.get('arguments',{}).get('volume_id',''))=='80001':continue
             search_result=results.get(cid,{})
             if search_result.get('toolId')!=call.get('toolId'):continue
-            for item in search_result.get("output", {}).get("items", []):
+            search_output=search_result.get('output')
+            if not isinstance(search_output,dict):continue
+            for item in search_output.get("items", []):
                 if item.get("source_id") == target["file_id"] and not item.get("content_preview_truncated") and target["marker"] in item.get("content_preview", ""):
                     hits.append({"call_id":cid, "chunk_id":item["item_id"], "marker":target["marker"]})
             # New MOI returns a bounded external-tool summary. Only actual full
@@ -128,6 +130,9 @@ def verify_rag(audit, targets):
                 if read_call.get('toolId')!='read_artifact':continue
                 args=read_call.get('arguments',{});read_result=results.get(read_id,{})
                 full=read_result.get('output',{})
+                # Failed tool calls can return plain error text before the
+                # same task corrects its arguments and supplies real evidence.
+                if not isinstance(full,dict):continue
                 if args.get('artifact_id')!=artifact_id or args.get('file_id')!=target['file_id'] or args.get('semantic_model_id')!=80001:continue
                 if read_result.get('toolId')!='read_artifact':continue
                 if any(full.get(k)!=args.get(k) for k in ('artifact_id','file_id','chunk_id','semantic_model_id')):continue
@@ -136,10 +141,14 @@ def verify_rag(audit, targets):
                 hits.append(dict(call_id=cid,read_call_id=read_id,artifact_id=artifact_id,chunk_id=args['chunk_id'],marker=target['marker'],evidence_protocol='search_then_full_artifact'))
         require(bool(hits), "rag_marker_missing")
         proofs.append({"file_id":target["file_id"], "hits":hits})
-    selections = [x.get("output", {}) for x in results.values() if "select_final_sources" in x.get("toolId", "")]
+    selections = [x['output'] for cid,x in results.items()
+                  if x.get('toolId')=='select_final_sources'
+                  and calls.get(cid,{}).get('toolId')==x.get('toolId')
+                  and isinstance(x.get('output'),dict)]
     def selected_exact_hits(selection):
         sources=selection.get('sources',[])
-        if not selection.get('accepted') or {s.get('file_id') for s in sources}!={t['file_id'] for t in targets}:return False
+        if selection.get('accepted') is not True or not isinstance(sources,list) or not all(isinstance(s,dict) for s in sources):return False
+        if {s.get('file_id') for s in sources}!={t['file_id'] for t in targets}:return False
         for proof in proofs:
             if not any(s.get('file_id')==proof['file_id'] and any(s.get('chunk_id')==h['chunk_id'] and (not h.get('artifact_id') or s.get('artifact_id')==h['artifact_id']) for h in proof['hits']) for s in sources):return False
         return True
