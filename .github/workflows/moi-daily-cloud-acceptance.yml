@@ -1,6 +1,10 @@
 name: MOI Matrix security daily
 run-name: MOI security ${{ inputs.mode || github.event.schedule }} - ${{ inputs.resume_run_id || 'daily batch' }}
 on:
+  schedule:
+    # UTC: Asia/Shanghai 04:17 preparation, 10:00 delivery.
+    - cron: '17 20 * * *'
+    - cron: '0,20,40 2 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -11,7 +15,7 @@ on:
       runtime_ref:
         description: Reviewed immutable runtime revision
         required: true
-        default: c11c33fd22c0299815b3d2788fe2e47965a4c7a4
+        default: 09d6e2b398d628bd712adde2d28fd6e4b705b35d
       resume_run_id:
         description: Same-day checkpoint only; blank starts the daily batch on schedule
         required: false
@@ -28,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.runtime_ref || 'c11c33fd22c0299815b3d2788fe2e47965a4c7a4' }}
+          ref: ${{ inputs.runtime_ref || '09d6e2b398d628bd712adde2d28fd6e4b705b35d' }}
           persist-credentials: false
           sparse-checkout: .github/scripts/moi-report-link
       - name: Record actual runtime revision
@@ -67,7 +71,7 @@ jobs:
             out/pipeline-events.jsonl
           retention-days: 14
   deliver:
-    if: github.event_name == 'schedule' && github.event.schedule == '0 2 * * *' || github.event_name == 'workflow_dispatch' && (inputs.mode == 'deliver' || inputs.mode == 'preview')
+    if: github.event_name == 'schedule' && github.event.schedule == '0,20,40 2 * * *' || github.event_name == 'workflow_dispatch' && (inputs.mode == 'deliver' || inputs.mode == 'preview')
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     concurrency:
@@ -76,7 +80,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.runtime_ref || 'c11c33fd22c0299815b3d2788fe2e47965a4c7a4' }}
+          ref: ${{ inputs.runtime_ref || '09d6e2b398d628bd712adde2d28fd6e4b705b35d' }}
           persist-credentials: false
           sparse-checkout: .github/scripts/moi-report-link
       - name: Record actual runtime revision
