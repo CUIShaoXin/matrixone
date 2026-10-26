@@ -1,6 +1,7 @@
 """Serialized, source-identity based ingestion and actual read-only tool evidence."""
 import json
 import datetime as dt
+import re
 import threading
 import time
 import urllib.error
@@ -22,7 +23,7 @@ def matching(allrows,fid):
     return [r for r in allrows if fid in (r.get('source_file_id'),r.get('kb_file_id'),r.get('source_id'))]
 
 
-def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15):
+def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_visibility_grace_seconds=180):
     with KB_LOCK,span('knowledge_ingestion'):
         saved=job.state.setdefault('knowledge_registration',{})
         start=time.monotonic();seen_rounds={};last_reconcile=start-60
@@ -40,12 +41,26 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15):
                     if found:
                         state['observed']=True
                         if all(v.get('ingest_status')=='failed' for v in found):
-                            job.store('knowledge-failure-'+fid+'.json',found)
+                            if not state.get('failure_evidence_recorded'):
+                                state['failure_evidence']=job.store('knowledge-failure-'+fid+'.json',found)
+                                # Retain the first failed view unchanged throughout recovery.
+                                state['failure_evidence_recorded']=True
                             operation='source_jobs'
                             jobs=job.api.data(job.api.request('/semantic-models/80001/source-jobs',timeout=90))
                             active=[v for v in jobs.get('items',[]) if fid in (v.get('source_file_id'),v.get('kb_file_id')) and v.get('job_status') in ('pending','queued','running')]
-                            if not active:raise ValueError('knowledge_ingestion_failed_requires_backend_repair')
-                            emit('knowledge_status_reconciling',active_jobs=len(active))
+                            if not active:
+                                # The live source view can briefly project a missing execution
+                                # before its real file-runtime facts are visible. Re-observe
+                                # these exact source IDs only; never reappend or accept failure.
+                                invisible=all(re.fullmatch(r'workflow execution [0-9a-f-]{36} not found: domain object not found',v.get('error') or '') for v in found)
+                                first=state.setdefault('missing_runtime_first_observed_epoch',time.time()) if invisible else 0
+                                elapsed=time.time()-first
+                                if not invisible or elapsed>=runtime_visibility_grace_seconds:
+                                    raise ValueError('knowledge_ingestion_failed_requires_backend_repair')
+                                state['missing_runtime_observations']=state.get('missing_runtime_observations',0)+1
+                                job.journal.save()
+                                emit('knowledge_runtime_visibility_wait',same_sources=True,elapsed_seconds=round(elapsed,3),grace_seconds=runtime_visibility_grace_seconds)
+                            else:emit('knowledge_status_reconciling',active_jobs=len(active))
                     else:
                         seen_rounds[fid]=seen_rounds.get(fid,0)+1
                         # Native raw-volume save may enqueue registration. Let it become visible first.

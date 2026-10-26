@@ -6,6 +6,38 @@ from source_code_review import accepted,context_for,review_repository
 from test_pipeline_recovery import Job
 
 class UnifiedTests(unittest.TestCase):
+ def test_missing_runtime_source_view_is_reobserved_without_duplicate_registration(self):
+  class API:
+   @staticmethod
+   def data(x):return x
+   def request(self,path,payload=None,**kw):
+    self_test.assertIsNone(payload);return {'items':[]}
+  self_test=self;job=Job(API())
+  failed=dict(source_file_id='fid',ingest_status='failed',error='workflow execution 11111111-1111-1111-1111-111111111111 not found: domain object not found')
+  with patch.object(kb,'rows',side_effect=[[failed],[dict(source_file_id='fid',ingest_status='succeeded')]]),patch.object(kb.time,'sleep'):
+   kb.ensure_sources(job,[dict(file_id='fid',name='x.md')])
+  state=job.state['knowledge_registration']['fid']
+  self.assertTrue(state['succeeded']);self.assertEqual(state['missing_runtime_observations'],1);self.assertNotIn('append_attempted',state)
+ def test_missing_runtime_view_has_a_bounded_grace_and_cannot_be_accepted(self):
+  class API:
+   @staticmethod
+   def data(x):return x
+   def request(self,*a,**kw):return {'items':[]}
+  job=Job(API());failed=dict(source_file_id='fid',ingest_status='failed',error='workflow execution 11111111-1111-1111-1111-111111111111 not found: domain object not found')
+  with patch.object(kb,'rows',return_value=[failed]):
+   with self.assertRaisesRegex(ValueError,'knowledge_ingestion_failed_requires_backend_repair'):
+    kb.ensure_sources(job,[dict(file_id='fid',name='x.md')],runtime_visibility_grace_seconds=0)
+  self.assertNotIn('succeeded',job.state['knowledge_registration']['fid'])
+ def test_actual_terminal_source_failure_without_active_job_still_blocks(self):
+  class API:
+   @staticmethod
+   def data(x):return x
+   def request(self,*a,**kw):return {'items':[]}
+  job=Job(API())
+  with patch.object(kb,'rows',return_value=[dict(source_file_id='fid',ingest_status='failed',error='embedding failed')]):
+   with self.assertRaisesRegex(ValueError,'knowledge_ingestion_failed_requires_backend_repair'):
+    kb.ensure_sources(job,[dict(file_id='fid',name='x.md')])
+  self.assertNotIn('missing_runtime_first_observed_epoch',job.state['knowledge_registration']['fid'])
  def rag_artifact_task(self):
   events=[]
   def pair(cid,tool,args,output):
