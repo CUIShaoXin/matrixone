@@ -296,9 +296,14 @@ class UnifiedTests(unittest.TestCase):
   job=Job(types.SimpleNamespace(data=lambda x:x,request=lambda *a,**k:{'items':[]}))
   with patch.object(kb,'rows',return_value=[dict(source_file_id='fid',ingest_status='failed')]):
    with self.assertRaisesRegex(ValueError,'requires_backend_repair'):kb.ensure_sources(job,[dict(file_id='fid',name='x.md')])
- def test_workflow_has_no_send_schedule_push_or_historical_fallback(self):
+ def test_workflow_never_uses_push_or_fixed_historical_fallback(self):
   workflow=(Path(__file__).parents[2]/'workflows/moi-daily-cloud-acceptance.yml')
   if workflow.exists():
-   text=workflow.read_text();self.assertNotIn('schedule:',text);self.assertNotIn('push:',text);self.assertNotIn('39885692751',text)
+   text=workflow.read_text();self.assertNotIn('push:',text);self.assertNotIn('39885692751',text)
+   if 'schedule:' in text:
+    self.assertIn("17 20 * * *",text)
+    self.assertIn('daily_delivery.py',text)
+    self.assertIn('MATRIX_SCHEDULED_BATCH',text)
+    self.assertIn('cancel-in-progress: false',text)
 
 if __name__=='__main__':unittest.main()

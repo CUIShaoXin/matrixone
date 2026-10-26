@@ -200,11 +200,29 @@ def verify_send(task, claim):
     cid = next(iter(calls))
     args = calls[cid]['arguments']
     require(args.get('channel_instance_id') == CHANNEL and args.get('msg_type') == 'markdown' and args.get('content') == claim['content'], 'delivery_sent_content_mismatch')
-    result = results[cid]['output']; output = result.get('output', result)
-    require(output.get('ok') is True and output.get('status') == 'COMPLETED' and output.get('data', {}).get('ok') is True and output.get('request_id') == cid, 'delivery_real_tool_receipt_missing')
+    result = results[cid]['output']
+    require(isinstance(result, dict), 'delivery_tool_output_invalid')
+    output = result.get('output', result)
+    require(isinstance(output, dict), 'delivery_tool_output_invalid')
+    legacy = output.get('ok') is True and output.get('status') == 'COMPLETED' and output.get('data', {}).get('ok') is True and output.get('request_id') == cid
+    # Current native channel runtime returns a typed acknowledgement instead
+    # of the former work-item envelope. Bind every identity; a model's "sent"
+    # text or an arbitrary {ok:true} cannot satisfy either supported protocol.
+    native = (result.get('call_id') == cid and result.get('tool_id') == 'moi_wecom_robot_message'
+              and isinstance(result.get('created_at'), str) and output.get('ok') is True
+              and output.get('operation') == 'group_robot_send' and output.get('request_id') == cid
+              and output.get('workspace_id') == WORKSPACE)
+    require(legacy or native, 'delivery_real_tool_receipt_missing')
+    if native:
+        # Go emits nanoseconds; Python 3.9 accepts at most microseconds.
+        stamp = re.sub(r'(\.\d{6})\d+', r'\1', result['created_at']).replace('Z', '+00:00')
+        at = dt.datetime.fromisoformat(stamp)
+        require(at.tzinfo is not None and at.astimezone(LOCAL).date().isoformat() == claim['date'], 'delivery_ack_wrong_date')
     return dict(schema='matrix_daily_delivery_v1', date=claim['date'], scope='three-repositories',
                 sent=True, status='sent', channel_instance_id=CHANNEL, task_id=task['id'],
                 attempt_id=claim['attempt_id'], tool_call_id=cid, tool_output=result,
+                tool_receipt_protocol='native_channel_ack_v1' if native else 'work_item_completed_v1',
+                sent_at_utc=result.get('created_at'),
                 content=claim['content'], content_sha256=sha(claim['content'].encode()),
                 publication_file_id=claim['publication_file_id'], prefix=claim['prefix'],
                 verified_at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
