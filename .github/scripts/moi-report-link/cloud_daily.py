@@ -243,7 +243,10 @@ class Runner:
         stages = self.state.setdefault("stages", {})
         stage = stages.setdefault(label, {})
         if not stage:
-            stage.update(workflow_id=str(uuid.uuid5(uuid.NAMESPACE_URL,WORKSPACE+"/matrix-daily-reusable-v2/"+label)), status="planned")
+            # A deleted app ID cannot be reused: MOI's completed delete command
+            # may acknowledge its old deletion while leaving the new app alive.
+            identity=WORKSPACE+'/matrix-daily-ephemeral-v3/'+self.state['date']+'/'+self.state['run_id']+'/'+label
+            stage.update(workflow_id=str(uuid.uuid5(uuid.NAMESPACE_URL,identity)), status="planned", lifecycle_version=3)
             self.journal.save()
         input_digest=sha256(json_bytes(nodes))
         require(stage.get("input_sha256",input_digest)==input_digest,"workflow_resume_input_changed")

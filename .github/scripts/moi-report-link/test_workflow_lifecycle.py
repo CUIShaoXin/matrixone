@@ -92,6 +92,18 @@ class WorkflowLifecycleTests(unittest.TestCase):
         self.assertEqual(runner.workflow('lifecycle_probe', nodes), first)
         self.assertEqual((runner.api.deploys, runner.api.submits, runner.api.deletes), (1, 1, 1))
 
+    def test_next_batch_never_recreates_a_previously_deleted_app_id(self):
+        runner, nodes = self.runner()
+        runner.workflow('lifecycle_probe', nodes)
+        old_id = runner.state['stages']['lifecycle_probe']['workflow_id']
+        later, later_nodes = self.runner()
+        later.state['run_id'] = 'test-2'
+        later.state['prefix'] = 'private/test-2'
+        later.workflow('lifecycle_probe', later_nodes)
+        new_id = later.state['stages']['lifecycle_probe']['workflow_id']
+        self.assertNotEqual(old_id, new_id)
+        self.assertEqual(later.state['stages']['lifecycle_probe']['cleanup']['status'], 'deleted')
+
     def test_uncertain_delete_is_reconciled_without_second_delete(self):
         runner, nodes = self.runner()
         runner.api.lost_delete = True

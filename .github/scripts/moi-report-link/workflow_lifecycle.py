@@ -65,8 +65,8 @@ def retire(runner, label):
 def _retire(runner, label, stage):
     from cloud_daily import WORKSPACE
     wid, eid = stage['workflow_id'], stage['execution_id']
-    expected_id = str(uuid.uuid5(uuid.NAMESPACE_URL,
-                                WORKSPACE+'/matrix-daily-reusable-v2/'+label))
+    expected_id = str(uuid.uuid5(uuid.NAMESPACE_URL, WORKSPACE+
+        '/matrix-daily-ephemeral-v3/'+runner.state['date']+'/'+runner.state['run_id']+'/'+label))
     if wid != expected_id or stage['status'] not in TERMINAL:
         raise ValueError('workflow_cleanup_ownership_or_state_mismatch')
     if stage['status'] == 'completed' and 'output_artifacts' not in stage:
