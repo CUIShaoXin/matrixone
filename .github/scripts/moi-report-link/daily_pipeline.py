@@ -49,7 +49,7 @@ def scan_components(runner,archives,on_failure):
 
 def main():
     date=dt.datetime.now(preflight.LOCAL).date().isoformat();start=time.monotonic()
-    run_id=os.environ.get('MATRIX_PIPELINE_RESUME_RUN_ID') or os.environ['GITHUB_RUN_ID']+'-'+os.environ.get('GITHUB_RUN_ATTEMPT','1')
+    run_id=os.environ.get('MATRIX_PIPELINE_RESUME_RUN_ID') or ('daily-'+date.replace('-','') if os.environ.get('MATRIX_SCHEDULED_BATCH')=='true' else os.environ['GITHUB_RUN_ID']+'-'+os.environ.get('GITHUB_RUN_ATTEMPT','1'))
     mode=os.environ.get('MATRIX_PIPELINE_MODE','full')
     status=dict(schema='matrix_unified_no_send_status_v1',date=date,run_id=run_id,mode=mode,sent=False,daily_automation_ready=False,execution_head=os.environ.get('MATRIX_RUNTIME_SHA',os.environ.get('GITHUB_SHA')))
     out=Path('out/pipeline');out.mkdir(parents=True,exist_ok=True)
@@ -130,6 +130,10 @@ def main():
                     else:receipt=publish_report(job,source,page,api_results)
                     root.value.update(published=True,publication_file_id=receipt['receipt_artifact']['file_id'],commits=commits);root.save()
                     status.update(status='passed',same_batch_end_to_end_passed=True,publication_file_id=root.value['publication_file_id'],component_focus_count=ncomp,code_findings=ncode,api_port_findings=receipt['added_findings'],kb_verified=True,minio_login_free_verified=True)
+        if mode=='full' and status.get('same_batch_end_to_end_passed'):
+            from daily_delivery import export_ready
+            export_ready(api,objects,prefix,date)
+            status['daily_delivery_readiness_verified']=True
     except Exception as exc:
         status.update(status='failed',same_batch_end_to_end_passed=False,**error_fields(exc))
         if re.fullmatch('[a-z][a-z0-9_]{0,100}',str(exc)):status['safe_code']=str(exc)
