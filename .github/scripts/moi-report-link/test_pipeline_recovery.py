@@ -2,6 +2,7 @@ import copy,hashlib,json,types,unittest,xml.etree.ElementTree as ET
 from unittest.mock import patch
 from resilient_storage import Objects, PART_SIZE, sha256
 from kimi_recovery import run_review
+from test_workflow_lifecycle import WorkflowLifecycleTests
 
 class Storage(Objects):
  def __init__(self,lost_part=False,lost_complete=False):

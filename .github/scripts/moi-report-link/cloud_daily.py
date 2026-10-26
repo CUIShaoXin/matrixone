@@ -249,6 +249,13 @@ class Runner:
         require(stage.get("input_sha256",input_digest)==input_digest,"workflow_resume_input_changed")
         stage["input_sha256"]=input_digest
         wid = stage["workflow_id"]
+        from workflow_lifecycle import cached_outputs, retire
+        if stage['status'] == 'completed':
+            cached = cached_outputs(self, stage, nodes)
+            if cached is not None:
+                retire(self, label)
+                return cached
+        require(stage['status'] not in ('failed','cancelled','canceled','error','timeout'), 'moi_workflow_failed:'+label)
         if stage["status"] == "planned":
             lines = ["workflow:", "  name: matrix_daily_" + label, "  root: root", "root:", "  chain:"]
             for node in nodes:
@@ -279,7 +286,11 @@ class Runner:
                     stage.update(status="completed", moi_case_id=result.get("moi_case_id"))
                     self.journal.save()
                     break
-                require(result["status"] not in ("failed", "cancelled", "canceled", "error"), "moi_workflow_failed:" + label)
+                if result['status'] in ('failed','cancelled','canceled','error','timeout'):
+                    stage['status'] = result['status']
+                    self.journal.save()
+                    retire(self, label)
+                    raise Failure('moi_workflow_failed:'+label)
                 time.sleep(12)
             require(stage["status"] == "completed", "moi_workflow_timeout")
         artifacts = {}
@@ -289,6 +300,9 @@ class Runner:
             fid = data["run"]["runtime_output"]["file_id"]
             raw = self.api.file(fid)
             artifacts[node["name"]] = (file_evidence(fid, raw, name=node["input"]["output_file_name"]), raw)
+        stage['output_artifacts'] = {name:item[0] for name,item in artifacts.items()}
+        self.journal.save()
+        retire(self, label)
         return artifacts
 
     @staticmethod

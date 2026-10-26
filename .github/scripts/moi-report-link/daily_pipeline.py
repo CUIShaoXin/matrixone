@@ -54,8 +54,15 @@ def main():
     status=dict(schema='matrix_unified_no_send_status_v1',date=date,run_id=run_id,mode=mode,sent=False,daily_automation_ready=False,execution_head=os.environ.get('MATRIX_RUNTIME_SHA',os.environ.get('GITHUB_SHA')))
     out=Path('out/pipeline');out.mkdir(parents=True,exist_ok=True)
     try:
-        require(re.fullmatch('[A-Za-z0-9_-]{1,80}',run_id) and mode in ('archives','reviews','full'),'invalid_pipeline_input')
+        require(re.fullmatch('[A-Za-z0-9_-]{1,80}',run_id) and mode in ('archives','reviews','full','maintenance'),'invalid_pipeline_input')
         api=DailyAPI(os.environ['MOI_API_KEY']);objects=preflight.Objects.from_workspace(api)
+        if mode == 'maintenance':
+            from workflow_lifecycle import probe
+            status.update(probe(api, objects, date, run_id), status='passed',
+                          seconds=round(time.monotonic()-start,3))
+            (out/'status.json').write_bytes(json_bytes(status))
+            print(json.dumps(status), flush=True)
+            return 0
         prefix='receipts/'+date.replace('-','')+'/pipeline-'+run_id
         root=open_journal(objects,prefix+'/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix,sent=False))
         if root.value.get('published'):
