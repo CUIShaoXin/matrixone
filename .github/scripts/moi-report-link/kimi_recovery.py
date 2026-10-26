@@ -70,6 +70,11 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
                     job.store(repo+'/'+phase+'/attempt-'+str(attempt['number'])+'-task.json',task)
                     if not revalidating or 'seconds' not in attempt:
                         attempt['seconds'] = round(time.time()-attempt['started_epoch'],3)
+                        attempt['terminal_observed_at_utc'] = dt.datetime.now(dt.timezone.utc).isoformat()
+                        # A semantic parser can fail after a completed model reply.
+                        # Persist its original clock before parsing or recovery
+                        # would replace it with elapsed repair/restart time.
+                        job.journal.save()
                         emit('model_terminal', repository=repo, phase=phase, status=status, attempt=attempt['number'], seconds=attempt['seconds'])
                 if status=='completed':
                     try:
