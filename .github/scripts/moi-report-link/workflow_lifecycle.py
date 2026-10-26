@@ -21,6 +21,11 @@ def digest(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
+def fresh_route(route):
+    # Lifecycle checks must observe the origin, including after a mutation.
+    return route+'?_matrix_retirement='+uuid.uuid4().hex
+
+
 def cached_outputs(runner, stage, nodes):
     evidence = stage.get('output_artifacts')
     if evidence is None:
@@ -68,7 +73,7 @@ def _retire(runner, label, stage):
         raise ValueError('workflow_cleanup_outputs_not_cached')
     route = '/workflow/v2/workflow-apps/'+wid
     try:
-        definition = runner.api.data(runner.api.request(route))['workflow']
+        definition = runner.api.data(runner.api.request(fresh_route(route)))['workflow']
     except Exception as exc:
         if str(exc) != 'moi_http_404' or not stage.get('workflow_archive'):
             raise
@@ -107,16 +112,20 @@ def _retire(runner, label, stage):
     runner.journal.save()
     _check_archive(runner, stage['workflow_archive'])
     # Check again after backup; a new run or redeploy must block removal.
-    current = runner.api.data(runner.api.request(route))['workflow']
+    current = runner.api.data(runner.api.request(fresh_route(route)))['workflow']
     if current != definition:
         raise ValueError('workflow_cleanup_app_changed_during_backup')
     try:
-        runner.api.request(route, method='DELETE', timeout=45)
-    except Exception:
+        reply = runner.api.request(fresh_route(route), method='DELETE', timeout=45)
+        data = runner.api.data(reply)
+        stage['cleanup_delete_ack'] = dict(http_status=reply.get('http_status'),
+            deleted=data.get('deleted'), response_fields=sorted(data))
+    except Exception as exc:
         # The independent GET reconciles an uncertain DELETE; no blind retry.
-        pass
+        stage['cleanup_delete_ack'] = dict(error_type=type(exc).__name__)
+    runner.journal.save()
     try:
-        runner.api.request(route)
+        runner.api.request(fresh_route(route))
     except Exception as exc:
         if str(exc) != 'moi_http_404':
             raise
@@ -152,7 +161,7 @@ def probe(api, objects, date, run_id):
         raise ValueError('workflow_lifecycle_probe_resume_changed_output')
     _check_archive(runner, stage['workflow_archive'])
     try:
-        api.request('/workflow/v2/workflow-apps/'+stage['workflow_id'])
+        api.request(fresh_route('/workflow/v2/workflow-apps/'+stage['workflow_id']))
     except Exception as exc:
         if str(exc) != 'moi_http_404':
             raise
