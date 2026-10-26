@@ -1,0 +1,30 @@
+name: MOI ZIP and report delivery preflight
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: moi-report-link-preflight
+  cancel-in-progress: false
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts/moi-report-link
+      - name: Check fixed archive download and MinIO readback
+        env:
+          MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
+          SCAN_GITHUB_TOKEN: ${{ secrets.SCAN_GITHUB_TOKEN }}
+        run: python3 .github/scripts/moi-report-link/cloud_preflight.py
+      - name: Retain status without manifests, credentials or links
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: moi-cloud-zip-preflight-${{ github.run_id }}
+          path: out/moi-cloud-zip-preflight-receipt.json
+          retention-days: 7
+

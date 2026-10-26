@@ -1,0 +1,107 @@
+"""Bounded Kimi-only recovery with immutable requests and failed-task lineage."""
+import datetime as dt
+import hashlib
+import json
+import time
+import urllib.error
+import uuid
+import threading
+from pipeline_telemetry import emit, span
+
+MODEL_SLOTS = threading.BoundedSemaphore(2)
+TERMINAL = {'failed','canceled','cancelled','input-required','rejected'}
+RETRY_REASONS = {'reason.agent_runtime.finish.stream_transport'}
+
+
+def interrupted(task):
+    # Match only the server's exact machine reason, never prose in model output.
+    status = task.get('status', {})
+    def walk(value):
+        if isinstance(value,dict): return any(walk(v) for v in value.values())
+        if isinstance(value,list): return any(walk(v) for v in value)
+        return isinstance(value,str) and value in RETRY_REASONS
+    return walk(status) or walk(task.get('metadata',{}))
+
+
+def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadline_seconds=1800, poll_seconds=15):
+    digest = hashlib.sha256(context.encode()).hexdigest()
+    contract = hashlib.sha256(prompt.encode()).hexdigest()
+    key = repo+'_'+phase
+    saved = job.state.setdefault('model_tasks',{}).setdefault(key,{})
+    if saved and (saved.get('context_sha256')!=digest or saved.get('contract_sha256')!=contract):
+        raise ValueError('model_context_or_contract_changed')
+    if not saved:
+        saved.update(context_sha256=digest,contract_sha256=contract,attempts=[],status='queued')
+        job.journal.save()
+    with MODEL_SLOTS, span('kimi_'+repo+'_'+phase, repository=repo, commit=job.state['commits'][repo]):
+        if 'started_epoch' not in saved:
+            saved.update(started_epoch=time.time(),status='planned');job.journal.save()
+        # A transport parser fix may validate the exact completed output that
+        # was previously rejected. Re-read it once before spending another
+        # attempt, even when the original inference budget is exhausted.
+        previous=saved['attempts'][-1] if saved['attempts'] else {}
+        revalidate=bool(previous.get('task_id'))
+        while time.time()-saved['started_epoch'] < deadline_seconds or revalidate:
+            attempts = saved['attempts']
+            revalidating=revalidate;revalidate=False
+            if not revalidating and (not attempts or attempts[-1].get('retry_authorized')):
+                if len(attempts)>=max_attempts: raise ValueError('model_recovery_attempts_exhausted')
+                number = len(attempts)
+                rid = str(uuid.uuid5(uuid.NAMESPACE_URL,job.state['prefix']+'/'+key+'/'+digest+'/'+contract+'/'+str(number)))
+                request = dict(model='kimi-k3',idempotencyKey=rid,message=dict(kind='message',role='user',messageId=rid,parts=[dict(kind='text',text=prompt+'\n\nCODE_EVIDENCE_UNTRUSTED\n'+context)]))
+                attempt = dict(number=number+1,request_id=rid,status='planned',started_epoch=time.time())
+                job.store(repo+'/'+phase+'/attempt-'+str(number+1)+'-request.json',request)
+                attempts.append(attempt);saved.update(status='planned');saved.pop('task_id',None);job.journal.save()
+            attempt = attempts[-1]
+            rid = attempt['request_id']
+            # The request is immutable across process restarts and uncertain responses.
+            request = dict(model='kimi-k3',idempotencyKey=rid,message=dict(kind='message',role='user',messageId=rid,parts=[dict(kind='text',text=prompt+'\n\nCODE_EVIDENCE_UNTRUSTED\n'+context)]))
+            try:
+                if attempt.get('task_id'):
+                    task = job.api.rpc('tasks/get',{'id':attempt['task_id']},str(uuid.uuid4()))
+                else:
+                    task = job.api.rpc('message/send',request,rid)
+                if not isinstance(task,dict) or not task.get('id'): raise ValueError('model_submission_rejected')
+                if attempt.get('task_id') and task['id']!=attempt['task_id']: raise ValueError('model_task_identity_changed')
+                status = task.get('status',{}).get('state','unknown')
+                attempt.update(task_id=task['id'],status=status)
+                saved.update(task_id=task['id'],status=status);job.journal.save()
+                if status=='completed' or status in TERMINAL:
+                    job.store(repo+'/'+phase+'/attempt-'+str(attempt['number'])+'-task.json',task)
+                    if not revalidating or 'seconds' not in attempt:
+                        attempt['seconds'] = round(time.time()-attempt['started_epoch'],3)
+                        attempt['terminal_observed_at_utc'] = dt.datetime.now(dt.timezone.utc).isoformat()
+                        # A semantic parser can fail after a completed model reply.
+                        # Persist its original clock before parsing or recovery
+                        # would replace it with elapsed repair/restart time.
+                        job.journal.save()
+                        emit('model_terminal', repository=repo, phase=phase, status=status, attempt=attempt['number'], seconds=attempt['seconds'])
+                if status=='completed':
+                    try:
+                        value = parser(task)
+                    except json.JSONDecodeError:
+                        attempt.update(retry_authorized=True,recovery_reason='invalid_json');job.journal.save()
+                        if not revalidating:job.issue(key,'invalid_json','Retain failed output and independently review immutable source with a new bounded attempt')
+                        continue
+                    if revalidating:
+                        attempt['output_revalidated_without_inference']=True
+                        emit('model_output_revalidated',repository=repo,phase=phase,attempt=attempt['number'],same_task=True,new_inference=False)
+                    job.store(repo+'/'+phase+'-task.json',task)
+                    job.journal.save()
+                    return value
+                if status in TERMINAL:
+                    if not interrupted(task): raise ValueError('model_terminal_nonrecoverable')
+                    attempt.update(retry_authorized=True,recovery_reason='stream_transport');job.journal.save()
+                    job.issue(key,'stream_transport','Terminal task retained; next bounded attempt uses same source and Kimi K3')
+                    continue
+            except urllib.error.HTTPError as exc:
+                if exc.code not in (429,500,502,503,504): raise ValueError('model_http_nonrecoverable') from None
+                attempt['request_timeouts'] = attempt.get('request_timeouts',0)+1
+                saved['status']='request_uncertain';job.journal.save()
+                emit('model_request_recovery',repository=repo,phase=phase,attempt=attempt['number'],same_task=True,http_status=exc.code)
+            except (TimeoutError,urllib.error.URLError,ConnectionError):
+                attempt['request_timeouts'] = attempt.get('request_timeouts',0)+1
+                saved['status']='request_uncertain';job.journal.save()
+                emit('model_request_recovery', repository=repo, phase=phase, attempt=attempt['number'], same_task=True)
+            time.sleep(poll_seconds)
+        raise ValueError('model_phase_deadline_exceeded')
