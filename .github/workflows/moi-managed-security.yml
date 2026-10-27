@@ -18,8 +18,8 @@ on:
         required: true
       trigger_source:
         type: choice
-        options: [moi_manual, moi_api, moi_schedule]
-        default: moi_manual
+        options: [github_manual, moi_manual, moi_api, moi_schedule]
+        default: github_manual
       execution_mode:
         type: choice
         options: [no_send, production]
