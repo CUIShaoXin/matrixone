@@ -2,9 +2,10 @@ name: MOI Matrix security daily
 run-name: MOI security ${{ inputs.mode || github.event.schedule }} - ${{ inputs.resume_run_id || 'daily batch' }}
 on:
   schedule:
-    # UTC: Asia/Shanghai 04:17 preparation, 10:00 delivery.
+    # UTC: Asia/Shanghai 04:17 starts one same-batch run. The delivery job
+    # waits for 10:00 after scan completion, so it does not depend on a
+    # second scheduled event being created by GitHub.
     - cron: '17 20 * * *'
-    - cron: '0,20,40 2 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -15,7 +16,7 @@ on:
       runtime_ref:
         description: Reviewed immutable runtime revision
         required: true
-        default: 602eb813236a258c963eec5e1c7f2ce597eda41a
+        default: e3a7b76c4953965709019cd3eff6ad2780a7b4d4
       resume_run_id:
         description: Same-day checkpoint only; blank starts the daily batch on schedule
         required: false
@@ -32,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.runtime_ref || '602eb813236a258c963eec5e1c7f2ce597eda41a' }}
+          ref: ${{ inputs.runtime_ref || 'e3a7b76c4953965709019cd3eff6ad2780a7b4d4' }}
           persist-credentials: false
           sparse-checkout: .github/scripts/moi-report-link
       - name: Record actual runtime revision
@@ -63,7 +64,7 @@ jobs:
         run: python3 .github/scripts/moi-report-link/daily_pipeline.py
       - name: Retain safe timings and status
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75d540449e92b4886f43607fa02
         with:
           name: moi-security-scan-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -71,7 +72,8 @@ jobs:
             out/pipeline-events.jsonl
           retention-days: 14
   deliver:
-    if: github.event_name == 'schedule' && github.event.schedule == '0,20,40 2 * * *' || github.event_name == 'workflow_dispatch' && (inputs.mode == 'deliver' || inputs.mode == 'preview')
+    needs: scan
+    if: always() && (github.event_name == 'schedule' && github.event.schedule == '17 20 * * *' || github.event_name == 'workflow_dispatch' && (inputs.mode == 'deliver' || inputs.mode == 'preview'))
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     concurrency:
@@ -80,11 +82,21 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.runtime_ref || '602eb813236a258c963eec5e1c7f2ce597eda41a' }}
+          ref: ${{ inputs.runtime_ref || 'e3a7b76c4953965709019cd3eff6ad2780a7b4d4' }}
           persist-credentials: false
           sparse-checkout: .github/scripts/moi-report-link
       - name: Record actual runtime revision
         run: echo "MATRIX_RUNTIME_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Wait until 10:00 Beijing for the scheduled same-batch delivery
+        if: github.event_name == 'schedule'
+        run: |
+          python3 - <<'PY'
+          import datetime as dt
+          import time
+          tz = dt.timezone(dt.timedelta(hours=8))
+          while dt.datetime.now(tz).hour < 10:
+              time.sleep(15)
+          PY
       - name: Verify today's report and deliver once to existing group
         env:
           MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
@@ -92,7 +104,7 @@ jobs:
         run: python3 .github/scripts/moi-report-link/daily_delivery.py
       - name: Retain safe delivery status
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75d540449e92b4886f43607fa02
         with:
           name: moi-security-delivery-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
