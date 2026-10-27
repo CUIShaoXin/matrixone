@@ -48,11 +48,11 @@ class RecoveryTests(unittest.TestCase):
   class PersistentJob(Job):
    def save(self):
     super().save();self.persisted=copy.deepcopy(self.state)
-  api=Model([task('completed'),task('completed')]);job=PersistentJob(api)
+  api=Model([task('completed'),task('completed'),task('completed')]);job=PersistentJob(api)
   def reject(t):raise ValueError('focus_quote_mismatch')
   with patch('kimi_recovery.time.time',return_value=100):
-   with self.assertRaisesRegex(ValueError,'focus_quote_mismatch'):
-    run_review(job,'repo','primary','source','prompt',reject,poll_seconds=0)
+   with self.assertRaisesRegex(ValueError,'attempts_exhausted'):
+    run_review(job,'repo','primary','source','prompt',reject,max_attempts=2,poll_seconds=0)
   original=job.persisted['model_tasks']['repo_primary']['attempts'][0]
   self.assertEqual(original['seconds'],0);self.assertIn('terminal_observed_at_utc',original)
   restarted=PersistentJob(api);restarted.state=copy.deepcopy(job.persisted)
@@ -61,7 +61,19 @@ class RecoveryTests(unittest.TestCase):
   restored=restarted.state['model_tasks']['repo_primary']['attempts'][0]
   self.assertEqual(restored['seconds'],original['seconds'])
   self.assertEqual(restored['terminal_observed_at_utc'],original['terminal_observed_at_utc'])
-  self.assertEqual([r[0] for r in api.requests],['message/send','tasks/get'])
+  self.assertEqual([r[0] for r in api.requests],['message/send','message/send','tasks/get'])
+
+ def test_semantic_validation_failure_retries_same_context_with_new_kimi_task(self):
+  api=Model([task('completed'),task('completed',id='t2')]);job=Job(api)
+  def reject_once(t):
+   if t['id']=='t1':raise ValueError('rag_marker_missing')
+   return t['id']
+  self.assertEqual(run_review(job,'repo','audit','source','prompt',reject_once,max_attempts=2,poll_seconds=0),'t2')
+  saved=job.state['model_tasks']['repo_audit']
+  self.assertEqual([r[0] for r in api.requests],['message/send','message/send'])
+  self.assertNotEqual(api.requests[0][2],api.requests[1][2])
+  self.assertEqual(saved['attempts'][0]['recovery_reason'],'semantic_validation')
+  self.assertEqual(saved['attempts'][0]['parser_error'],'rag_marker_missing')
 
  def test_successful_primary_can_be_reused_after_its_original_deadline(self):
   api=Model([task('completed'),task('completed')]);job=Job(api)

@@ -83,6 +83,27 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
                         attempt.update(retry_authorized=True,recovery_reason='invalid_json');job.journal.save()
                         if not revalidating:job.issue(key,'invalid_json','Retain failed output and independently review immutable source with a new bounded attempt')
                         continue
+                    except Exception as exc:
+                        # A completed Kimi task can still fail the independent
+                        # evidence contract (for example a malformed
+                        # search->read->select tool chain). Treat that as a
+                        # bounded semantic recovery, rather than abandoning
+                        # the repository after the first completed reply.
+                        # The original task and its timing remain immutable;
+                        # the next attempt gets the same context and contract.
+                        safe = str(exc) if isinstance(exc, ValueError) or type(exc).__name__ == 'Failure' else type(exc).__name__
+                        if not isinstance(safe, str) or not safe or len(safe) > 120 or not all(c.isalnum() or c in '_-' for c in safe):
+                            safe = type(exc).__name__
+                        attempt.update(retry_authorized=True,recovery_reason='semantic_validation',
+                                      parser_error=safe)
+                        saved['status']='parser_recovery'
+                        job.journal.save()
+                        if not revalidating:
+                            job.issue(key,'semantic_validation_failed',
+                                      'Retain the completed task and retry the same immutable Kimi context with bounded evidence validation')
+                        emit('model_output_rejected',repository=repo,phase=phase,
+                             attempt=attempt['number'],reason=safe,same_task=revalidating)
+                        continue
                     if revalidating:
                         attempt['output_revalidated_without_inference']=True
                         emit('model_output_revalidated',repository=repo,phase=phase,attempt=attempt['number'],same_task=True,new_inference=False)
