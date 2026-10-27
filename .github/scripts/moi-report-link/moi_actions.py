@@ -116,17 +116,21 @@ def reconcile(actions, api, objects, ctx):
     reads. An older observer cannot select a new run or resubmit business work.
     """
     from dataclasses import replace
-    from orchestration_status import check_identity, snapshot, upload_saved
+    from orchestration_status import check_identity, registered_context, snapshot, upload_saved
     key = ctx.prefix+'/orchestration/status.json'
     saved = read_json(objects, key, missing=True)
-    if saved is not None:
-        check_identity(saved, ctx)
+    if saved is not None: check_identity(saved, ctx)
+    bound = registered_context(objects, ctx, saved)
+    if bound is not None:
+        github = bound.github
+    elif saved is not None:
         github = github_identity(saved.get('github', {}))
     else:
         intent = read_json(objects, ctx.prefix+'/orchestration/dispatch.json', missing=True)
         if intent is None: raise ValueError('github_run_binding_required')
         check_identity(dict(intent, execution_mode=intent['request']['inputs']['execution_mode']), ctx)
         github = github_identity(dict(run_id=intent.get('github_run_id'), attempt=intent.get('github_attempt')))
+        bound = replace(ctx, github=github, trigger_source=intent['request']['inputs']['trigger_source'])
     run = actions.request('/actions/runs/'+github['run_id']+'/attempts/'+str(github['attempt']))
     verify_run(run, ctx, github)
     if run.get('status') != 'completed':
@@ -145,8 +149,6 @@ def reconcile(actions, api, objects, ctx):
     if saved is None:
         # Covers cancellation before checkout/first heartbeat. The identity is
         # the original dispatch's verified run, never this observer's run.
-        inputs = intent['request']['inputs']
-        bound = replace(ctx, github=github, trigger_source=inputs['trigger_source'])
         create_once(objects, key, snapshot(api, objects, bound))
     result = upload_saved(api, objects, ctx)
     result['terminal_applied'] = (result.get('github') == github

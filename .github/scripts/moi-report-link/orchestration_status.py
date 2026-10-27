@@ -17,6 +17,26 @@ def check_identity(value, ctx):
         raise ValueError('batch_execution_mode_conflict')
 
 
+def registered_context(objects, ctx, value):
+    """A registered retry can precede its first status heartbeat.
+
+    Advance only a snapshot known to precede that retry in the execution
+    journal. A newer snapshot absent from the journal must never be downgraded.
+    """
+    from dataclasses import replace
+    from moi_actions import github_identity
+    root = read_json(objects, ctx.prefix+'/checkpoint.json', missing=True) or {}
+    executions = root.get('executions', [])
+    if not executions: return None
+    latest = executions[-1]
+    if value is not None:
+        github = value.get('github')
+        if github == latest.get('github') or not any(e.get('github') == github for e in executions[:-1]):
+            return None
+    check_identity(latest, ctx)
+    return replace(ctx, github=github_identity(latest.get('github', {})), trigger_source=latest['trigger_source'])
+
+
 def apply_terminal(objects, ctx, value):
     """Project a verified Actions terminal result without inventing scan/send results."""
     from moi_actions import terminal_key
@@ -156,6 +176,14 @@ def upload_saved(api, objects, ctx):
         _, headers, original = objects.call('GET', key)
         value = json.loads(original)
         check_identity(value, ctx)
+        registered = registered_context(objects, ctx, value)
+        if registered is not None:
+            previous = value
+            value = snapshot(api, objects, registered)
+            value['previous_execution'] = dict(github=previous['github'], status=previous['status'],
+                                                business_status=previous.get('business_status', previous['status']))
+            if previous.get('sent') is True and previous.get('delivery_receipt_file_id'):
+                value.update(sent=True, delivery_receipt_file_id=previous['delivery_receipt_file_id'])
         value = apply_terminal(objects, ctx, value)
         report_error = None
         if value.get('report_details', {}).get('status') == 'pending':

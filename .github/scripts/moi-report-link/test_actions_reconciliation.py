@@ -253,6 +253,36 @@ class ActionsReconciliationTests(unittest.TestCase):
         self.assertEqual(value['repositories']['matrixone']['status'], 'waiting')
         self.assertIsNone(value['sent'])
 
+    def test_registered_retry_before_first_heartbeat_supersedes_older_snapshot(self):
+        old_execution = dict(self.ctx.record(), github=dict(run_id='123', attempt=1))
+        retry = dict(self.ctx.record(), github=dict(run_id='456', attempt=1))
+        self.store.publish(self.ctx.prefix+'/checkpoint.json', json_bytes(dict(
+            executions=[old_execution, retry], published=True, publication_file_id='report-file')), 'application/json')
+        self.store.publish(self.ctx.prefix+'/components/checkpoint.json', json_bytes(dict(
+            repositories=dict(matrixone=dict(accepted=True), taas=dict(accepted=True), matrixflow=dict(accepted=True)))),
+            'application/json')
+        self.files['report-file'] = json_bytes(dict(url=self.saved['report_url'], expires_at_utc='2026-11-03T00:00:00Z'))
+        def request(path, payload=None):
+            self.assertEqual(path, '/actions/runs/456/attempts/1')
+            self.assertIsNone(payload)
+            return dict(self.run, id=456, html_url='https://github.com/CUIShaoXin/matrixone/actions/runs/456')
+        self.actions.request.side_effect = request
+        self.reconcile()
+        value = self.current()
+        self.assertEqual(value['github'], retry['github'])
+        self.assertEqual(value['status'], 'cancelled')
+        self.assertEqual(value['repositories']['taas']['stages']['component_scan'], 'succeeded')
+        self.assertEqual(value['report_url'], self.saved['report_url'])
+        self.assertEqual(value['executions'], [old_execution, retry])
+        self.assertEqual(value['previous_execution']['github'], old_execution['github'])
+
+    def test_new_snapshot_absent_from_older_journal_is_never_downgraded(self):
+        old = dict(self.ctx.record(), github=dict(run_id='99', attempt=1))
+        self.store.publish(self.ctx.prefix+'/checkpoint.json', json_bytes(dict(executions=[old])), 'application/json')
+        self.reconcile()
+        self.assertEqual(self.current()['github'], self.saved['github'])
+        self.assertEqual(self.current()['status'], 'cancelled')
+
     def test_linked_dispatch_reads_exact_run_instead_of_recent_run_list(self):
         request = dict(ref='main', inputs=dict(mode='managed', runtime_ref='a'*40,
             run_id=self.ctx.run_id, business_date=self.ctx.business_date,
