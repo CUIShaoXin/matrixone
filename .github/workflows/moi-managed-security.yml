@@ -1,0 +1,89 @@
+name: MOI managed security pipeline
+run-name: MOI security managed - ${{ inputs.run_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [managed, status-sync]
+        default: managed
+      runtime_ref:
+        description: Reviewed immutable runtime commit containing managed_entry.py
+        required: true
+      run_id:
+        description: MOI business batch identity; stable across retries
+        required: true
+      business_date:
+        description: MOI business date in Asia/Shanghai (YYYY-MM-DD)
+        required: true
+      trigger_source:
+        type: choice
+        options: [moi_manual, moi_api, moi_schedule]
+        default: moi_manual
+      execution_mode:
+        type: choice
+        options: [no_send, production]
+        default: no_send
+permissions:
+  contents: read
+jobs:
+  managed:
+    if: github.event_name == 'workflow_dispatch' && (inputs.mode == 'managed' || inputs.mode == 'status-sync')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    concurrency:
+      group: moi-matrix-daily-scan
+      cancel-in-progress: false
+    env:
+      MATRIX_PIPELINE_RUN_ID: ${{ inputs.run_id }}
+      MATRIX_BUSINESS_DATE: ${{ inputs.business_date }}
+      MATRIX_TRIGGER_SOURCE: ${{ inputs.trigger_source }}
+      MATRIX_EXECUTION_MODE: ${{ inputs.execution_mode }}
+      MATRIX_PIPELINE_MODE: full
+      MATRIX_STATUS_MONITOR: 'true'
+    steps:
+      - name: Validate MOI inputs before checkout
+        env:
+          REVIEWED_RUNTIME: ${{ inputs.runtime_ref }}
+        run: |
+          python3 - <<'PYTHON'
+          import datetime, os, re
+          assert re.fullmatch('[0-9a-f]{40}', os.environ['REVIEWED_RUNTIME']), 'immutable_runtime_ref_required'
+          assert re.fullmatch('[A-Za-z0-9_-]{1,80}', os.environ['MATRIX_PIPELINE_RUN_ID']), 'moi_run_id_required'
+          assert re.fullmatch('[0-9]{4}-[0-9]{2}-[0-9]{2}', os.environ['MATRIX_BUSINESS_DATE']), 'business_date_required'
+          datetime.date.fromisoformat(os.environ['MATRIX_BUSINESS_DATE'])
+          PYTHON
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.runtime_ref }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/moi-report-link
+      - name: Record actual runtime revision
+        run: echo "MATRIX_RUNTIME_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Ensure source inventory tool
+        run: command -v rg || (sudo apt-get update -qq && sudo apt-get install -y ripgrep)
+      - name: Run orchestration and existing recovery regressions
+        working-directory: .github/scripts/moi-report-link
+        run: python3 -m unittest -v test_moi_orchestration test_orchestration_recovery test_pipeline_recovery test_api_port_review test_component_details test_unified_pipeline test_daily_delivery test_workflow_lifecycle
+      - name: Execute the same pipeline and delivery gate
+        if: inputs.mode == 'managed'
+        env:
+          MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
+          SCAN_GITHUB_TOKEN: ${{ secrets.SCAN_GITHUB_TOKEN }}
+        run: python3 .github/scripts/moi-report-link/managed_entry.py
+      - name: Replay saved status without scanning or sending
+        if: inputs.mode == 'status-sync'
+        env:
+          MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
+        run: python3 .github/scripts/moi-report-link/orchestration_status.py
+      - name: Retain run status and safe stage events
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: moi-orchestration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            out/orchestration/status.json
+            out/pipeline/status.json
+            out/delivery/status.json
+            out/pipeline-events.jsonl
+          retention-days: 14

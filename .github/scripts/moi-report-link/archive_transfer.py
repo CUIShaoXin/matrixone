@@ -17,36 +17,49 @@ def prepare(github, objects, repository, run_id, date, validate, failure):
             raise failure('acquisition_identity_mismatch')
     except RuntimeError as exc:
         if str(exc) != 'minio_http_404': raise
-        commit = github.get(full_name,'/branches/'+repository.branch)['commit']['sha']
-        if not re.fullmatch('[0-9a-f]{40}',commit): raise failure('github_commit_invalid')
-        state = dict(repository=full_name,branch=repository.branch,date=date,run_id=run_id,commit=commit,transfer={})
+        state = dict(repository=full_name,branch=repository.branch,date=date,run_id=run_id,transfer={})
     def save():
         objects.publish(journal_key,json.dumps(state,ensure_ascii=False).encode(),'application/json')
+    state['attempts'] = state.get('attempts', 0) + 1
+    state.setdefault('stages', {})
+    state.pop('failure', None)
     save()  # Commit is durable before download or upload.
+    if not state.get('commit'):
+        with acquisition_stage(state, save, 'version'):
+            commit = github.get(full_name,'/branches/'+repository.branch)['commit']['sha']
+            if not re.fullmatch('[0-9a-f]{40}',commit): raise failure('github_commit_invalid')
+            state['commit'] = commit
+    state['stages']['version'] = 'succeeded'; save()
     commit = state['commit']
     key = 'snapshots/'+date.replace('-','')+'/'+repository.name+'/'+repository.name+'-'+commit+'-gha-'+run_id+'.zip'
     if state.get('key',key) != key: raise failure('acquisition_key_mismatch')
     proof = state.get('proof')
     if proof and objects.verify_object(key,proof['bytes'],proof['sha256']):
         raw = None
+        state['stages'].update(download='succeeded', validation='succeeded', storage='succeeded')
+        save()
     else:
-        cache = Path(tempfile.gettempdir())/'matrix-archive-cache'/(repository.owner+'-'+repository.name+'-'+commit)
+        cache = Path(tempfile.gettempdir())/'matrix-archive-cache'/date/run_id/(repository.owner+'-'+repository.name+'-'+commit)
         cache.parent.mkdir(parents=True,exist_ok=True)
         raw = cache.read_bytes() if cache.exists() else None
         if raw is not None and proof and sha256(raw)!=proof['sha256']:
             raise failure('archive_cache_hash_mismatch')
         if raw is None:
-            with span('github_fixed_archive_download', repository=repository.name, commit=commit):
-                raw = github.get(full_name,'/zipball/'+commit,binary=True)
+            with acquisition_stage(state, save, 'download'):
+                with span('github_fixed_archive_download', repository=repository.name, commit=commit):
+                    raw = github.get(full_name,'/zipball/'+commit,binary=True)
             cache.write_bytes(raw); cache.chmod(0o600)
-        with span('archive_validation', repository=repository.name, commit=commit, bytes=len(raw)):
-            with tempfile.TemporaryFile() as stream:
-                stream.write(raw); current = validate(stream,commit)
+        state['stages']['download'] = 'succeeded'; save()
+        with acquisition_stage(state, save, 'validation'):
+            with span('archive_validation', repository=repository.name, commit=commit, bytes=len(raw)):
+                with tempfile.TemporaryFile() as stream:
+                    stream.write(raw); current = validate(stream,commit)
         if proof and (current['sha256'],current['bytes']) != (proof['sha256'],proof['bytes']):
             raise failure('fixed_archive_bytes_changed')
         proof = current
         state.update(key=key,proof=proof);save()  # Size/hash precede any PUT.
-        objects.put_verified(key,raw,proof['sha256'],state['transfer'],save)
+        with acquisition_stage(state, save, 'storage'):
+            objects.put_verified(key,raw,proof['sha256'],state['transfer'],save)
         cache.unlink(missing_ok=True)
     proof.update(repository=full_name,branch=repository.branch,key=key,report_date=date,
         acquisition_location='GitHub Actions cloud runner',download_method='fixed-commit GitHub repository archive API',
@@ -56,3 +69,27 @@ def prepare(github, objects, repository, run_id, date, validate, failure):
     objects.publish(key[:-4]+'-inventory.json',json.dumps(proof,ensure_ascii=False,indent=2).encode(),'application/json')
     emit('archive_accepted',repository=repository.name,commit=commit,bytes=proof['bytes'])
     return proof
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def acquisition_stage(state, save, stage):
+    state['status'] = 'running'
+    state['stages'][stage] = 'running'
+    save()
+    try:
+        yield
+    except Exception as exc:
+        from pipeline_telemetry import error_fields
+        state['status'] = 'failed'
+        state['stages'][stage] = 'failed'
+        state['failure'] = dict(stage=stage, **error_fields(exc))
+        if re.fullmatch(r'[a-z][a-z0-9_]{0,100}', str(exc)):
+            state['failure']['code'] = str(exc)
+        save()
+        raise
+    else:
+        state['stages'][stage] = 'succeeded'
+        save()

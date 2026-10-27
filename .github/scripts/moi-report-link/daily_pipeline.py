@@ -15,6 +15,7 @@ from cloud_publish import verify_batch
 from combined_renderer import render,build_focus
 from pipeline_telemetry import span,error_fields
 from resilient_storage import verify_login_free
+from batch_context import BatchContext
 
 
 def verify_publication(api,objects,receipt_id,date,commits):
@@ -48,10 +49,11 @@ def scan_components(runner,archives,on_failure):
 
 
 def main():
-    date=dt.datetime.now(preflight.LOCAL).date().isoformat();start=time.monotonic()
-    run_id=os.environ.get('MATRIX_PIPELINE_RESUME_RUN_ID') or ('daily-'+date.replace('-','') if os.environ.get('MATRIX_SCHEDULED_BATCH')=='true' else os.environ['GITHUB_RUN_ID']+'-'+os.environ.get('GITHUB_RUN_ATTEMPT','1'))
+    context=BatchContext.from_env();date=context.business_date;start=time.monotonic()
+    run_id=context.run_id
     mode=os.environ.get('MATRIX_PIPELINE_MODE','full')
     status=dict(schema='matrix_unified_no_send_status_v1',date=date,run_id=run_id,mode=mode,sent=False,daily_automation_ready=False,execution_head=os.environ.get('MATRIX_RUNTIME_SHA',os.environ.get('GITHUB_SHA')))
+    status.update(context.record())
     out=Path('out/pipeline');out.mkdir(parents=True,exist_ok=True)
     try:
         require(re.fullmatch('[A-Za-z0-9_-]{1,80}',run_id) and mode in ('archives','reviews','full','maintenance'),'invalid_pipeline_input')
@@ -64,7 +66,12 @@ def main():
             print(json.dumps(status), flush=True)
             return 0
         prefix='receipts/'+date.replace('-','')+'/pipeline-'+run_id
-        root=open_journal(objects,prefix+'/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix,sent=False))
+        root=open_journal(objects,prefix+'/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix,sent=False,execution_mode=context.execution_mode))
+        require(root.value.get('execution_mode','production')==context.execution_mode,'batch_execution_mode_conflict')
+        execution=context.record()
+        executions=root.value.setdefault('executions',[])
+        if execution not in executions:executions.append(execution)
+        root.save()
         if root.value.get('published'):
             verify_publication(api,objects,root.value['publication_file_id'],date,root.value['commits'])
             status.update(status='passed',publication_file_id=root.value['publication_file_id'],same_batch_end_to_end_passed=True)
@@ -76,6 +83,15 @@ def main():
                 for repo in preflight.REPOSITORIES:
                     if repo.name not in archives:
                         archives[repo.name]=preflight.prepare_archive(github,objects,repo,run_id,date);root.save()
+                    else:
+                        proof=archives[repo.name]
+                        # A persisted success flag alone cannot prove the object still exists.
+                        if not objects.verify_object(proof['key'],proof['bytes'],proof['sha256']):
+                            acquisition_key='receipts/'+date.replace('-','')+'/acquisition-'+run_id+'/'+repo.name+'.json'
+                            frozen=json.loads(objects.call('GET',acquisition_key)[2])
+                            require(frozen['commit']==proof['commit'],'acquisition_resume_commit_mismatch')
+                            repaired=preflight.prepare_archive(github,objects,repo,run_id,date)
+                            require(all(repaired[k]==proof[k] for k in ('commit','key','bytes','sha256')),'acquisition_resume_artifact_mismatch')
                     proof=archives[repo.name]
                     require(proof['report_date']==date and proof['repository']=='matrixorigin/'+repo.name and proof['daily_cloud_download_verified'] and proof['minio_readback_verified'],'pipeline_archive_identity_mismatch')
             commits={r:p['commit'] for r,p in archives.items()};status['commits']=commits
@@ -137,7 +153,7 @@ def main():
                     else:receipt=publish_report(job,source,page,api_results)
                     root.value.update(published=True,publication_file_id=receipt['receipt_artifact']['file_id'],commits=commits);root.save()
                     status.update(status='passed',same_batch_end_to_end_passed=True,publication_file_id=root.value['publication_file_id'],component_focus_count=ncomp,code_findings=ncode,api_port_findings=receipt['added_findings'],kb_verified=True,minio_login_free_verified=True)
-        if mode=='full' and status.get('same_batch_end_to_end_passed'):
+        if mode=='full' and status.get('same_batch_end_to_end_passed') and context.execution_mode=='production':
             from daily_delivery import export_ready
             export_ready(api,objects,prefix,date)
             status['daily_delivery_readiness_verified']=True
