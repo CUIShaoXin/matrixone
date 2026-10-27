@@ -75,6 +75,19 @@ class RecoveryTests(unittest.TestCase):
   self.assertEqual(saved['attempts'][0]['recovery_reason'],'semantic_validation')
   self.assertEqual(saved['attempts'][0]['parser_error'],'rag_marker_missing')
 
+ def test_expired_semantic_revalidation_starts_bounded_new_attempt(self):
+  api=Model([task('completed'),task('completed'),task('completed',id='t2')]);job=Job(api)
+  def reject(t):
+   if t['id']=='t1':raise ValueError('rag_sources_not_selected')
+   return t['id']
+  with patch('kimi_recovery.time.time',return_value=100):
+   with self.assertRaisesRegex(ValueError,'attempts_exhausted'):
+    run_review(job,'repo','audit','source','prompt',reject,max_attempts=1,poll_seconds=0)
+  with patch('kimi_recovery.time.time',return_value=10000):
+   self.assertEqual(run_review(job,'repo','audit','source','prompt',reject,max_attempts=2,poll_seconds=0),'t2')
+  self.assertEqual([r[0] for r in api.requests],['message/send','tasks/get','message/send'])
+  self.assertEqual(len(job.state['model_tasks']['repo_audit']['attempts']),2)
+
  def test_successful_primary_can_be_reused_after_its_original_deadline(self):
   api=Model([task('completed'),task('completed')]);job=Job(api)
   run_review(job,'repo','primary','source','prompt',lambda t:t['id'],poll_seconds=0)

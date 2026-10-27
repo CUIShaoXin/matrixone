@@ -41,7 +41,9 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
         # attempt, even when the original inference budget is exhausted.
         previous=saved['attempts'][-1] if saved['attempts'] else {}
         revalidate=bool(previous.get('task_id'))
-        while time.time()-saved['started_epoch'] < deadline_seconds or revalidate:
+        recovery_started_epoch=saved.get('recovery_started_epoch')
+        while (time.time()-saved['started_epoch'] < deadline_seconds or revalidate or
+               (recovery_started_epoch is not None and time.time()-recovery_started_epoch < deadline_seconds)):
             attempts = saved['attempts']
             revalidating=revalidate;revalidate=False
             if not revalidating and (not attempts or attempts[-1].get('retry_authorized')):
@@ -82,6 +84,10 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
                     except json.JSONDecodeError:
                         attempt.update(retry_authorized=True,recovery_reason='invalid_json');job.journal.save()
                         if not revalidating:job.issue(key,'invalid_json','Retain failed output and independently review immutable source with a new bounded attempt')
+                        else:
+                            recovery_started_epoch=time.time()
+                            saved['recovery_started_epoch']=recovery_started_epoch
+                            job.journal.save()
                         continue
                     except Exception as exc:
                         # A completed Kimi task can still fail the independent
@@ -97,6 +103,9 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
                         attempt.update(retry_authorized=True,recovery_reason='semantic_validation',
                                       parser_error=safe)
                         saved['status']='parser_recovery'
+                        if revalidating:
+                            recovery_started_epoch=time.time()
+                            saved['recovery_started_epoch']=recovery_started_epoch
                         job.journal.save()
                         if not revalidating:
                             job.issue(key,'semantic_validation_failed',
@@ -108,6 +117,7 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
                         attempt['output_revalidated_without_inference']=True
                         emit('model_output_revalidated',repository=repo,phase=phase,attempt=attempt['number'],same_task=True,new_inference=False)
                     job.store(repo+'/'+phase+'-task.json',task)
+                    saved.pop('recovery_started_epoch',None)
                     job.journal.save()
                     return value
                 if status in TERMINAL:
