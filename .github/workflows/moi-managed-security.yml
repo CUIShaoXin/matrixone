@@ -1,11 +1,11 @@
 name: MOI managed security pipeline
-run-name: MOI security managed - ${{ inputs.run_id }}
+run-name: ${{ inputs.mode == 'managed' && format('MOI security managed - {0}', inputs.run_id) || format('MOI security {0} - {1}', inputs.mode, inputs.run_id) }}
 on:
   workflow_dispatch:
     inputs:
       mode:
         type: choice
-        options: [managed, status-sync]
+        options: [managed, status-sync, status-reconcile]
         default: managed
       runtime_ref:
         description: Reviewed immutable runtime commit containing managed_entry.py
@@ -26,9 +26,10 @@ on:
         default: no_send
 permissions:
   contents: read
+  actions: read
 jobs:
   managed:
-    if: github.event_name == 'workflow_dispatch' && (inputs.mode == 'managed' || inputs.mode == 'status-sync')
+    if: github.event_name == 'workflow_dispatch' && (inputs.mode == 'managed' || inputs.mode == 'status-sync' || inputs.mode == 'status-reconcile')
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     concurrency:
@@ -64,7 +65,7 @@ jobs:
         run: command -v rg || (sudo apt-get update -qq && sudo apt-get install -y ripgrep)
       - name: Run orchestration and existing recovery regressions
         working-directory: .github/scripts/moi-report-link
-        run: python3 -m unittest -v test_moi_orchestration test_orchestration_recovery test_component_recovery test_pipeline_recovery test_api_port_review test_component_details test_unified_pipeline test_daily_delivery test_workflow_lifecycle
+        run: python3 -m unittest -v test_moi_orchestration test_orchestration_recovery test_actions_reconciliation test_component_recovery test_pipeline_recovery test_api_port_review test_component_details test_unified_pipeline test_daily_delivery test_workflow_lifecycle
       - name: Execute the same pipeline and delivery gate
         if: inputs.mode == 'managed'
         env:
@@ -76,6 +77,12 @@ jobs:
         env:
           MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
         run: python3 .github/scripts/moi-report-link/orchestration_status.py
+      - name: Reconcile real Actions terminal status without business execution
+        if: inputs.mode == 'status-reconcile'
+        env:
+          MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
+          GITHUB_ACTIONS_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/moi-report-link/orchestration_status.py --reconcile-actions
       - name: Retain run status and safe stage events
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

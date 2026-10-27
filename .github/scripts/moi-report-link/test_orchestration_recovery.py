@@ -18,9 +18,14 @@ import orchestration_status
 
 class MemoryObjects:
     def __init__(self): self.data = {}
-    def call(self, method, key, **kwargs):
+    def call(self, method, key, raw=None, headers=None, **kwargs):
+        if method == 'PUT':
+            if headers and headers.get('if-match') != '"'+hashlib.sha256(self.data[key]).hexdigest()+'"':
+                raise RuntimeError('minio_http_412')
+            self.data[key] = raw
+            return 200, {}, b''
         if key not in self.data: raise RuntimeError('minio_http_404')
-        return 200, {}, self.data[key]
+        return 200, {'ETag':'"'+hashlib.sha256(self.data[key]).hexdigest()+'"'}, self.data[key]
     def publish(self, key, raw, kind): self.data[key] = raw
     def verify_object(self, key, size, digest):
         raw = self.data.get(key)

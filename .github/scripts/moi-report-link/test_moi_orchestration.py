@@ -141,6 +141,8 @@ class StatusAndDispatchTests(unittest.TestCase):
         actions, objects = Mock(), Mock()
         actions.request.side_effect = [None, dict(workflow_runs=[dict(display_title='MOI security managed - batch',
             created_at='2099-01-01T00:00:00Z', id=123, run_attempt=2, status='completed', conclusion='failure',
+            event='workflow_dispatch', path='.github/workflows/moi-managed-security.yml',
+            repository=dict(full_name=bridge.REPOSITORY),
             html_url='https://github.com/CUIShaoXin/matrixone/actions/runs/123')])]
         with patch.object(bridge, 'create_once', side_effect=lambda o,k,v:(True,v)):
             result = bridge.dispatch(actions, objects, self.context(), 'a'*40)

@@ -10,6 +10,56 @@ from daily_delivery import read_json
 REPOSITORIES = (('matrixone', 'main'), ('taas', 'main'), ('matrixflow', 'dev'))
 
 
+def check_identity(value, ctx):
+    if (value.get('run_id'), value.get('business_date')) != (ctx.run_id, ctx.business_date):
+        raise ValueError('status_identity_mismatch')
+    if value.get('execution_mode', ctx.execution_mode) != ctx.execution_mode:
+        raise ValueError('batch_execution_mode_conflict')
+
+
+def apply_terminal(objects, ctx, value):
+    """Project a verified Actions terminal result without inventing scan/send results."""
+    from moi_actions import terminal_key
+    github = value.get('github', {})
+    if github.get('run_id') in (None, 'manual'): return value
+    evidence = read_json(objects, terminal_key(ctx, github), missing=True)
+    if evidence is None: return value
+    if ((evidence.get('run_id'), evidence.get('business_date'), evidence.get('github'))
+            != (ctx.run_id, ctx.business_date, github)
+            or evidence.get('schema') != 'matrix_github_terminal_v1'
+            or evidence.get('status') != 'completed'):
+        raise ValueError('github_terminal_evidence_conflict')
+    business = value.setdefault('business_status', value.get('status', 'waiting'))
+    conclusion = evidence['conclusion']
+    if conclusion == 'success':
+        status = business if business in ('succeeded', 'failed') else 'incomplete'
+        code = 'github_success_without_business_completion' if status == 'incomplete' else None
+    else:
+        states = dict(cancelled='cancelled', timed_out='timed_out', failure='failed', startup_failure='failed',
+                      neutral='incomplete', skipped='incomplete', stale='incomplete', action_required='incomplete')
+        if conclusion not in states: raise ValueError('github_run_conclusion_invalid')
+        status, code = states[conclusion], 'github_actions_'+conclusion
+    value['status'] = status
+    stages = value.setdefault('stages', {})
+    for repo in value.get('repositories', {}).values():
+        if repo.get('status') == 'running': repo['status'] = 'unknown'
+        for name, current in repo.get('stages', {}).items():
+            if current == 'running': repo['stages'][name] = 'unknown'
+    for item in stages.values():
+        if isinstance(item, dict) and item.get('status') in ('running', 'waiting_for_delivery_time'):
+            item.update(status='unknown', code='github_execution_ended_before_stage_confirmation')
+    stages['github_actions'] = evidence
+    if 'overall' in stages: stages['overall']['status'] = status
+    if value.get('sent') is not True:
+        value['sent'] = False if value.get('execution_mode') == 'no_send' else None
+    if code:
+        value.setdefault('failure_stage', 'github_actions')
+        failure = dict(stage='github_actions', code=code)
+        failures = value.setdefault('failures', [])
+        if failure not in failures: failures.append(failure)
+    return value
+
+
 def snapshot(api, objects, ctx):
     value = dict(schema='matrix_orchestration_status_v1', **ctx.record(),
                  observed_at_utc=dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -88,7 +138,7 @@ def snapshot(api, objects, ctx):
         except Exception as exc:
             # Report enrichment must not destroy the durable status during a MOI outage.
             value['report_details'] = dict(status='pending', error_type=type(exc).__name__)
-    return value
+    return apply_terminal(objects, ctx, value)
 
 
 def sync(api, objects, ctx):
@@ -101,17 +151,40 @@ def sync(api, objects, ctx):
 
 
 def upload_saved(api, objects, ctx):
-    raw = objects.call('GET', ctx.prefix+'/orchestration/status.json')[2]
-    value = json.loads(raw)
-    if (value['run_id'], value['business_date']) != (ctx.run_id, ctx.business_date):
-        raise ValueError('status_identity_mismatch')
-    if value.get('report_details', {}).get('status') == 'pending':
-        publication = json.loads(api.file(value['publication_file_id']))
-        value['report_url'] = publication['url']
-        value['report_expires_at_utc'] = publication['expires_at_utc']
-        value['report_details'] = dict(status='succeeded')
+    key = ctx.prefix+'/orchestration/status.json'
+    for attempt in range(3):
+        _, headers, original = objects.call('GET', key)
+        value = json.loads(original)
+        check_identity(value, ctx)
+        value = apply_terminal(objects, ctx, value)
+        report_error = None
+        if value.get('report_details', {}).get('status') == 'pending':
+            try:
+                publication = json.loads(api.file(value['publication_file_id']))
+                value['report_url'] = publication['url']
+                value['report_expires_at_utc'] = publication['expires_at_utc']
+                value['report_details'] = dict(status='succeeded')
+            except Exception as exc:
+                # Persist terminal evidence even when report enrichment needs
+                # MOI recovery. The caller still receives the actual failure.
+                report_error = exc
+        if value == json.loads(original):
+            raw = original
+            break
         raw = json_bytes(value)
-        objects.publish(ctx.prefix+'/orchestration/status.json', raw, 'application/json')
+        etag = next((v for k,v in headers.items() if k.lower() == 'etag'), None)
+        if not etag: raise ValueError('status_etag_required')
+        try:
+            objects.call('PUT', key, raw=raw, headers={'if-match':etag, 'content-type':'application/json',
+                         'x-amz-meta-sha256':hashlib.sha256(raw).hexdigest()})
+        except RuntimeError as exc:
+            if str(exc) != 'minio_http_412': raise
+            continue
+        # A successful write may immediately be superseded by a new attempt.
+        if objects.call('GET', key)[2] == raw: break
+    else:
+        raise ValueError('status_update_contended')
+    if report_error is not None: raise report_error
     digest = hashlib.sha256(raw).hexdigest()
     receipt_key = ctx.prefix+'/orchestration/sync-'+digest+'.json'
     saved = read_json(objects, receipt_key, missing=True)
@@ -119,17 +192,28 @@ def upload_saved(api, objects, ctx):
         saved = api.upload('matrix-run-'+ctx.run_id+'-status-'+digest[:16]+'.json', raw)
     if api.file(saved['file_id']) != raw: raise ValueError('moi_status_readback_mismatch')
     objects.publish(receipt_key, json_bytes(saved), 'application/json')
-    return dict(synced=True, file_id=saved['file_id'], sha256=digest, minio_key=ctx.prefix+'/orchestration/status.json')
+    return dict(synced=True, file_id=saved['file_id'], sha256=digest, minio_key=key,
+                github=value.get('github'), github_conclusion=value.get('stages', {}).get('github_actions', {}).get('conclusion'))
 
 
 def main():
+    import argparse
     import os
     from batch_context import BatchContext
     from cloud_daily import DailyAPI
     from resilient_storage import Objects
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--reconcile-actions', action='store_true')
+    args = parser.parse_args()
     ctx = BatchContext.from_env()
     api = DailyAPI(os.environ['MOI_API_KEY'])
-    print(json.dumps(upload_saved(api, Objects.from_workspace(api), ctx)))
+    objects = Objects.from_workspace(api)
+    if args.reconcile_actions:
+        from moi_actions import GitHubActions, reconcile
+        result = reconcile(GitHubActions(os.environ['GITHUB_ACTIONS_TOKEN']), api, objects, ctx)
+    else:
+        result = upload_saved(api, objects, ctx)
+    print(json.dumps(result))
 
 
 
