@@ -37,6 +37,26 @@ def context():
 
 
 class SnapshotOutageTests(unittest.TestCase):
+    def test_started_empty_checkpoints_are_running_and_absent_repositories_wait(self):
+        ctx, store = context(), MemoryObjects()
+        repositories = dict(taas={}, matrixflow=dict(accepted=True))
+        for suffix, value in (
+            ('components/checkpoint.json', dict(repositories=repositories)),
+            ('reviews/checkpoint.json', dict(repositories=repositories, code_repositories=repositories)),
+        ):
+            store.publish(ctx.prefix+'/'+suffix, json.dumps(value).encode(), 'application/json')
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = os.getcwd()
+            try:
+                os.chdir(tmp)
+                result = orchestration_status.snapshot(Mock(), store, ctx)
+            finally:
+                os.chdir(previous)
+        for stage in ('component_scan', 'code_review', 'api_port_review'):
+            self.assertEqual(result['repositories']['matrixone']['stages'][stage], 'waiting')
+            self.assertEqual(result['repositories']['taas']['stages'][stage], 'running')
+            self.assertEqual(result['repositories']['matrixflow']['stages'][stage], 'succeeded')
+
     def test_report_read_outage_does_not_lose_durable_final_status(self):
         ctx, store, api = context(), MemoryObjects(), Mock()
         store.publish(ctx.prefix+'/checkpoint.json', json.dumps(dict(published=True, publication_file_id='report')).encode(), 'application/json')

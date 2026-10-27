@@ -48,13 +48,23 @@ def snapshot(api, objects, ctx):
     for repo, _ in REPOSITORIES:
         target = value['repositories'][repo]
         for label, field in (('code_review', 'code_repositories'), ('api_port_review', 'repositories')):
-            item = reviews.get(field, {}).get(repo, {})
-            target['stages'][label] = 'succeeded' if item.get('accepted') else ('running' if item else 'waiting')
-        item = components.get('repositories', {}).get(repo, {})
-        target['stages']['component_scan'] = 'succeeded' if item.get('accepted') else ('running' if item else 'waiting')
+            repositories = reviews.get(field, {})
+            item = repositories.get(repo, {})
+            target['stages'][label] = 'succeeded' if item.get('accepted') else ('running' if repo in repositories else 'waiting')
+        repositories = components.get('repositories', {})
+        item = repositories.get(repo, {})
+        target['stages']['component_scan'] = 'succeeded' if item.get('accepted') else ('running' if repo in repositories else 'waiting')
         for failure in root.get('failures', []):
             if failure.get('repository') == repo and failure.get('stage') == 'components' and not item.get('accepted'):
                 target['stages']['component_scan'] = 'failed'
+        if not item.get('accepted') and item.get('scan_status') in ('running', 'failed'):
+            target['stages']['component_scan'] = item['scan_status']
+        target['component_failure'] = item.get('scan_failure')
+        attempts = components.get('workflow_recovery', {}).get(repo+'_finalize', {}).get('attempts', [])
+        target['component_attempts'] = [dict(attempt,
+            workflow_status=components.get('stages', {}).get(attempt['label'], {}).get('status', 'planned'))
+            for attempt in attempts]
+        target['component_retry_count'] = max(0, len(attempts)-1)
         for failure in reviews.get('issues', []):
             for label, prefix in (('code_review', 'code_'), ('api_port_review', 'api_')):
                 if failure.get('stage') == prefix+repo and target['stages'][label] != 'succeeded':

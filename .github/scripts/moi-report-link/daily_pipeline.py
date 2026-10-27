@@ -8,7 +8,8 @@ import re
 import time
 
 import cloud_preflight as preflight
-from cloud_daily import DailyAPI,Journal,Runner,require,json_bytes,WORKSPACE
+from cloud_daily import DailyAPI,Journal,require,json_bytes,WORKSPACE
+from component_recovery import ComponentRunner as Runner
 from api_port_review import Job,REPOS,review_repository as api_review,publish_report,sha
 from source_code_review import review_repository as code_review
 from cloud_publish import verify_batch
@@ -117,7 +118,7 @@ def main():
                     if mode=='full':
                         component_journal=open_journal(objects,prefix+'/components/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix+'/components',archives=archives,commits=commits,sent=False))
                         require(component_journal.value['archives']==archives,'component_resume_archive_mismatch')
-                        runner=Runner(api,objects,component_journal)
+                        runner=Runner(api,objects,component_journal,context=context)
                         def component_failure(repo,exc):
                             failure=dict(stage='components',repository=repo,**error_fields(exc),at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
                             if re.fullmatch('[a-z][a-z0-9_]{0,100}',str(exc)):failure['safe_code']=str(exc)

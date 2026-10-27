@@ -18,8 +18,8 @@ on:
         required: true
       trigger_source:
         type: choice
-        options: [moi_manual, moi_api, moi_schedule]
-        default: moi_manual
+        options: [github_manual, moi_manual, moi_api, moi_schedule]
+        default: github_manual
       execution_mode:
         type: choice
         options: [no_send, production]
@@ -64,7 +64,7 @@ jobs:
         run: command -v rg || (sudo apt-get update -qq && sudo apt-get install -y ripgrep)
       - name: Run orchestration and existing recovery regressions
         working-directory: .github/scripts/moi-report-link
-        run: python3 -m unittest -v test_moi_orchestration test_orchestration_recovery test_pipeline_recovery test_api_port_review test_component_details test_unified_pipeline test_daily_delivery test_workflow_lifecycle
+        run: python3 -m unittest -v test_moi_orchestration test_orchestration_recovery test_component_recovery test_pipeline_recovery test_api_port_review test_component_details test_unified_pipeline test_daily_delivery test_workflow_lifecycle
       - name: Execute the same pipeline and delivery gate
         if: inputs.mode == 'managed'
         env:
