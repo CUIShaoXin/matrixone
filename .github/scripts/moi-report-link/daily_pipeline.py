@@ -47,6 +47,19 @@ def scan_components(runner,archives,on_failure):
     return results
 
 
+def reverify_archives(objects, archives, date):
+    commits = {}
+    with span('three_repository_archive_reverification'):
+        for repo in preflight.REPOSITORIES:
+            proof = archives[repo.name]
+            require(proof['report_date'] == date and proof['repository'] == repo.owner+'/'+repo.name
+                    and proof.get('daily_cloud_download_verified') and proof.get('minio_readback_verified'),
+                    'pipeline_archive_identity_mismatch')
+            require(objects.verify_object(proof['key'], proof['bytes'], proof['sha256']), 'verified_archive_missing')
+            commits[repo.name] = proof['commit']
+    return commits
+
+
 def main():
     date=dt.datetime.now(preflight.LOCAL).date().isoformat();start=time.monotonic()
     run_id=os.environ.get('MATRIX_PIPELINE_RESUME_RUN_ID') or ('daily-'+date.replace('-','') if os.environ.get('MATRIX_SCHEDULED_BATCH')=='true' else os.environ['GITHUB_RUN_ID']+'-'+os.environ.get('GITHUB_RUN_ATTEMPT','1'))
@@ -65,7 +78,11 @@ def main():
             return 0
         prefix='receipts/'+date.replace('-','')+'/pipeline-'+run_id
         root=open_journal(objects,prefix+'/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix,sent=False))
-        if root.value.get('published'):
+        if mode == 'archives' and set(root.value.get('archives', {})) == {r.name for r in preflight.REPOSITORIES}:
+            commits = reverify_archives(objects, root.value['archives'], date)
+            status.update(status='passed', commits=commits, archives_verified=True,
+                          archive_readback_reverified=True, same_batch_end_to_end_passed=False)
+        elif root.value.get('published'):
             verify_publication(api,objects,root.value['publication_file_id'],date,root.value['commits'])
             status.update(status='passed',publication_file_id=root.value['publication_file_id'],same_batch_end_to_end_passed=True)
         else:
