@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -24,13 +25,15 @@ def local_now():
 
 
 def retryable(status, kind):
+    if status.get('error_type') == 'HTTPError':
+        return status.get('http_status') in (408, 429, 500, 502, 503, 504)
     if status.get('error_type') in TRANSIENT_TYPES or status.get('reason_type') in TRANSIENT_TYPES:
         return True
     code = status.get('safe_code', '')
     if code in (SCAN_RECOVERABLE if kind == 'scan' else DELIVERY_RECOVERABLE):
         return True
-    return code in {prefix + str(n) for prefix in ('minio_http_', 'moi_http_')
-                    for n in (429, 500, 502, 503, 504)}
+    return code in {prefix + str(n) for prefix in ('minio_http_', 'moi_http_', 'login_free_http_')
+                    for n in (408, 429, 500, 502, 503, 504)}
 
 
 def wait_until(target, date, now=local_now, sleep=time.sleep):
@@ -80,7 +83,9 @@ def supervise(kind, scheduled=False, env=None, now=local_now, sleep=time.sleep,
         if scheduled:
             # Before 10:00 a missing ready pointer is an observation, not a
             # failed send. Allow bounded read-only polls through the warmup.
-            max_attempts = 25
+            # 20 warmup polls plus 30 post-release polls, with a final read at
+            # the boundary. The shared deadline remains authoritative.
+            max_attempts = 51
             target = dt.datetime.combine(dt.date.fromisoformat(date), dt.time(10), LOCAL)
             warmup = target - dt.timedelta(minutes=10)
             emit('delivery_warmup_wait', date=date, verify_at_beijing=warmup.isoformat(),
@@ -129,6 +134,10 @@ def main():
         status = supervise(args.kind, scheduled=args.scheduled)
     except Exception as exc:
         status = dict(status='failed', phase=args.kind, **error_fields(exc))
+        if re.fullmatch('[a-z][a-z0-9_]{0,100}', str(exc)):
+            status['safe_code'] = str(exc)
+        out = Path('out/supervisor'); out.mkdir(parents=True, exist_ok=True)
+        (out / (args.kind + '-status.json')).write_text(json.dumps(status))
     print(json.dumps(status), flush=True)
     return 0 if status['status'] == 'passed' else 1
 

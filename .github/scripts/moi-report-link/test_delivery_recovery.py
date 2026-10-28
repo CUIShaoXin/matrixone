@@ -1,9 +1,12 @@
 """Offline failure/restart drills. No real API, object store, send or wall sleep."""
 import copy
 import datetime as dt
+from email.parser import BytesParser
 import json
+import tempfile
 import unittest
 from collections import defaultdict, deque
+from pathlib import Path
 from unittest.mock import patch
 
 import daily_delivery as d
@@ -15,7 +18,10 @@ CLAIM = BASE + 'delivery-claim.json'
 COMPLETE = BASE + 'delivery-completed.json'
 NATIVE = BASE + 'native-delivery-receipt.json'
 UPLOAD_CLAIM = BASE + 'native-receipt-upload-claim.json'
+UPLOAD_FILE = BASE + 'native-receipt-upload-file.json'
+ATTACH_CLAIM = BASE + 'native-receipt-attach-claim.json'
 REAL_DATETIME = dt.datetime
+LOCAL_RECEIPT_FILE = d.local_receipt_file
 
 
 class Crash(BaseException):
@@ -86,7 +92,8 @@ class FakeObjects:
 class FakeAPI:
     def __init__(self, objects, backend=None):
         self.objects, self.clock = objects, objects.clock
-        self.backend = backend if backend is not None else dict(task=None, files={}, names={}, sends=0, uploads=0)
+        self.backend = backend if backend is not None else dict(
+            task=None, files={}, names={}, raw_names={}, sends=0, uploads=0)
         self.calls, self.faults = [], defaultdict(deque)
 
     def fault(self, operation):
@@ -131,24 +138,55 @@ class FakeAPI:
 
     def request(self, path, payload):
         self.calls.append((path, copy.deepcopy(payload), self.clock.elapsed))
-        if path != '/catalog/file/list':
-            raise AssertionError('unexpected catalog mutation')
-        self.fault('list')
-        return dict(list=[dict(file_id=fid, origin_file_name=name) for fid, name in self.backend['names'].items()])
+        if path == '/catalog/file/list':
+            self.fault('list')
+            return dict(list=[dict(file_id=fid, origin_file_name=name) for fid, name in self.backend['names'].items()])
+        if path == '/catalog/file/create':
+            # Fail any test that attaches before the exact FID is durable.
+            identity = self.objects.get_json(UPLOAD_FILE)
+            assert payload == dict(volume_id=130001, file_ids=[identity['file_id']])
+            fid = identity['file_id']
+            assert self.objects.get_json(ATTACH_CLAIM)['file_id'] == fid
+            assert identity['bytes'] == len(self.objects.values[COMPLETE])
+            assert identity['sha256'] == d.sha(self.objects.values[COMPLETE])
+            self.fault('create-before')
+            self.backend['names'][fid] = self.backend['raw_names'][fid]
+            self.fault('create-after')
+            return {}
+        raise AssertionError('unexpected catalog mutation')
+
+    def binary(self, path, payload=None, raw=None, content_type='application/json'):
+        assert path == '/catalog/file/upload'
+        part = BytesParser().parsebytes(('Content-Type: ' + content_type + '\r\n\r\n').encode() + raw)
+        parts = part.get_payload()
+        assert len(parts) == 1
+        name, body = parts[0].get_filename(), parts[0].get_payload(decode=True)
+        self.calls.append(('upload', name, self.clock.elapsed))
+        self.backend['uploads'] += 1
+        self.fault('upload-before')
+        fid = '00000000-0000-4000-8000-' + str(self.backend['uploads']).zfill(12)
+        self.backend['files'][fid] = body
+        self.backend['raw_names'][fid] = name
+        self.fault('upload-after')
+        return json.dumps(dict(code='OK', data=dict(file_id=fid))).encode()
 
     def file(self, fid):
         self.calls.append(('file', fid, self.clock.elapsed))
         self.fault('file')
         if fid not in self.backend['files']:
             raise AssertionError('unexpected large report download')
+        # Model direct FID download independently from volume membership.
+        # Tests also inject 404 when an unattached FID is not readable.
         return self.backend['files'][fid]
 
     def upload(self, name, raw):
+        # Seed receipts from the former monolithic client for compatibility tests.
         self.calls.append(('upload', name, self.clock.elapsed))
         self.backend['uploads'] += 1
         self.fault('upload-before')
-        fid = 'native-' + str(self.backend['uploads'])
+        fid = '00000000-0000-4000-8000-' + str(self.backend['uploads']).zfill(12)
         self.backend['files'][fid] = raw
+        self.backend['raw_names'][fid] = name
         self.backend['names'][fid] = name
         self.fault('upload-after')
         return dict(file_id=fid, bytes=len(raw), sha256=d.sha(raw), readback_verified=True)
@@ -163,6 +201,31 @@ class Output:
 
     def write_bytes(self, raw):
         self.raw = raw
+
+
+class CatalogTransport:
+    """Run the actual DailyAPI/ReportAPI methods against an in-memory transport."""
+    def __init__(self, api):
+        self.api, self.timeouts = api, []
+
+    def open(self, request, timeout=None):
+        self.timeouts.append(timeout)
+        path = request.full_url.split('/v5', 1)[1]
+        payload = json.loads(request.data) if request.data and path != '/catalog/file/upload' else None
+        if path.startswith('/workspaces/'):
+            body = json.dumps(dict(result=self.api.rpc(payload['method'], payload['params'], payload['id']))).encode()
+        elif path == '/catalog/file/upload':
+            body = self.api.binary(path, raw=request.data, content_type=request.get_header('Content-type'))
+        elif path == '/catalog/file/download':
+            body = self.api.file(payload['file_id'])
+        else:
+            body = json.dumps(dict(code='OK', data=self.api.request(path, payload))).encode()
+        class Response:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self, limit): return body[:limit]
+        return Response()
 
 
 class RecoveryTests(unittest.TestCase):
@@ -180,6 +243,8 @@ class RecoveryTests(unittest.TestCase):
         self.enterContext(patch.dict(d.os.environ, {}, clear=True))
         self.enterContext(patch('socket.socket.connect', side_effect=AssertionError('network forbidden')))
         self.enterContext(patch('urllib.request.OpenerDirector.open', side_effect=AssertionError('network forbidden')))
+        self.enterContext(patch('pipeline_telemetry.emit'))
+        self.enterContext(patch.object(d, 'local_receipt_file', side_effect=self.local_file))
 
     # TestCase.enterContext was added in Python 3.11; runtime also supports 3.9.
     def enterContext(self, cm):
@@ -188,6 +253,7 @@ class RecoveryTests(unittest.TestCase):
         return result
 
     def fresh(self, at='2026-10-28T10:00:00+08:00'):
+        self.local_files = {}
         self.clock = Clock(at)
         self.objects = FakeObjects(self.clock)
         self.api = FakeAPI(self.objects)
@@ -198,6 +264,25 @@ class RecoveryTests(unittest.TestCase):
                             publication_file_id='file', publication_sha256='hash')
         self.bundle['root'].update(run_id=self.pointer['run_id'], commits=self.pointer['commits'])
         self.objects.put_json(BASE + 'ready.json', self.pointer)
+
+    def local_file(self, final, identity=None):
+        key = (final['date'], final['task_id'])
+        saved = self.local_files.get(key)
+        if saved is not None:
+            d.validate_receipt_file(saved, final, d.json_bytes(final))
+            d.require(identity is None or identity == saved, 'delivery_native_receipt_conflict')
+        if identity is not None and saved is None:
+            d.validate_receipt_file(identity, final, d.json_bytes(final))
+            self.local_files[key] = copy.deepcopy(identity)
+        return copy.deepcopy(self.local_files.get(key))
+
+    def real_client(self):
+        fake = self.api
+        client = d._DAILY_API_TYPE('fake')
+        client.opener = CatalogTransport(fake)
+        client.backend, client.calls = fake.backend, fake.calls
+        self.api = client
+        return fake, client.opener
 
     def seed_claim(self, legacy=False):
         claim = dict(schema='matrix_daily_claim_v1', date=DATE, channel_instance_id=d.CHANNEL,
@@ -295,7 +380,10 @@ class RecoveryTests(unittest.TestCase):
 
     def test_unknown_native_upload_is_discovered_read_only(self):
         self.seed_claim()
-        self.api.faults['upload-after'].append(TimeoutError())
+        def visible_but_response_lost():
+            self.api.backend['names'].update(self.api.backend['raw_names'])
+            raise TimeoutError()
+        self.api.faults['upload-after'].append(visible_but_response_lost)
         self.assertTrue(self.recover()['sent'])
         self.assertEqual(self.api.backend['uploads'], 1)
         self.assert_no_resend()
@@ -322,7 +410,10 @@ class RecoveryTests(unittest.TestCase):
 
     def test_crash_after_native_upload_recovers_catalog_file_without_uploading_again(self):
         self.seed_claim()
-        self.api.faults['upload-after'].append(Crash())
+        def visible_before_crash():
+            self.api.backend['names'].update(self.api.backend['raw_names'])
+            raise Crash()
+        self.api.faults['upload-after'].append(visible_before_crash)
         with self.assertRaises(Crash): self.recover()
         self.api = FakeAPI(self.objects, self.api.backend)
         self.assertTrue(self.recover()['sent'])
@@ -339,6 +430,185 @@ class RecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'read_original_task_only'): self.recover()
         self.assertEqual(self.api.backend['uploads'], 1)
         self.assert_no_resend()
+
+    def test_raw_upload_then_mount_timeout_only_reads_original_fid(self):
+        for stage in ('create-before', 'create-after'):
+            with self.subTest(stage=stage):
+                self.fresh(); self.seed_claim()
+                self.api.faults[stage].append(TimeoutError())
+                result = self.recover()
+                self.assertTrue(result['sent'])
+                self.assertEqual(result['catalog_attachment'], 'unknown')
+                fid = self.objects.get_json(UPLOAD_FILE)['file_id']
+                self.assertEqual(self.api.backend['uploads'], 1)
+                self.assertEqual(len([c for c in self.api.calls if c[0] == '/catalog/file/create']), 1)
+                self.assertEqual(self.objects.get_json(NATIVE)['file_id'], fid)
+                self.assertEqual(self.api.backend['files'][fid], self.objects.values[COMPLETE])
+                if stage == 'create-before':
+                    self.assertEqual(self.api.backend['names'], {})
+                self.assert_no_resend()
+
+    def test_fid_put_or_confirmation_timeout_never_precedes_mount(self):
+        for stage in ('before', 'after', 'confirmation'):
+            with self.subTest(stage=stage):
+                self.fresh(); self.seed_claim()
+                if stage == 'confirmation':
+                    self.objects.inject('PUT', UPLOAD_FILE, 'after',
+                                        lambda obj: obj.inject('GET', UPLOAD_FILE, 'before', TimeoutError()))
+                else:
+                    self.objects.inject('PUT', UPLOAD_FILE, stage, TimeoutError())
+                self.assertTrue(self.recover()['sent'])
+                puts = [c for c in self.objects.calls if c[:2] == ('PUT', UPLOAD_FILE)]
+                self.assertTrue(all(c[2] == puts[0][2] and c[3]['if-none-match'] == '*' for c in puts))
+                self.assertEqual(self.api.backend['uploads'], 1)
+                self.assertEqual(len([c for c in self.api.calls if c[0] == '/catalog/file/create']), 1)
+                self.assert_no_resend()
+
+    def test_restart_at_fid_or_mount_boundary_uses_durable_fid_without_listing(self):
+        for boundary in ('fid-put', 'fid-confirmation', 'create-before', 'create-after'):
+            with self.subTest(boundary=boundary):
+                self.fresh(); self.seed_claim()
+                if boundary == 'fid-put':
+                    self.objects.inject('PUT', UPLOAD_FILE, 'after', Crash())
+                elif boundary == 'fid-confirmation':
+                    self.objects.inject('PUT', UPLOAD_FILE, 'after',
+                                        lambda obj: obj.inject('GET', UPLOAD_FILE, 'before', Crash()))
+                else:
+                    self.api.faults[boundary].append(Crash())
+                with self.assertRaises(Crash): self.recover()
+                fid = self.objects.get_json(UPLOAD_FILE)['file_id']
+                original = self.objects.values[COMPLETE]
+                self.local_files.clear()  # Remote FID alone is enough on a new observer.
+                self.api = FakeAPI(self.objects, self.api.backend)
+                self.api.backend['names'].clear()
+                self.assertEqual(self.recover()['status'], 'already_sent')
+                self.assertNotIn('/catalog/file/list', [c[0] for c in self.api.calls])
+                if boundary.startswith('create-'):
+                    self.assertNotIn('/catalog/file/create', [c[0] for c in self.api.calls])
+                self.assertEqual(self.objects.get_json(NATIVE)['file_id'], fid)
+                self.assertEqual(self.objects.values[COMPLETE], original)
+                self.assertEqual(self.api.backend['files'][fid], original)
+                self.assertEqual(self.api.backend['uploads'], 1)
+                self.assert_no_resend()
+
+    def test_runner_local_fid_survives_remote_put_failure_and_process_restart(self):
+        self.seed_claim()
+        self.objects.faults['PUT', UPLOAD_FILE, 'before'].extend([TimeoutError() for _ in range(30)])
+        with self.assertRaisesRegex(ValueError, 'read_original_task_only'): self.recover()
+        self.assertNotIn(UPLOAD_FILE, self.objects.values)
+        self.assertNotIn('/catalog/file/create', [c[0] for c in self.api.calls])
+        local = next(iter(self.local_files.values()))
+        self.assertEqual(set(local), {'file_id', 'bytes', 'sha256', 'task_id'})
+        self.objects.faults.clear()
+        self.api = FakeAPI(self.objects, self.api.backend)
+        self.assertTrue(self.recover()['sent'])
+        self.assertNotIn('/catalog/file/list', [c[0] for c in self.api.calls])
+        self.assertEqual(self.objects.get_json(NATIVE)['file_id'], local['file_id'])
+        self.assertEqual(self.api.backend['uploads'], 1)
+        self.assert_no_resend()
+
+    def test_crash_before_remote_fid_put_uses_runner_local_identity(self):
+        self.seed_claim()
+        self.objects.inject('PUT', UPLOAD_FILE, 'before', Crash())
+        with self.assertRaises(Crash): self.recover()
+        self.assertNotIn(UPLOAD_FILE, self.objects.values)
+        self.api = FakeAPI(self.objects, self.api.backend)
+        self.assertTrue(self.recover()['sent'])
+        self.assertEqual(self.api.backend['uploads'], 1)
+        self.assert_no_resend()
+
+    def test_unknown_raw_upload_without_catalog_identity_stays_read_only_after_restart(self):
+        self.seed_claim()
+        self.api.faults['upload-after'].append(TimeoutError())
+        with self.assertRaisesRegex(ValueError, 'read_original_task_only'): self.recover()
+        self.assertEqual(len(self.api.backend['files']), 1)
+        self.assertEqual(self.api.backend['names'], {})
+        self.assertEqual(self.local_files, {})
+        self.assertNotIn(UPLOAD_FILE, self.objects.values)
+        self.api = FakeAPI(self.objects, self.api.backend)
+        self.objects.calls.clear()
+        with self.assertRaisesRegex(ValueError, 'read_original_task_only'): self.recover()
+        self.assertTrue(all(c[0] == 'GET' for c in self.objects.calls))
+        self.assertTrue(all(c[0] in ('tasks/get', '/catalog/file/list') for c in self.api.calls))
+        self.assertEqual(self.api.backend['uploads'], 1)
+        self.assert_no_resend()
+
+    def test_unknown_mount_and_unavailable_fid_are_bounded_without_replaying_mount(self):
+        self.seed_claim()
+        self.api.faults['create-before'].append(TimeoutError())
+        self.api.faults['file'].extend([RuntimeError('moi_http_404') for _ in range(30)])
+        with self.assertRaisesRegex(ValueError, 'read_original_task_only'): self.recover()
+        self.assertEqual(self.clock.elapsed, 12)
+        self.assertEqual(len([c for c in self.api.calls if c[0] == '/catalog/file/create']), 1)
+        self.assertNotIn(NATIVE, self.objects.values)
+        self.api = FakeAPI(self.objects, self.api.backend)
+        self.api.faults['file'].extend([RuntimeError('moi_http_404') for _ in range(30)])
+        with self.assertRaisesRegex(ValueError, 'read_original_task_only'): self.recover()
+        self.assertNotIn('/catalog/file/create', [c[0] for c in self.api.calls])
+        self.assertNotIn(NATIVE, self.objects.values)
+        self.api = FakeAPI(self.objects, self.api.backend)
+        self.assertTrue(self.recover()['sent'])
+        self.assertNotIn('/catalog/file/create', [c[0] for c in self.api.calls])
+        self.assertEqual(self.api.backend['uploads'], 1)
+        self.assert_no_resend()
+
+    def test_real_client_staged_upload_mount_timeout_and_restart(self):
+        for stage in ('create-before', 'create-after'):
+            for error in (TimeoutError, Crash):
+                with self.subTest(stage=stage, error=error.__name__):
+                    self.fresh(); self.seed_claim()
+                    self.api.faults[stage].append(error())
+                    fake, transport = self.real_client()
+                    if error is Crash:
+                        with self.assertRaises(Crash): self.recover()
+                        self.api = FakeAPI(self.objects, fake.backend)
+                        self.real_client()
+                    self.assertTrue(self.recover()['sent'])
+                    self.assertEqual(fake.backend['uploads'], 1)
+                    calls = fake.calls if error is TimeoutError else fake.calls + self.api.calls
+                    self.assertEqual(len([c for c in calls if c[0] == '/catalog/file/create']), 1)
+                    self.assertTrue(all(0 < t <= 12 for t in transport.timeouts))
+                    fid = self.objects.get_json(NATIVE)['file_id']
+                    self.assertEqual(fake.backend['files'][fid], self.objects.values[COMPLETE])
+                    self.assert_no_resend()
+
+    def test_durable_fid_metadata_and_uploaded_bytes_remain_strict_gates(self):
+        for corruption in ('task_id', 'sha256', 'bytes', 'file_id', 'body'):
+            with self.subTest(corruption=corruption):
+                self.fresh(); self.seed_claim()
+                self.objects.inject('PUT', UPLOAD_FILE, 'after', Crash())
+                with self.assertRaises(Crash): self.recover()
+                identity = self.objects.get_json(UPLOAD_FILE)
+                if corruption == 'body':
+                    self.api.backend['files'][identity['file_id']] = b'wrong receipt'
+                else:
+                    identity[corruption] = -1 if corruption == 'bytes' else 'wrong'
+                    self.objects.put_json(UPLOAD_FILE, identity)
+                self.local_files.clear()
+                self.api = FakeAPI(self.objects, self.api.backend)
+                with self.assertRaisesRegex(ValueError, 'native_receipt_conflict|file_hash_mismatch'): self.recover()
+                self.assertNotIn(NATIVE, self.objects.values)
+                self.assertEqual(self.api.backend['uploads'], 1)
+                self.assert_no_resend()
+
+    def test_local_fid_handoff_is_atomic_opaque_and_bound_to_original_receipt(self):
+        final = self.seed_complete(native=False)
+        raw = d.json_bytes(final)
+        identity = dict(file_id='00000000-0000-4000-8000-000000000001',
+                        bytes=len(raw), sha256=d.sha(raw), task_id=final['task_id'])
+        with tempfile.TemporaryDirectory() as tmp:
+            real_path = Path
+            with patch.object(d, 'Path', side_effect=lambda p: real_path(tmp) / p):
+                self.assertIsNone(LOCAL_RECEIPT_FILE(final))
+                self.assertEqual(LOCAL_RECEIPT_FILE(final, identity), identity)
+                self.assertEqual(LOCAL_RECEIPT_FILE(final), identity)
+                files = list(real_path(tmp).rglob('*.json'))
+                self.assertEqual(len(files), 1)
+                self.assertEqual(json.loads(files[0].read_bytes()), identity)
+                self.assertNotIn(final['content'].encode(), files[0].read_bytes())
+                self.assertEqual(list(real_path(tmp).rglob('*.tmp')), [])
+                with self.assertRaisesRegex(ValueError, 'native_receipt_conflict'):
+                    LOCAL_RECEIPT_FILE(dict(final, task_id='other'))
 
     def test_original_task_read_timeout_recovers_without_submit(self):
         self.seed_claim()

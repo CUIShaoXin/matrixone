@@ -74,6 +74,34 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(len(calls), 21)
         self.assertEqual(calls[-1].hour, 10)
 
+    def test_ready_at_ten_three_is_not_starved_by_warmup_polls(self):
+        clock = Clock(9, 50); calls = []
+        def run(*args):
+            calls.append(clock.now())
+            return ({'status': 'failed', 'safe_code': 'minio_http_404'}
+                    if clock.now() < dt.datetime(2026, 10, 29, 10, 3, tzinfo=s.LOCAL)
+                    else {'status': 'sent_verified'})
+        final = self.run_supervisor('deliver', run, clock, True)
+        self.assertEqual(final['status'], 'passed')
+        self.assertEqual(len(calls), 27)
+
+    def test_actual_http_errors_and_login_free_errors_have_bounded_recovery(self):
+        for value in ({'error_type': 'HTTPError', 'http_status': 503},
+                      {'safe_code': 'login_free_http_503'}):
+            self.assertTrue(s.retryable(value, 'deliver'))
+        for value in ({'error_type': 'HTTPError', 'http_status': 403},
+                      {'safe_code': 'login_free_http_403'},
+                      {'safe_code': 'login_free_report_mismatch'}):
+            self.assertFalse(s.retryable(value, 'deliver'))
+
+    def test_permanent_ready_absence_stops_at_total_deadline(self):
+        clock = Clock(9, 50)
+        def run(*args): return {'status': 'failed', 'safe_code': 'minio_http_404'}
+        final = self.run_supervisor('deliver', run, clock, True)
+        self.assertEqual(final['status'], 'failed')
+        self.assertLessEqual(final['attempts'], 51)
+        self.assertLessEqual(final['seconds'], 1500)
+
     def test_midnight_stops_recovery_instead_of_using_new_date(self):
         clock = Clock(23, 59)
         def run(*args):

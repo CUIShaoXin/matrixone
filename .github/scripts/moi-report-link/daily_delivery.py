@@ -367,25 +367,89 @@ def find_native_receipt(api, final):
                 fid = row.get('file_id', row.get('id'))
                 raw = api.file(fid)
                 require(raw == json_bytes(final), 'delivery_native_receipt_mismatch')
-                found = dict(file_id=fid, bytes=len(raw), sha256=sha(raw), readback_verified=True)
+                found = dict(file_id=fid, bytes=len(raw), sha256=sha(raw), readback_verified=True,
+                             catalog_attachment='verified')
         if len(rows) < 100:
             return found
     raise ValueError('delivery_history_pagination_incomplete')
 
 
+def upload_receipt_file(api, name, raw):
+    """Only upload bytes; the returned FID must be durable before catalog create."""
+    boundary = 'moi' + uuid.uuid4().hex
+    body = ('--' + boundary + '\r\nContent-Disposition: form-data; name="file"; filename="'
+            + name + '"\r\nContent-Type: application/octet-stream\r\n\r\n').encode()
+    body += raw + ('\r\n--' + boundary + '--\r\n').encode()
+    result = json.loads(api.binary('/catalog/file/upload', raw=body,
+                                   content_type='multipart/form-data; boundary=' + boundary))
+    require(result.get('code') in ('OK', 0, 200), 'delivery_native_upload_rejected')
+    fid = result.get('data', {}).get('file_id')
+    require(isinstance(fid, str) and re.fullmatch(r'[0-9a-f-]{36}', fid),
+            'delivery_native_upload_identity_invalid')
+    return fid
+
+
+def validate_receipt_file(identity, final, raw):
+    require(isinstance(identity, dict)
+            and identity.get('task_id') == final['task_id']
+            and identity.get('bytes') == len(raw) and identity.get('sha256') == sha(raw)
+            and isinstance(identity.get('file_id'), str)
+            and re.fullmatch(r'[0-9a-f-]{36}', identity['file_id']),
+            'delivery_native_receipt_conflict')
+
+
+def local_receipt_file(final, identity=None):
+    """Opaque FID handoff between supervisor children on this runner only."""
+    path = Path('out/delivery') / ('native-receipt-upload-' + final['date'].replace('-', '') + '.json')
+    try:
+        saved = json.loads(path.read_bytes())
+    except FileNotFoundError:
+        saved = None
+    if saved is not None:
+        validate_receipt_file(saved, final, json_bytes(final))
+        require(identity is None or saved == identity, 'delivery_native_receipt_conflict')
+    if identity is None or saved is not None:
+        return saved
+    validate_receipt_file(identity, final, json_bytes(final))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    try:
+        with temporary.open('xb') as stream:
+            stream.write(json_bytes(identity))
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return identity
+
+
 def native_receipt(api, objects, base, final, recovery=None):
+    raw = json_bytes(final)
     saved = read_json(objects, base + '/native-delivery-receipt.json', missing=True)
     if saved is not None:
-        require(checked_file(api, saved) == json_bytes(final), 'delivery_native_receipt_mismatch')
+        require(checked_file(api, saved) == raw, 'delivery_native_receipt_mismatch')
         return saved
     recovery = {} if recovery is None else recovery
-    artifact = recovery.get('artifact') or find_native_receipt(api, final)
-    if artifact is None:
+    identity_key = base + '/native-receipt-upload-file.json'
+    saved_identity = read_json(objects, identity_key, missing=True)
+    identity = recovery.get('file_identity') or local_receipt_file(final)
+    if saved_identity is not None:
+        validate_receipt_file(saved_identity, final, raw)
+        require(identity is None or identity == saved_identity, 'delivery_native_receipt_conflict')
+        identity = saved_identity
+    artifact = recovery.get('artifact')
+    if artifact is None and identity is None:
+        artifact = find_native_receipt(api, final)
+    if artifact is None and identity is None:
         # Persist upload permission separately: after an unknown upload or a
         # crash, subsequent observers may only discover the original native file.
         intent = recovery.setdefault('upload_intent', dict(
-            task_id=final['task_id'], receipt_sha256=sha(json_bytes(final)), owner=str(uuid.uuid4())))
-        _, saved_intent = create_once(objects, base + '/native-receipt-upload-claim.json', intent)
+            task_id=final['task_id'], receipt_sha256=sha(raw), owner=str(uuid.uuid4())))
+        intent_key = base + '/native-receipt-upload-claim.json'
+        saved_intent = read_json(objects, intent_key, missing=True)
+        if saved_intent is None:
+            _, saved_intent = create_once(objects, intent_key, intent)
         require(all(saved_intent.get(k) == intent[k] for k in ('task_id', 'receipt_sha256')),
                 'delivery_native_receipt_conflict')
         if saved_intent != intent or recovery.get('upload_started'):
@@ -393,10 +457,50 @@ def native_receipt(api, objects, base, final, recovery=None):
         # A lost intent confirmation is recoverable by this observer while it
         # still knows it has not attempted upload. After restart, read only.
         recovery['upload_started'] = True
-        artifact = api.upload('matrix-security-delivery-' + final['date'].replace('-', '') + '.json', json_bytes(final))
+        fid = upload_receipt_file(api, 'matrix-security-delivery-' + final['date'].replace('-', '') + '.json', raw)
+        identity = dict(file_id=fid, bytes=len(raw), sha256=sha(raw), task_id=final['task_id'])
+        # Retain a known FID even if its conditional PUT/readback times out.
+        recovery['file_identity'] = identity
+    if artifact is None:
+        validate_receipt_file(identity, final, raw)
+        # A runner-local atomic handoff survives a failed remote identity PUT.
+        local_receipt_file(final, identity)
+        if saved_identity is None:
+            _, saved_identity = create_once(objects, identity_key, identity)
+            require(saved_identity == identity, 'delivery_native_receipt_conflict')
+        # Only a confirmed durable FID grants permission to attach this exact
+        # file. An uncertain raw upload never reaches this path or uploads again.
+        attach = recovery.setdefault('attach_intent', dict(
+            file_id=identity['file_id'], task_id=final['task_id'], receipt_sha256=sha(raw),
+            owner=str(uuid.uuid4())))
+        attach_key = base + '/native-receipt-attach-claim.json'
+        saved_attach = read_json(objects, attach_key, missing=True)
+        if saved_attach is None:
+            _, saved_attach = create_once(objects, attach_key, attach)
+        require(all(saved_attach.get(k) == attach[k] for k in ('file_id', 'task_id', 'receipt_sha256')),
+                'delivery_native_receipt_conflict')
+        attachment = 'unknown'
+        if saved_attach == attach and not recovery.get('attach_started'):
+            recovery['attach_started'] = True
+            try:
+                api.request('/catalog/file/create', {'volume_id': 130001, 'file_ids': [identity['file_id']]})
+            except Exception as exc:
+                if not transient(exc):
+                    raise
+                # The mount may have committed. Only read this original FID.
+            else:
+                attachment = 'confirmed'
+        try:
+            require(checked_file(api, identity) == raw, 'delivery_native_receipt_mismatch')
+        except Exception as exc:
+            if str(exc) == 'moi_http_404' or isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+                raise TimeoutError('delivery_native_file_unavailable_read_only') from None
+            raise
+        artifact = dict(file_id=identity['file_id'], bytes=len(raw), sha256=sha(raw), readback_verified=True,
+                        catalog_attachment=attachment)
     recovery['artifact'] = artifact
     _, saved = create_once(objects, base + '/native-delivery-receipt.json', artifact)
-    require(checked_file(api, saved) == json_bytes(final), 'delivery_native_receipt_mismatch')
+    require(checked_file(api, saved) == raw, 'delivery_native_receipt_mismatch')
     return saved
 
 
@@ -462,7 +566,8 @@ def recover_claim(api, objects, date, claim, complete, deadline, poll_seconds, p
             return dict(status='already_sent' if complete is not None else 'sent_verified',
                         sent=True, duplicate_prevented=True, successful_send_count=1,
                         tool_call_id=stored['tool_call_id'], task_id=stored['task_id'],
-                        receipt_file_id=artifact['file_id'])
+                        receipt_file_id=artifact['file_id'],
+                        catalog_attachment=artifact.get('catalog_attachment', 'unknown'))
         except Exception as exc:
             if not transient(exc):
                 raise
