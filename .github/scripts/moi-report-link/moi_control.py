@@ -126,7 +126,7 @@ class Controller:
             raise ValueError('configured_retry_limit_required')
         result = self.status(owner_run_id)
         observed, snapshot = result['dispatch'], result['snapshot'] or {}
-        if snapshot.get('sent') is True or snapshot.get('business_status') == 'succeeded':
+        if snapshot.get('sent') is True or snapshot.get('business_status', snapshot.get('status')) == 'succeeded':
             return dict(result, retry=dict(state='status_sync_required'))
         if observed['state'] in ('queued', 'pending', 'waiting', 'requested', 'in_progress'):
             return result

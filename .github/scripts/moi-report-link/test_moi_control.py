@@ -238,6 +238,17 @@ class ControlBoundaryTests(unittest.TestCase):
         self.assertEqual(result['retry']['state'], 'status_sync_required')
         self.assertEqual(self.posts(), original)
 
+    def test_business_success_before_terminal_reconciliation_only_requires_state_sync(self):
+        batch = self.failed_run()
+        ctx = self.controller.context(batch)
+        self.store.publish(ctx.prefix+'/orchestration/status.json', json_bytes(dict(
+            run_id=batch['run_id'], business_date=batch['business_date'], execution_mode='no_send',
+            status='succeeded', sent=False)), 'application/json')
+        original = self.posts()
+        result = self.controller.resume(self.inputs['owner_run_id'], max_retries=1)
+        self.assertEqual(result['retry']['state'], 'status_sync_required')
+        self.assertEqual(self.posts(), original)
+
     def test_retry_limit_and_existing_legacy_batch_never_start_another_execution(self):
         self.failed_run()
         self.fixture.run.update(run_attempt=2)
