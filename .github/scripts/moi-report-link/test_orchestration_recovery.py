@@ -42,6 +42,72 @@ def context():
 
 
 class SnapshotOutageTests(unittest.TestCase):
+    def test_failed_report_registration_survives_entry_sync_and_replay(self):
+        import managed_entry
+        ctx, store, api = context(), MemoryObjects(), Mock()
+        code = 'knowledge_registration_uncertain_no_resubmit'
+        api.upload.return_value = dict(file_id='status-file')
+        api.file.side_effect = lambda fid: api.upload.call_args.args[1]
+
+        def failed_scan():
+            out = Path('out/pipeline'); out.mkdir(parents=True)
+            (out/'status.json').write_text(json.dumps(dict(ctx.record(), status='failed',
+                safe_code=code, error_type='ValueError', same_batch_end_to_end_passed=False)))
+            Path('out/pipeline-events.jsonl').write_text('\n'.join(json.dumps(dict(
+                kind='stage_end', stage=stage, status='failed', error_type='ValueError',
+                at_utc='2026-10-27T01:00:00Z')) for stage in ('knowledge_ingestion', 'api_publish_report')))
+            return 1
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, dict(
+                MATRIX_PIPELINE_RUN_ID=ctx.run_id, MATRIX_BUSINESS_DATE=ctx.business_date,
+                MATRIX_TRIGGER_SOURCE=ctx.trigger_source, MATRIX_EXECUTION_MODE=ctx.execution_mode), clear=True):
+            previous = os.getcwd()
+            try:
+                os.chdir(tmp)
+                with patch.object(managed_entry, 'scan', side_effect=failed_scan), \
+                     patch.object(managed_entry, 'delivery') as send, \
+                     patch.object(managed_entry, 'sync_status', side_effect=lambda: orchestration_status.sync(api, store, ctx)):
+                    self.assertEqual(managed_entry.run(), 1)
+                saved = json.loads(store.data[ctx.prefix+'/orchestration/status.json'])
+                self.assertEqual(saved['failure_stage'], 'scan')
+                self.assertEqual(saved['safe_code'], code)
+                self.assertEqual(saved['stages']['knowledge_ingestion']['status'], 'failed')
+                self.assertEqual(saved['stages']['report']['status'], 'failed')
+                self.assertIn(dict(stage='scan', safe_code=code, error_type='ValueError'), saved['failures'])
+                self.assertFalse(saved['sent'])
+                send.assert_not_called()
+                Path('out/pipeline/status.json').unlink()
+                Path('out/pipeline-events.jsonl').unlink()
+                with patch.object(managed_entry, 'scan') as scanner, patch.object(managed_entry, 'delivery') as sender:
+                    self.assertTrue(orchestration_status.upload_saved(api, store, ctx)['synced'])
+                replayed = json.loads(api.upload.call_args.args[1])
+                self.assertEqual(replayed, saved)
+                scanner.assert_not_called()
+                sender.assert_not_called()
+            finally: os.chdir(previous)
+
+    def test_delivery_exception_is_visible_without_exposing_raw_exception(self):
+        import managed_entry
+        ctx, store = context(), MemoryObjects()
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, dict(
+                MATRIX_PIPELINE_RUN_ID=ctx.run_id, MATRIX_BUSINESS_DATE=ctx.business_date,
+                MATRIX_TRIGGER_SOURCE=ctx.trigger_source, MATRIX_EXECUTION_MODE='production'), clear=True):
+            previous = os.getcwd()
+            try:
+                os.chdir(tmp)
+                with patch.object(managed_entry, 'scan', return_value=0), \
+                     patch.object(managed_entry, 'delivery', side_effect=TimeoutError('private webhook URL')), \
+                     patch.object(managed_entry, 'sync_status', return_value=dict(synced=False)):
+                    self.assertEqual(managed_entry.run(), 1)
+                production = BatchContext.from_env()
+                result = orchestration_status.snapshot(Mock(), store, production)
+            finally: os.chdir(previous)
+        self.assertEqual(result['failure_stage'], 'delivery')
+        self.assertEqual(result['error_type'], 'TimeoutError')
+        self.assertIn(dict(stage='delivery', error_type='TimeoutError'), result['failures'])
+        self.assertIsNone(result['sent'])
+        self.assertNotIn('private webhook URL', json.dumps(result))
+
     def test_started_empty_checkpoints_are_running_and_absent_repositories_wait(self):
         ctx, store = context(), MemoryObjects()
         repositories = dict(taas={}, matrixflow=dict(accepted=True))

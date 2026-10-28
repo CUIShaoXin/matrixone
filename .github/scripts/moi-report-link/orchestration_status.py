@@ -102,7 +102,8 @@ def snapshot(api, objects, ctx):
             name = event.get('stage')
             if name not in ('three_repository_acquisition', 'three_repository_component_scan',
                             'component_focus_summary', 'daily_delivery_readiness',
-                            'code_repository', 'api_context_for', 'api_publish_report'): continue
+                            'code_repository', 'api_context_for', 'api_publish_report',
+                            'knowledge_ingestion'): continue
             identity = name + (':'+event['repository'] if event.get('repository') else '')
             value['stages'][identity] = dict(status=event.get('status', 'running'),
                 at_utc=event['at_utc'], error_type=event.get('error_type'))
@@ -139,13 +140,29 @@ def snapshot(api, objects, ctx):
             for label, prefix in (('code_review', 'code_'), ('api_port_review', 'api_')):
                 if failure.get('stage') == prefix+repo and target['stages'][label] != 'succeeded':
                     target['stages'][label] = 'failed'
-    value['stages']['report'] = dict(status='succeeded' if root.get('published') else 'waiting')
+    publication_stage = value['stages'].get('api_publish_report', {})
+    report_status = ('succeeded' if root.get('published') else
+                     'failed' if publication_stage.get('status') == 'failed' else
+                     'running' if publication_stage else 'waiting')
+    value['stages']['report'] = dict(status=report_status)
     overall = value['stages'].get('overall', {})
     value['status'] = overall.get('status', 'running')
     delivery = value['stages'].get('delivery', {})
     value['sent'] = delivery.get('sent', overall.get('sent', False))
     value['delivery_receipt_file_id'] = delivery.get('receipt_file_id', overall.get('receipt_file_id'))
     value['failures'] = root.get('failures', []) + reviews.get('issues', [])
+    phase = overall.get('failure_stage')
+    if phase:
+        # The scanner returns a nonzero status after writing its safe reason;
+        # the entry's overall record can consequently contain only the phase.
+        # Keep that producer's reason when projecting the same failed run.
+        scan = value['stages'].get('scan', {})
+        failure = dict(scan if phase == 'scan' and scan.get('status') == 'failed' else {})
+        failure.update(overall)
+        fields = {k: failure[k] for k in ('safe_code', 'error_type', 'reason_type', 'http_status') if k in failure}
+        value.update(failure_stage=phase, **fields)
+        evidence = dict(stage=phase, **fields)
+        if evidence not in value['failures']: value['failures'].append(evidence)
     value['executions'] = root.get('executions', [])
     value['retry_count'] = max(0, len(value['executions'])-1)
     if root.get('publication_file_id'):
