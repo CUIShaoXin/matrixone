@@ -23,7 +23,23 @@ def interrupted(task):
     return walk(status) or walk(task.get('metadata',{}))
 
 
-def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadline_seconds=1800, poll_seconds=15):
+def empty_runtime_failure(task):
+    # Match only the observed failure before model output. A session title is
+    # runtime bookkeeping and cannot prove that any requested action ran.
+    if task.get('status', {}).get('state') != 'failed': return False
+    reason = task.get('metadata', {}).get('reason_display', {}).get('i18n_key')
+    if reason != 'reason.agent_runtime.finish.error' or task.get('history'): return False
+    artifacts = task.get('artifacts', [])
+    return bool(artifacts) and all(
+        a.get('name') == 'session_title' and
+        a.get('metadata', {}).get('data_type') == 'agent.session_title' and
+        bool(a.get('parts')) and all(
+            p.get('kind') == 'data' and p.get('data', {}).get('type') == 'agent.session_title'
+            for p in a['parts'])
+        for a in artifacts)
+
+
+def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadline_seconds=1800, poll_seconds=15, recover_empty_runtime_failure=False):
     digest = hashlib.sha256(context.encode()).hexdigest()
     contract = hashlib.sha256(prompt.encode()).hexdigest()
     key = repo+'_'+phase
@@ -121,9 +137,14 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
                     job.journal.save()
                     return value
                 if status in TERMINAL:
-                    if not interrupted(task): raise ValueError('model_terminal_nonrecoverable')
-                    attempt.update(retry_authorized=True,recovery_reason='stream_transport');job.journal.save()
-                    job.issue(key,'stream_transport','Terminal task retained; next bounded attempt uses same source and Kimi K3')
+                    reason = ('stream_transport' if interrupted(task) else
+                              'empty_runtime_failure' if recover_empty_runtime_failure and empty_runtime_failure(task) else None)
+                    if reason is None: raise ValueError('model_terminal_nonrecoverable')
+                    attempt.update(retry_authorized=True,recovery_reason=reason)
+                    if revalidating:
+                        recovery_started_epoch=saved.setdefault('recovery_started_epoch',time.time())
+                    job.journal.save()
+                    job.issue(key,reason,'Terminal task retained; next bounded attempt uses same source and Kimi K3')
                     continue
             except urllib.error.HTTPError as exc:
                 if exc.code not in (429,500,502,503,504): raise ValueError('model_http_nonrecoverable') from None
