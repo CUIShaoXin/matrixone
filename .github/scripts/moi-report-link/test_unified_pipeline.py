@@ -389,4 +389,61 @@ class KnowledgeProjectionRecoveryBudgetTests(unittest.TestCase):
    with self.assertRaisesRegex(ValueError,'requires_backend_repair'):kb.ensure_sources(job,[dict(file_id='fid',name='same.md')])
   self.assertNotIn('succeeded',job.state['knowledge_registration']['fid'])
 
+ def test_registration_checkpoint_failure_does_not_claim_submission(self):
+  class API:
+   def __init__(self):self.appends=0
+   @staticmethod
+   def data(x):return x
+   def request(self,path,payload=None,**kw):
+    if path.endswith('/sources'):self.appends+=1
+    return {'items':[]}
+  api=API();job=Job(api);failed=[]
+  def save():
+   if job.state.get('knowledge_registration',{}).get('fid',{}).get('append_attempted') and not failed:
+    failed.append(True);raise TimeoutError()
+  job.journal.save=save
+  def inventory(*args):return [dict(source_file_id='fid',ingest_status='succeeded')] if api.appends else []
+  with patch.object(kb,'rows',side_effect=inventory),patch.object(kb.time,'sleep'):
+   kb.ensure_sources(job,[dict(file_id='fid',name='x.md')])
+  self.assertEqual(api.appends,1);self.assertTrue(failed)
+ def selection_recovery_fixture(self,preview=None,fail=False):
+  class API:
+   def __init__(self):self.requests=[];self.registered=False
+   @staticmethod
+   def data(x):return x
+   def request(self,path,payload=None,**kw):
+    if path.endswith('/preview'):return preview if preview is not None else dict(file_count=1,table_count=0,total_count=1)
+    if path.endswith('/sources'):
+     self.requests.append(payload)
+     if fail:raise TimeoutError()
+     self.registered=True
+    return {'items':[]}
+  api=API();job=Job(api);job.state['knowledge_registration']={'fid':{'append_attempted':True}}
+  return api,job
+ def test_missing_legacy_registration_uses_deduplicated_exact_file_selection(self):
+  api,job=self.selection_recovery_fixture()
+  def inventory(*args):return [dict(source_file_id='fid',ingest_status='succeeded')] if api.registered else []
+  with patch.object(kb,'rows',side_effect=inventory),patch.object(kb.time,'sleep'),patch.object(kb.time,'monotonic',side_effect=range(0,100000,20)):
+   kb.ensure_sources(job,[dict(file_id='fid',name='x.md')],registration_volume_id=140002)
+  self.assertEqual(api.requests,[{'source_selections':[dict(kind='volume_files',volume_id=140002,all_selected=False,selected_file_ids=['fid'])]}])
+  self.assertTrue(job.state['knowledge_registration']['fid']['succeeded'])
+ def test_selection_recovery_rejects_broader_preview(self):
+  api,job=self.selection_recovery_fixture(dict(file_count=2,table_count=0,total_count=2))
+  with patch.object(kb,'rows',return_value=[]),patch.object(kb.time,'sleep'),patch.object(kb.time,'monotonic',side_effect=range(0,100000,20)):
+   with self.assertRaisesRegex(ValueError,'preview_identity_invalid'):
+    kb.ensure_sources(job,[dict(file_id='fid',name='x.md')],registration_volume_id=140002)
+  self.assertEqual(api.requests,[])
+ def test_existing_source_fact_is_not_registered_again(self):
+  api,job=self.selection_recovery_fixture(dict(file_count=0,table_count=0,total_count=0))
+  with patch.object(kb,'rows',return_value=[]),patch.object(kb.time,'sleep'),patch.object(kb.time,'monotonic',side_effect=range(0,100000,20)):
+   with self.assertRaisesRegex(ValueError,'ingestion_deadline'):
+    kb.ensure_sources(job,[dict(file_id='fid',name='x.md')],deadline_seconds=1000,registration_volume_id=140002)
+  self.assertEqual(api.requests,[])
+ def test_uncertain_selection_recovery_is_not_repeated(self):
+  api,job=self.selection_recovery_fixture(fail=True)
+  with patch.object(kb,'rows',return_value=[]),patch.object(kb.time,'sleep'),patch.object(kb.time,'monotonic',side_effect=range(0,100000,20)):
+   with self.assertRaisesRegex(ValueError,'uncertain_no_resubmit'):
+    kb.ensure_sources(job,[dict(file_id='fid',name='x.md')],registration_volume_id=140002)
+  self.assertEqual(len(api.requests),1)
+
 if __name__=='__main__':unittest.main()
