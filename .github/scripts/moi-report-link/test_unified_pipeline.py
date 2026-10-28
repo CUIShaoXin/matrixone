@@ -306,4 +306,25 @@ class UnifiedTests(unittest.TestCase):
     self.assertIn('MATRIX_SCHEDULED_BATCH',text)
     self.assertIn('cancel-in-progress: false',text)
 
+class ArchiveReverificationTests(unittest.TestCase):
+ def proofs(self):
+  from daily_pipeline import preflight
+  return {r.name:dict(report_date='2026-10-28',repository=r.owner+'/'+r.name,
+    daily_cloud_download_verified=True,minio_readback_verified=True,
+    key=r.name+'.zip',bytes=3,sha256='digest',commit='a'*40) for r in preflight.REPOSITORIES}
+ def test_existing_archive_mode_rechecks_every_object_without_new_acquisition(self):
+  from daily_pipeline import reverify_archives
+  from unittest.mock import Mock
+  objects=Mock();objects.verify_object.return_value=True
+  commits=reverify_archives(objects,self.proofs(),'2026-10-28')
+  self.assertEqual(set(commits),{'matrixone','taas','matrixflow'});self.assertEqual(objects.verify_object.call_count,3)
+  self.assertEqual(set(c.args[0] for c in objects.verify_object.call_args_list),{'matrixone.zip','taas.zip','matrixflow.zip'})
+ def test_wrong_day_or_missing_archive_cannot_pass_reverification(self):
+  from daily_pipeline import reverify_archives
+  from unittest.mock import Mock
+  objects=Mock();proofs=self.proofs();proofs['matrixone']['report_date']='2026-10-27'
+  with self.assertRaisesRegex(Exception,'identity_mismatch'):reverify_archives(objects,proofs,'2026-10-28')
+  objects.verify_object.assert_not_called();objects.verify_object.return_value=False
+  with self.assertRaisesRegex(Exception,'verified_archive_missing'):reverify_archives(objects,self.proofs(),'2026-10-28')
+
 if __name__=='__main__':unittest.main()
