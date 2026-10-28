@@ -57,6 +57,23 @@ def json_bytes(value):
     return json.dumps(value, ensure_ascii=False, indent=2).encode()
 
 
+def finalize_contract_nodes(stages, label, legacy_nodes):
+    """Resume the exact persisted variant; fresh runs omit free-form drafts."""
+    current = [n for n in legacy_nodes if n['name'] not in ('employee', 'employee_report')]
+    stage = stages.get(label)
+    if not stage:
+        return current
+    digest = stage.get('input_sha256')
+    if digest == sha256(json_bytes(current)):
+        return current
+    if digest == sha256(json_bytes(legacy_nodes)):
+        return legacy_nodes
+    # The initial planned checkpoint precedes input/deployment persistence.
+    if digest is None and stage.get('status') == 'planned' and not stage.get('execution_id'):
+        return current
+    raise Failure('workflow_resume_input_changed')
+
+
 
 def yaml_inline(value):
     """Keep jq quotes literal for MOI's raw-DSL template validation gate."""
@@ -411,8 +428,7 @@ class Runner:
                   self.sink("validation","{{ .state.validation }}",run_prefix+"-validation.json")]
         # Resume the exact historical contract if it already ran. Fresh batches
         # omit the redundant free-form LLM node; the final focus still uses Kimi.
-        if repo.name+"_finalize" not in self.state.get('stages', {}):
-            nodes = [node for node in nodes if node['name'] not in ('employee', 'employee_report')]
+        nodes = finalize_contract_nodes(self.state.get('stages', {}), repo.name+"_finalize", nodes)
         generated=self.workflow(repo.name+"_finalize",nodes)
         # Correct the legacy operator's import description before publishing or KB registration.
         if saved.get("artifact_storage_version") != 2:
