@@ -2,9 +2,11 @@ name: MOI Matrix security daily
 run-name: MOI security ${{ inputs.mode || github.event.schedule }} - ${{ inputs.resume_run_id || 'daily batch' }}
 on:
   schedule:
-    # UTC: Asia/Shanghai 04:17 starts one same-batch run. The delivery job
-    # waits for 10:00 after scan completion, so it does not depend on a
-    # second scheduled event being created by GitHub.
+    # Beijing 00:17 prepares the new day's fixed-commit report.
+    # Beijing 04:17 starts a separate delivery runner early, avoiding a new
+    # GitHub scheduling decision at 10:00. It verifies at 09:50, then waits
+    # until 10:00 before any send. Both phases share the same daily identity.
+    - cron: '17 16 * * *'
     - cron: '17 20 * * *'
   workflow_dispatch:
     inputs:
@@ -16,7 +18,7 @@ on:
       runtime_ref:
         description: Reviewed immutable runtime revision
         required: true
-        default: 988204aa35f42b2f6433fa2275abe92609644e09
+        default: c9cd57818f76506fdbaf517dae24431091671501
       resume_run_id:
         description: Same-day checkpoint only; blank starts the daily batch on schedule
         required: false
@@ -24,7 +26,7 @@ permissions:
   contents: read
 jobs:
   scan:
-    if: github.event_name == 'schedule' && github.event.schedule == '17 20 * * *' || github.event_name == 'workflow_dispatch' && inputs.mode != 'deliver' && inputs.mode != 'preview'
+    if: github.event_name == 'schedule' && github.event.schedule == '17 16 * * *' || github.event_name == 'workflow_dispatch' && inputs.mode != 'deliver' && inputs.mode != 'preview'
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     concurrency:
@@ -33,35 +35,26 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.runtime_ref || '988204aa35f42b2f6433fa2275abe92609644e09' }}
+          ref: ${{ inputs.runtime_ref || 'c9cd57818f76506fdbaf517dae24431091671501' }}
           persist-credentials: false
-          sparse-checkout: .github/scripts/moi-report-link
+          sparse-checkout: |
+            .github/scripts/moi-report-link
+            .github/workflows/moi-daily-cloud-acceptance.yml
       - name: Record actual runtime revision
         run: echo "MATRIX_RUNTIME_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - name: Ensure source inventory tool
         run: command -v rg || (sudo apt-get update -qq && sudo apt-get install -y ripgrep)
       - name: Check recovery and delivery gates
         working-directory: .github/scripts/moi-report-link
-        run: python3 -m unittest -v test_pipeline_recovery test_api_port_review test_component_details test_unified_pipeline test_daily_delivery
+        run: python3 -m unittest discover -v -p 'test_*.py'
       - name: Scan and publish today's three repositories
-        id: scan
-        continue-on-error: true
         env:
           MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
           SCAN_GITHUB_TOKEN: ${{ secrets.SCAN_GITHUB_TOKEN }}
           MATRIX_PIPELINE_MODE: ${{ inputs.mode || 'full' }}
           MATRIX_PIPELINE_RESUME_RUN_ID: ${{ inputs.resume_run_id }}
           MATRIX_SCHEDULED_BATCH: ${{ github.event_name == 'schedule' }}
-        run: python3 .github/scripts/moi-report-link/daily_pipeline.py
-      - name: One bounded recovery of the exact same batch
-        if: steps.scan.outcome == 'failure'
-        env:
-          MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
-          SCAN_GITHUB_TOKEN: ${{ secrets.SCAN_GITHUB_TOKEN }}
-          MATRIX_PIPELINE_MODE: ${{ inputs.mode || 'full' }}
-          MATRIX_PIPELINE_RESUME_RUN_ID: ${{ inputs.resume_run_id }}
-          MATRIX_SCHEDULED_BATCH: ${{ github.event_name == 'schedule' }}
-        run: python3 .github/scripts/moi-report-link/daily_pipeline.py
+        run: python3 .github/scripts/moi-report-link/daily_supervisor.py scan ${{ github.event_name == 'schedule' && '--scheduled' || '' }}
       - name: Retain safe timings and status
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -70,6 +63,7 @@ jobs:
           path: |
             out/pipeline/status.json
             out/pipeline-events.jsonl
+            out/supervisor/scan-*.json
           retention-days: 14
   deliver:
     needs: scan
@@ -82,26 +76,21 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.runtime_ref || '988204aa35f42b2f6433fa2275abe92609644e09' }}
+          ref: ${{ inputs.runtime_ref || 'c9cd57818f76506fdbaf517dae24431091671501' }}
           persist-credentials: false
-          sparse-checkout: .github/scripts/moi-report-link
+          sparse-checkout: |
+            .github/scripts/moi-report-link
+            .github/workflows/moi-daily-cloud-acceptance.yml
       - name: Record actual runtime revision
         run: echo "MATRIX_RUNTIME_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-      - name: Wait until 10:00 Beijing for the scheduled same-batch delivery
-        if: github.event_name == 'schedule'
-        run: |
-          python3 - <<'PY'
-          import datetime as dt
-          import time
-          tz = dt.timezone(dt.timedelta(hours=8))
-          while dt.datetime.now(tz).hour < 10:
-              time.sleep(15)
-          PY
+      - name: Check bounded receipt recovery and time barriers
+        working-directory: .github/scripts/moi-report-link
+        run: python3 -m unittest -v test_daily_delivery test_daily_supervisor test_delivery_recovery test_storage_recovery
       - name: Verify today's report and deliver once to existing group
         env:
           MOI_API_KEY: ${{ secrets.MOI_API_KEY }}
           MATRIX_DELIVERY_PREVIEW: ${{ inputs.mode == 'preview' }}
-        run: python3 .github/scripts/moi-report-link/daily_delivery.py
+        run: python3 .github/scripts/moi-report-link/daily_supervisor.py deliver ${{ github.event_name == 'schedule' && '--scheduled' || '' }}
       - name: Retain safe delivery status
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -110,4 +99,5 @@ jobs:
           path: |
             out/delivery/status.json
             out/pipeline-events.jsonl
+            out/supervisor/deliver-*.json
           retention-days: 14
