@@ -64,7 +64,7 @@ jobs:
         run: python3 .github/scripts/moi-report-link/daily_pipeline.py
       - name: Retain safe timings and status
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75d540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: moi-security-scan-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -75,7 +75,7 @@ jobs:
     needs: scan
     if: always() && (github.event_name == 'schedule' && github.event.schedule == '17 20 * * *' || github.event_name == 'workflow_dispatch' && (inputs.mode == 'deliver' || inputs.mode == 'preview'))
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 360
     concurrency:
       group: moi-matrix-daily-deliver
       cancel-in-progress: false
@@ -104,7 +104,7 @@ jobs:
         run: python3 .github/scripts/moi-report-link/daily_delivery.py
       - name: Retain safe delivery status
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75d540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: moi-security-delivery-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
