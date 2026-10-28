@@ -23,7 +23,7 @@ def matching(allrows,fid):
     return [r for r in allrows if fid in (r.get('source_file_id'),r.get('kb_file_id'),r.get('source_id'))]
 
 
-def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_visibility_grace_seconds=600):
+def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_visibility_grace_seconds=600,registration_volume_id=None):
     with KB_LOCK,span('knowledge_ingestion'):
         saved=job.state.setdefault('knowledge_registration',{})
         start=time.monotonic();seen_rounds={};last_reconcile=start-60
@@ -68,11 +68,41 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
                         seen_rounds[fid]=seen_rounds.get(fid,0)+1
                         # Native raw-volume save may enqueue registration. Let it become visible first.
                         if seen_rounds[fid]>=3 and not state.get('append_attempted'):
-                            state['append_attempted']=True;job.journal.save()
+                            state['append_attempted']=True
+                            try:
+                                job.journal.save()
+                            except Exception:
+                                # No registration request was reached. A failed checkpoint
+                                # acknowledgement must not become a false submission claim.
+                                state.pop('append_attempted',None)
+                                emit('knowledge_registration_preflight_failed',request_sent=False)
+                                raise
                             operation='source_registration'
                             job.api.request('/semantic-models/80001/sources',{'sources':[dict(source_type='local_file',upload_kind='unstructured',file_id=fid,file_name=artifact['name'])]},timeout=90)
                         elif state.get('append_attempted') and time.monotonic()-start>300 and not state.get('observed'):
-                            raise ValueError('knowledge_registration_uncertain_no_resubmit')
+                            if not registration_volume_id or state.get('selection_recovery_attempted'):
+                                raise ValueError('knowledge_registration_uncertain_no_resubmit')
+                            # The supported selection path checks persistent source facts
+                            # and skips existing file IDs before append. Never replay the
+                            # original uncertain local_file mutation or create another file.
+                            selection=dict(kind='volume_files',volume_id=registration_volume_id,all_selected=False,selected_file_ids=[fid])
+                            operation='source_selection_preview'
+                            preview=job.api.data(job.api.request('/semantic-models/80001/source-selections/preview',{'source_selections':[selection]},method='POST',timeout=90))
+                            if preview==dict(file_count=0,table_count=0,total_count=0):
+                                emit('knowledge_source_fact_exists_waiting',same_sources=True)
+                            elif preview==dict(file_count=1,table_count=0,total_count=1):
+                                state['selection_recovery_attempted']=True
+                                try:
+                                    job.journal.save()
+                                except Exception:
+                                    state.pop('selection_recovery_attempted',None)
+                                    emit('knowledge_registration_preflight_failed',request_sent=False)
+                                    raise
+                                operation='source_registration'
+                                job.api.request('/semantic-models/80001/sources',{'source_selections':[selection]},method='POST',timeout=90)
+                                emit('knowledge_missing_registration_recovered',same_sources=True,volume_id=registration_volume_id)
+                            else:
+                                raise ValueError('knowledge_registration_preview_identity_invalid')
                 job.journal.save()
                 if ready:return
                 if time.monotonic()-last_reconcile>=60:
