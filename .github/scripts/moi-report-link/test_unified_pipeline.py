@@ -327,4 +327,24 @@ class ArchiveReverificationTests(unittest.TestCase):
   objects.verify_object.assert_not_called();objects.verify_object.return_value=False
   with self.assertRaisesRegex(Exception,'verified_archive_missing'):reverify_archives(objects,self.proofs(),'2026-10-28')
 
+class EmployeeEvidenceSummaryTests(unittest.TestCase):
+ def scan(self):
+  return dict(commit='f8478038'+'a'*32,facts=dict(report_date_shanghai='2026-10-28',
+   repository='matrixorigin/matrixone',branch='main',commit='f8478038'+'a'*32,
+   marker='MATRIX-MINIO-FULLZIP-20261028-MATRIXONE-F8478038',input_files=13,
+   queried_package_versions=316,priority_components=[dict(name='golang.org/x/crypto',
+    versions={'0.51.0':[]},vulnerability_ids=['GO-example'])]))
+ def test_native_evidence_summary_uses_scan_facts_and_exact_marker(self):
+  from cloud_daily import employee_evidence_summary
+  osv=self.scan();osv['employee_draft']='Unfinished reasoning. Truncated output.'
+  raw=employee_evidence_summary(osv);text=raw.decode()
+  self.assertTrue(text.endswith(osv['facts']['marker']+'-EMPLOYEE\n'))
+  self.assertIn('golang.org/x/crypto：0.51.0',text);self.assertIn('316',text)
+  self.assertNotIn('Unfinished',text);self.assertNotIn('修复完成',text)
+ def test_wrong_batch_marker_or_commit_is_rejected(self):
+  from cloud_daily import employee_evidence_summary
+  for field in ('marker','commit'):
+   osv=self.scan();osv['facts'][field]='wrong'
+   with self.assertRaisesRegex(Exception,'facts_identity_mismatch'):employee_evidence_summary(osv)
+
 if __name__=='__main__':unittest.main()
