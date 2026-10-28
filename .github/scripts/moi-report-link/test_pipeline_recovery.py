@@ -193,4 +193,38 @@ class RecoveryTests(unittest.TestCase):
   from api_port_review import parse_review
   bad=task('completed');bad['artifacts']=[{'parts':[{'kind':'text','text':'{}'}]}]
   with self.assertRaises(ValueError):parse_review(bad,'repo','a'*40)
+class ArchiveReadCacheTests(unittest.TestCase):
+ def test_parallel_consumers_download_snapshot_once(self):
+  import concurrent.futures,time
+  store=Objects.__new__(Objects)
+  def network(*args,**kwargs):time.sleep(.03);return 200,{'Content-Length':'3'},b'zip'
+  with patch.object(store,'_call_uncached',side_effect=network) as call,patch('resilient_storage.emit'):
+   with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+    results=list(pool.map(lambda _:store.call('GET','snapshots/20261028/repo/fixed.zip'),range(2)))
+   self.assertEqual(call.call_count,1);self.assertEqual([r[2] for r in results],[b'zip',b'zip'])
+ def test_failed_read_is_not_cached(self):
+  store=Objects.__new__(Objects)
+  with patch.object(store,'_call_uncached',side_effect=[TimeoutError(),(200,{},b'zip')]) as call:
+   with self.assertRaises(TimeoutError):store.call('GET','snapshots/today/fixed.zip')
+   self.assertEqual(store.call('GET','snapshots/today/fixed.zip')[2],b'zip');self.assertEqual(call.call_count,2)
+ def test_cached_bytes_still_obey_size_and_hash_gates(self):
+  store=Objects.__new__(Objects)
+  def network(method,*args,**kwargs):return (200,{'content-length':'3','x-amz-meta-sha256':sha256(b'yes')},b'') if method=='HEAD' else (200,{},b'bad')
+  with patch.object(store,'_call_uncached',side_effect=network),patch('resilient_storage.emit'):
+   store.call('GET','snapshots/today/fixed.zip')
+   with self.assertRaisesRegex(ValueError,'exceeds_limit'):store.call('GET','snapshots/today/fixed.zip',response_limit=2)
+   with self.assertRaisesRegex(ValueError,'hash_mismatch'):store.verify_object('snapshots/today/fixed.zip',3,sha256(b'yes'))
+ def test_other_objects_ranges_and_store_instances_are_independent(self):
+  first=Objects.__new__(Objects);second=Objects.__new__(Objects)
+  with patch.object(Objects,'_call_uncached',return_value=(200,{},b'zip')) as call,patch('resilient_storage.emit'):
+   for _ in range(2):first.call('GET','reports/report.zip')
+   for _ in range(2):first.call('GET','snapshots/today/fixed.zip',headers={'Range':'bytes=0-1'})
+   first.call('GET','snapshots/today/fixed.zip');second.call('GET','snapshots/today/fixed.zip')
+   self.assertEqual(call.call_count,6)
+ def test_memory_budget_evicts_earliest_snapshot(self):
+  store=Objects.__new__(Objects)
+  with patch('resilient_storage.ZIP_READ_LIMIT',5),patch.object(store,'_call_uncached',return_value=(200,{},b'zip')) as call:
+   store.call('GET','snapshots/today/first.zip');store.call('GET','snapshots/today/second.zip');store.call('GET','snapshots/today/first.zip')
+   self.assertEqual(call.call_count,3);self.assertLessEqual(sum(len(r[2]) for r in store._zip_reads.values()),5)
+
 if __name__=='__main__':unittest.main()
