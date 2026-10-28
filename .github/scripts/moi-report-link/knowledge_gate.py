@@ -23,7 +23,7 @@ def matching(allrows,fid):
     return [r for r in allrows if fid in (r.get('source_file_id'),r.get('kb_file_id'),r.get('source_id'))]
 
 
-def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_visibility_grace_seconds=180):
+def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_visibility_grace_seconds=600):
     with KB_LOCK,span('knowledge_ingestion'):
         saved=job.state.setdefault('knowledge_registration',{})
         start=time.monotonic();seen_rounds={};last_reconcile=start-60
