@@ -39,14 +39,18 @@ def open_journal(objects,key,initial):
 
 def scan_components(runner,archives,on_failure):
     results={};failures=[]
-    for repo in preflight.REPOSITORIES:
-        try:results[repo.name]=runner.scan(repo,archives[repo.name])
-        except Exception as exc:
-            on_failure(repo.name,exc);failures.append(repo.name)
+    with futures.ThreadPoolExecutor(max_workers=3) as pool:
+        pending={pool.submit(runner.scan,repo,archives[repo.name]):repo.name
+                 for repo in preflight.REPOSITORIES}
+        for future in futures.as_completed(pending):
+            name=pending[future]
+            try:results[name]=future.result()
+            except Exception as exc:
+                on_failure(name,exc);failures.append(name)
     # Each repository keeps its own real accepted checkpoint. One failed KB
     # gate must not prevent the other repositories from doing useful work.
     if failures:raise ValueError('component_scan_incomplete')
-    return results
+    return {repo.name:results[repo.name] for repo in preflight.REPOSITORIES}
 
 
 def main():

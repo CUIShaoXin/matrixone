@@ -184,4 +184,3 @@ class WorkflowLifecycleTests(unittest.TestCase):
                 del stage[damage]
             retire(runner, 'lifecycle_probe')
             self.assertEqual(runner.api.deletes, 0)
-

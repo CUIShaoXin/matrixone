@@ -61,13 +61,73 @@ class GitHubActions:
             return json.loads(raw) if raw else None
 
 
-def dispatch(actions, objects, ctx, runtime_ref):
+def update_dispatch(objects, key, request_sha256, observation):
+    """Merge an observation without losing a concurrently persisted binding."""
+    for attempt in range(3):
+        _, headers, original = objects.call('GET', key)
+        saved = json.loads(original)
+        if saved['request_sha256'] != request_sha256:
+            raise ValueError('dispatch_batch_request_conflict')
+        if saved.get('github_run_id'):
+            # A late POST acknowledgement cannot erase a run found by a poller.
+            if not observation.get('github_run_id'):
+                return saved
+            if str(saved['github_run_id']) != str(observation['github_run_id']):
+                raise ValueError('github_run_correlation_conflict')
+            if observation['github_attempt'] < saved['github_attempt']:
+                return saved
+            if observation['github_attempt'] == saved['github_attempt'] and saved['state'] == 'completed':
+                if observation['state'] != 'completed':
+                    return saved
+                if observation['conclusion'] != saved['conclusion']:
+                    raise ValueError('github_run_terminal_conflict')
+        elif saved['state'] == 'rejected' and observation.get('github_run_id'):
+            raise ValueError('github_run_correlation_conflict')
+        value = dict(saved, **observation)
+        if value == saved:
+            return saved
+        etag = next((v for k, v in headers.items() if k.lower() == 'etag'), None)
+        if not etag:
+            raise ValueError('dispatch_etag_required')
+        raw = json_bytes(value)
+        try:
+            objects.call('PUT', key, raw=raw, headers={'if-match': etag, 'content-type': 'application/json',
+                         'x-amz-meta-sha256': hashlib.sha256(raw).hexdigest()})
+        except RuntimeError as exc:
+            if str(exc) != 'minio_http_412':
+                raise
+            continue
+        if objects.call('GET', key)[2] == raw:
+            return value
+    raise ValueError('dispatch_update_contended')
+
+
+def validate_dispatch_inputs(ctx, runtime_ref, workflow_ref):
     if not re.fullmatch(r'[0-9a-f]{40}', runtime_ref): raise ValueError('immutable_runtime_ref_required')
+    if (not isinstance(workflow_ref, str) or not workflow_ref or workflow_ref != workflow_ref.strip()
+            or any(ord(c) < 32 for c in workflow_ref)):
+        raise ValueError('workflow_ref_required')
     if not ctx.trigger_source.startswith('moi_'): raise ValueError('moi_trigger_source_required')
+
+
+def submit_intent(actions, objects, key, digest, path, request):
+    try:
+        actions.request(path, request)
+        outcome = dict(state='submitted')
+    except urllib.error.HTTPError as exc:
+        # A server failure may occur after acceptance; do not auto-resubmit.
+        outcome = dict(state='rejected' if 400<=exc.code<500 and exc.code!=408 else 'unknown', http_status=exc.code)
+    except Exception as exc:
+        outcome = dict(state='unknown', error_type=type(exc).__name__)
+    return update_dispatch(objects, key, digest, outcome)
+
+
+def dispatch(actions, objects, ctx, runtime_ref, workflow_ref):
+    validate_dispatch_inputs(ctx, runtime_ref, workflow_ref)
     inputs = dict(mode='managed', runtime_ref=runtime_ref, run_id=ctx.run_id,
                   business_date=ctx.business_date, trigger_source=ctx.trigger_source,
                   execution_mode=ctx.execution_mode)
-    request = dict(ref='main', inputs=inputs)
+    request = dict(ref=workflow_ref, inputs=inputs)
     key = ctx.prefix+'/orchestration/dispatch.json'
     digest = hashlib.sha256(json_bytes(request)).hexdigest()
     initial = dict(schema='matrix_moi_dispatch_v1', request=request, request_sha256=digest,
@@ -76,15 +136,23 @@ def dispatch(actions, objects, ctx, runtime_ref):
     created, saved = create_once(objects, key, initial)
     if saved['request_sha256'] != digest: raise ValueError('dispatch_batch_request_conflict')
     if created:
-        try:
-            actions.request('/actions/workflows/'+WORKFLOW+'/dispatches', request)
-            saved['state'] = 'submitted'
-        except urllib.error.HTTPError as exc:
-            # A server failure may occur after acceptance; do not auto-resubmit.
-            saved.update(state='rejected' if 400<=exc.code<500 and exc.code!=408 else 'unknown', http_status=exc.code)
-        except Exception as exc:
-            saved.update(state='unknown', error_type=type(exc).__name__)
-        objects.publish(key, json_bytes(saved), 'application/json')
+        submit_intent(actions, objects, key, digest, '/actions/workflows/'+WORKFLOW+'/dispatches', request)
+    return observe_dispatch(actions, objects, ctx)
+
+
+def observe_dispatch(actions, objects, ctx):
+    """Read an existing intent and its real run; never submit a workflow."""
+    key = ctx.prefix+'/orchestration/dispatch.json'
+    saved = read_json(objects, key, missing=True)
+    if saved is None:
+        return dict(state='not_submitted', run_id=ctx.run_id, business_date=ctx.business_date)
+    request = saved['request']
+    digest = hashlib.sha256(json_bytes(request)).hexdigest()
+    expected = dict(run_id=ctx.run_id, business_date=ctx.business_date,
+                    trigger_source=ctx.trigger_source, execution_mode=ctx.execution_mode)
+    if (saved['request_sha256'] != digest
+            or any(request['inputs'].get(k) != v for k, v in expected.items())):
+        raise ValueError('dispatch_batch_request_conflict')
     # Matching is read-only even if POST timed out or process died afterwards.
     if saved['state'] != 'rejected':
         if saved.get('github_run_id'):
@@ -103,9 +171,9 @@ def dispatch(actions, objects, ctx, runtime_ref):
         if matches:
             run = matches[0]
             verify_run(run, ctx)
-            saved.update(state=run['status'], conclusion=run.get('conclusion'), github_run_id=run['id'],
-                         github_attempt=run['run_attempt'], github_url=run['html_url'])
-            objects.publish(key, json_bytes(saved), 'application/json')
+            saved = update_dispatch(objects, key, digest,
+                dict(state=run['status'], conclusion=run.get('conclusion'), github_run_id=run['id'],
+                     github_attempt=run['run_attempt'], github_url=run['html_url']))
     return saved
 
 

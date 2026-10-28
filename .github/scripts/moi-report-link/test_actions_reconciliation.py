@@ -297,7 +297,7 @@ class ActionsReconciliationTests(unittest.TestCase):
             self.assertIsNone(payload)
             return dict(self.run, run_attempt=2)
         self.actions.request.side_effect = request_run
-        result = moi_actions.dispatch(self.actions, self.store, self.ctx, 'a'*40)
+        result = moi_actions.dispatch(self.actions, self.store, self.ctx, 'a'*40, workflow_ref='main')
         self.assertEqual((result['github_run_id'], result['github_attempt'], result['conclusion']), (123, 2, 'cancelled'))
 
 

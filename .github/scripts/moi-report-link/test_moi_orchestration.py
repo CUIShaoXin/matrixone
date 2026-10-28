@@ -5,6 +5,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from resilient_storage import SignedObjects
+from test_actions_reconciliation import ConditionalObjects
+
 
 class EntryRegressionTests(unittest.TestCase):
     def test_explicit_moi_batch_and_business_date_are_preserved(self):
@@ -114,6 +117,11 @@ class PipelineEntryIntegrationTests(unittest.TestCase):
             self.assertTrue(store.verify_object(proof['key'], proof['bytes'], proof['sha256']))
 
 class StatusAndDispatchTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(patch.stopall)
+        patch.object(SignedObjects, 'call', autospec=True,
+                     side_effect=lambda obj, *args, **kwargs: obj.call(*args, **kwargs)).start()
+
     def context(self):
         from batch_context import BatchContext
         return BatchContext.from_env(dict(MATRIX_PIPELINE_RUN_ID='batch', MATRIX_BUSINESS_DATE='2026-10-27',
@@ -138,14 +146,13 @@ class StatusAndDispatchTests(unittest.TestCase):
     def test_exact_completed_actions_run_is_correlated(self):
         import moi_actions as bridge
         from unittest.mock import Mock
-        actions, objects = Mock(), Mock()
+        actions, objects = Mock(), ConditionalObjects()
         actions.request.side_effect = [None, dict(workflow_runs=[dict(display_title='MOI security managed - batch',
             created_at='2099-01-01T00:00:00Z', id=123, run_attempt=2, status='completed', conclusion='failure',
             event='workflow_dispatch', path='.github/workflows/moi-managed-security.yml',
             repository=dict(full_name=bridge.REPOSITORY),
             html_url='https://github.com/CUIShaoXin/matrixone/actions/runs/123')])]
-        with patch.object(bridge, 'create_once', side_effect=lambda o,k,v:(True,v)):
-            result = bridge.dispatch(actions, objects, self.context(), 'a'*40)
+        result = bridge.dispatch(actions, objects, self.context(), 'a'*40, workflow_ref='main')
         self.assertEqual((result['github_run_id'], result['github_attempt'], result['conclusion']), (123,2,'failure'))
 
     def test_moi_readback_corruption_is_not_reported_as_synced(self):
@@ -164,10 +171,9 @@ class StatusAndDispatchTests(unittest.TestCase):
     def test_dispatch_acceptance_is_submitted_until_real_run_is_found(self):
         import moi_actions as bridge
         from unittest.mock import Mock
-        actions, objects = Mock(), Mock()
+        actions, objects = Mock(), ConditionalObjects()
         actions.request.side_effect = [None, dict(workflow_runs=[])]
-        with patch.object(bridge, 'create_once', side_effect=lambda o,k,v:(True,v)):
-            result = bridge.dispatch(actions, objects, self.context(), 'a'*40)
+        result = bridge.dispatch(actions, objects, self.context(), 'a'*40, workflow_ref='main')
         self.assertEqual(result['state'], 'submitted')
         self.assertNotIn('conclusion', result)
         self.assertEqual(actions.request.call_args_list[0].args[1]['inputs']['run_id'], 'batch')
@@ -175,20 +181,10 @@ class StatusAndDispatchTests(unittest.TestCase):
     def test_uncertain_dispatch_is_correlated_without_resubmitting(self):
         import moi_actions as bridge
         from unittest.mock import Mock
-        actions, objects = Mock(), Mock()
+        actions, objects = Mock(), ConditionalObjects()
         actions.request.side_effect = [TimeoutError(), dict(workflow_runs=[]), dict(workflow_runs=[])]
-        persisted = {}
-        def claim(o,k,value):
-            if persisted: return False, persisted.copy()
-            persisted.update(value)
-            return True, persisted.copy()
-        def save(k,raw,kind):
-            import json
-            persisted.update(json.loads(raw))
-        objects.publish.side_effect = save
-        with patch.object(bridge, 'create_once', side_effect=claim):
-            self.assertEqual(bridge.dispatch(actions, objects, self.context(), 'a'*40)['state'], 'unknown')
-            self.assertEqual(bridge.dispatch(actions, objects, self.context(), 'a'*40)['state'], 'unknown')
+        self.assertEqual(bridge.dispatch(actions, objects, self.context(), 'a'*40, workflow_ref='main')['state'], 'unknown')
+        self.assertEqual(bridge.dispatch(actions, objects, self.context(), 'a'*40, workflow_ref='main')['state'], 'unknown')
         self.assertEqual([call.args[0].endswith('/dispatches') for call in actions.request.call_args_list],
                          [True, False, False])
 

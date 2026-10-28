@@ -5,7 +5,7 @@ on:
     inputs:
       mode:
         type: choice
-        options: [managed, status-sync, status-reconcile]
+        options: [managed, status-sync, status-reconcile, regressions]
         default: managed
       runtime_ref:
         description: Reviewed immutable runtime commit containing managed_entry.py
@@ -28,6 +28,38 @@ permissions:
   contents: read
   actions: read
 jobs:
+  regressions:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'regressions'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Validate immutable regression runtime
+        env:
+          REVIEWED_RUNTIME: ${{ inputs.runtime_ref }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, re
+          assert re.fullmatch('[0-9a-f]{40}', os.environ['REVIEWED_RUNTIME']), 'immutable_runtime_ref_required'
+          PYTHON
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.runtime_ref }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/moi-report-link
+      - name: Run isolated orchestration and recovery regressions
+        working-directory: .github/scripts/moi-report-link
+        run: |
+          python3 -m unittest discover -p 'test_*.py' -v > regressions.log 2>&1 || { tail -n 120 regressions.log; exit 1; }
+          tail -n 5 regressions.log
+      - name: Retain regression evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: moi-control-regressions-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .github/scripts/moi-report-link/regressions.log
+          retention-days: 14
   managed:
     if: github.event_name == 'workflow_dispatch' && (inputs.mode == 'managed' || inputs.mode == 'status-sync' || inputs.mode == 'status-reconcile')
     runs-on: ubuntu-24.04
@@ -65,7 +97,7 @@ jobs:
         run: command -v rg || (sudo apt-get update -qq && sudo apt-get install -y ripgrep)
       - name: Run orchestration and existing recovery regressions
         working-directory: .github/scripts/moi-report-link
-        run: python3 -m unittest -v test_moi_orchestration test_orchestration_recovery test_actions_reconciliation test_component_recovery test_pipeline_recovery test_api_port_review test_component_details test_unified_pipeline test_daily_delivery test_workflow_lifecycle
+        run: python3 -m unittest -v test_moi_orchestration test_orchestration_recovery test_actions_reconciliation test_dispatch_ownership test_moi_control test_component_recovery test_pipeline_recovery test_api_port_review test_component_details test_unified_pipeline test_daily_delivery test_workflow_lifecycle
       - name: Execute the same pipeline and delivery gate
         if: inputs.mode == 'managed'
         env:

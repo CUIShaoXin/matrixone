@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -169,6 +170,55 @@ class ComponentRecoveryEntryTests(unittest.TestCase):
 
     def checkpoint(self, suffix):
         return json.loads(self.store.data[self.ctx.prefix+'/'+suffix])
+
+    def parallel_component_gate(self):
+        barrier = threading.Barrier(3, timeout=2)
+        original = self.workflows.workflow
+
+        def workflow(runner, label, nodes):
+            if label in {'matrixone_parse', 'taas_parse', 'matrixflow_parse'}:
+                archives = self.checkpoint('checkpoint.json')['archives']
+                self.assertEqual(set(archives), {'matrixone', 'taas', 'matrixflow'})
+                for proof in archives.values():
+                    self.assertTrue(self.store.verify_object(proof['key'], proof['bytes'], proof['sha256']))
+                barrier.wait()
+            return original(runner, label, nodes)
+
+        self.workflows.workflow = workflow
+
+    def test_three_component_scans_overlap_only_after_all_archives_are_verified(self):
+        self.workflows.bad_labels.clear()
+        self.parallel_component_gate()
+        self.assertEqual(pipeline.main(), 0)
+        current = self.checkpoint('components/checkpoint.json')
+        for repo in ('matrixone', 'taas', 'matrixflow'):
+            self.assertTrue(current['repositories'][repo]['accepted'])
+            self.assertEqual(current['repositories'][repo]['scan_status'], 'succeeded')
+        self.assertEqual(self.publications[0]['commits'],
+            dict.fromkeys(('matrixone', 'taas', 'matrixflow'), 'a'*40))
+
+    def test_parallel_failure_keeps_other_repositories_and_blocks_publication(self):
+        self.parallel_component_gate()
+        self.seed_original_failure()
+        current = self.checkpoint('components/checkpoint.json')
+        self.assertTrue(current['repositories']['matrixone']['accepted'])
+        self.assertTrue(current['repositories']['matrixflow']['accepted'])
+        self.assertFalse(current['repositories']['taas'].get('accepted', False))
+        self.assertEqual(self.publications, [])
+
+    def test_acquisition_failure_prevents_every_parallel_scan(self):
+        original = pipeline.preflight.prepare_archive
+
+        def acquire(github, objects, repo, run_id, date):
+            if repo.name == 'taas':
+                raise ValueError('archive_verification_failed')
+            return original(github, objects, repo, run_id, date)
+
+        with patch.object(pipeline.preflight, 'prepare_archive', side_effect=acquire):
+            self.assertEqual(pipeline.main(), 1)
+        self.assertEqual(self.workflows.executed, [])
+        self.assertEqual(self.review_inferences, [])
+        self.assertEqual(self.publications, [])
 
     def seed_original_failure(self):
         with patch.object(pipeline, 'Runner',
