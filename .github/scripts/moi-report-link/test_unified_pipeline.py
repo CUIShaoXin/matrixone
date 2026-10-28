@@ -347,4 +347,23 @@ class EmployeeEvidenceSummaryTests(unittest.TestCase):
    osv=self.scan();osv['facts'][field]='wrong'
    with self.assertRaisesRegex(Exception,'facts_identity_mismatch'):employee_evidence_summary(osv)
 
+class KnowledgeProjectionRecoveryBudgetTests(unittest.TestCase):
+ def test_same_source_projection_can_recover_after_three_minutes(self):
+  import types
+  job=Job(types.SimpleNamespace(data=lambda x:x,request=lambda *a,**k:{'items':[]}))
+  job.state['knowledge_registration']={'fid':{'missing_runtime_first_observed_epoch':100}}
+  failed=dict(source_file_id='fid',ingest_status='failed',error='workflow execution 213472d9-decc-4bf1-b52f-6306c74360a8 not found: domain object not found')
+  with patch.object(kb,'rows',side_effect=[[failed],[dict(source_file_id='fid',ingest_status='succeeded')]]),patch.object(kb.time,'time',return_value=400),patch.object(kb.time,'sleep'):
+   kb.ensure_sources(job,[dict(file_id='fid',name='same.md')])
+  self.assertTrue(job.state['knowledge_registration']['fid']['succeeded'])
+  self.assertNotIn('append_attempted',job.state['knowledge_registration']['fid'])
+ def test_projection_budget_remains_bounded_and_cannot_accept_failure(self):
+  import types
+  job=Job(types.SimpleNamespace(data=lambda x:x,request=lambda *a,**k:{'items':[]}))
+  job.state['knowledge_registration']={'fid':{'active_dispatch_first_observed_epoch':100}}
+  failed=dict(source_file_id='fid',ingest_status='failed',error='workflow has an active volume dispatch job: job 213472d9-decc-4bf1-b52f-6306c74360a8 status running')
+  with patch.object(kb,'rows',return_value=[failed]),patch.object(kb.time,'time',return_value=701):
+   with self.assertRaisesRegex(ValueError,'requires_backend_repair'):kb.ensure_sources(job,[dict(file_id='fid',name='same.md')])
+  self.assertNotIn('succeeded',job.state['knowledge_registration']['fid'])
+
 if __name__=='__main__':unittest.main()
