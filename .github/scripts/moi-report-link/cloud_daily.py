@@ -39,6 +39,29 @@ def require(condition, code):
         raise Failure(code)
 
 
+class WorkflowFailure(Failure):
+    """A terminal MOI workflow failure with safe, durable execution evidence."""
+
+    def __init__(self, label, diagnostic):
+        self.workflow_label = label
+        self.diagnostic = diagnostic
+        super().__init__('moi_workflow_failed:' + label)
+
+
+def workflow_failure_diagnostic(result, workflow_id, execution_id):
+    """Keep useful scalar failure fields without copying arbitrary MOI output."""
+    diagnostic = {
+        'workflow_id': workflow_id,
+        'execution_id': execution_id,
+        'status': result.get('status'),
+    }
+    for key in ('error_code', 'error_type', 'error', 'message', 'reason'):
+        value = result.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            diagnostic[key] = str(value)[:500]
+    return {key: value for key, value in diagnostic.items() if value is not None}
+
+
 def json_bytes(value):
     return json.dumps(value, ensure_ascii=False, indent=2).encode()
 
@@ -231,11 +254,17 @@ class Journal:
 
 
 class Runner:
-    def __init__(self, api, objects, journal):
+    def __init__(self, api, objects, journal, repository=None):
         self.api, self.objects, self.journal = api, objects, journal
         self.state = journal.value
+        self.repository = repository
+
+    def telemetry_fields(self):
+        return {'repository': self.repository} if self.repository else {}
 
     def event(self, **fields):
+        if self.repository:
+            fields.setdefault('repository', self.repository)
         print(json.dumps(dict(stage=fields.pop("stage", "progress"), **fields)), flush=True)
 
     @timed("component_workflow")
@@ -291,9 +320,10 @@ class Runner:
                     break
                 if result['status'] in ('failed','cancelled','canceled','error','timeout'):
                     stage['status'] = result['status']
+                    stage['failure'] = workflow_failure_diagnostic(result, wid, eid)
                     self.journal.save()
                     retire(self, label)
-                    raise Failure('moi_workflow_failed:'+label)
+                    raise WorkflowFailure(label, stage['failure'])
                 time.sleep(12)
             require(stage["status"] == "completed", "moi_workflow_timeout")
         artifacts = {}

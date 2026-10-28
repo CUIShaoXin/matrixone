@@ -54,7 +54,8 @@ class WorkflowAPI:
         if path.endswith('/result'):
             if not self.exists:
                 raise Failure('moi_http_404')
-            return {'result': dict(execution_id='execution-1', workflow_id=self.wid, status=self.terminal)}
+            return {'result': dict(execution_id='execution-1', workflow_id=self.wid,
+                                   status=self.terminal, **getattr(self, 'failure_fields', {}))}
         if '/nodes/root.' in path:
             if not self.exists:
                 raise Failure('moi_http_404')
@@ -159,6 +160,18 @@ class WorkflowLifecycleTests(unittest.TestCase):
         self.assertEqual(stage['status'], 'failed')
         self.assertEqual(stage['cleanup']['status'], 'deleted')
         self.assertEqual((runner.api.deploys, runner.api.submits), (1, 1))
+
+    def test_failed_execution_persists_safe_diagnostic_without_copying_arbitrary_output(self):
+        runner, nodes = self.runner()
+        runner.api.terminal = 'failed'
+        runner.api.failure_fields = dict(error_code='A2A_INVALID', message='workflow input rejected')
+        with self.assertRaisesRegex(Failure, 'moi_workflow_failed'):
+            runner.workflow('lifecycle_probe', nodes)
+        failure = runner.state['stages']['lifecycle_probe']['failure']
+        self.assertEqual(failure['error_code'], 'A2A_INVALID')
+        self.assertEqual(failure['message'], 'workflow input rejected')
+        self.assertEqual(failure['execution_id'], 'execution-1')
+        self.assertNotIn('failure_fields', failure)
 
     def test_crash_after_delete_recovers_from_verified_archive(self):
         from workflow_lifecycle import retire

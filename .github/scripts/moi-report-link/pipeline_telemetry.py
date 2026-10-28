@@ -54,7 +54,14 @@ def timed(label):
     def decorate(function):
         @functools.wraps(function)
         def wrapped(*args, **kwargs):
-            with span(label):
+            fields = {}
+            if args:
+                telemetry = getattr(args[0], 'telemetry_fields', None)
+                if callable(telemetry):
+                    fields.update(telemetry())
+            if label == 'component_workflow' and len(args) > 1:
+                fields['workflow_label'] = str(args[1])
+            with span(label, **fields):
                 return function(*args, **kwargs)
         return wrapped
     return decorate

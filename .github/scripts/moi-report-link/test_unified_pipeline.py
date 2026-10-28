@@ -1,4 +1,4 @@
-import copy,json,tempfile,unittest
+import copy,json,tempfile,threading,unittest
 from pathlib import Path
 from unittest.mock import patch
 import knowledge_gate as kb
@@ -105,7 +105,21 @@ class UnifiedTests(unittest.TestCase):
    return {'accepted':True}
   with self.assertRaisesRegex(ValueError,'component_scan_incomplete'):
    scan_components(types.SimpleNamespace(scan=scan),{r:{} for r in ('matrixone','taas','matrixflow')},lambda r,e:failures.append((r,str(e))))
-  self.assertEqual(calls,['matrixone','taas','matrixflow']);self.assertEqual(failures,[('matrixone','knowledge_ingestion_failed_requires_backend_repair')])
+  self.assertCountEqual(calls,['matrixone','taas','matrixflow']);self.assertEqual(failures,[('matrixone','knowledge_ingestion_failed_requires_backend_repair')])
+ def test_component_scans_overlap_after_archives_and_use_isolated_runner_facades(self):
+  from daily_pipeline import scan_components
+  import types
+  barrier=threading.Barrier(3,timeout=3);instances=[]
+  class Runner:
+   def __init__(self,api,objects,journal):
+    self.api,self.objects,self.journal=api,objects,journal
+   def scan(self,repo,proof):
+    instances.append((repo.name,id(self)));barrier.wait();return {'repository':repo.name}
+  runner=Runner(object(),object(),object())
+  results=scan_components(runner,{r:{} for r in ('matrixone','taas','matrixflow')},lambda r,e: self.fail(str(e)))
+  self.assertCountEqual([name for name,_ in instances],['matrixone','taas','matrixflow'])
+  self.assertEqual(len({identity for _,identity in instances}),3)
+  self.assertEqual(set(results),{'matrixone','taas','matrixflow'})
  def test_missing_runtime_source_view_is_reobserved_without_duplicate_registration(self):
   class API:
    @staticmethod

@@ -39,14 +39,30 @@ def open_journal(objects,key,initial):
 
 def scan_components(runner,archives,on_failure):
     results={};failures=[]
+    def worker(repo):
+        # ComponentRunner owns per-repository recovery state. Give each
+        # parallel scan its own facade while retaining the shared checkpoint
+        # and the unchanged scanner implementation.
+        if hasattr(runner, 'context') and all(hasattr(runner, name) for name in ('api', 'objects', 'journal')):
+            target=type(runner)(runner.api,runner.objects,runner.journal,context=runner.context)
+        elif all(hasattr(runner, name) for name in ('api', 'objects', 'journal')):
+            target=type(runner)(runner.api,runner.objects,runner.journal)
+        else:
+            target=runner
+        if target is not runner:
+            target.repository=repo.name
+        return target.scan(repo,archives[repo.name])
+
     with futures.ThreadPoolExecutor(max_workers=3) as pool:
-        pending={pool.submit(runner.scan,repo,archives[repo.name]):repo.name
+        pending={pool.submit(worker,repo):repo.name
                  for repo in preflight.REPOSITORIES}
         for future in futures.as_completed(pending):
             name=pending[future]
             try:results[name]=future.result()
             except Exception as exc:
-                on_failure(name,exc);failures.append(name)
+                failures.append((name,exc))
+    for name,exc in failures:
+        on_failure(name,exc)
     # Each repository keeps its own real accepted checkpoint. One failed KB
     # gate must not prevent the other repositories from doing useful work.
     if failures:raise ValueError('component_scan_incomplete')
@@ -126,6 +142,8 @@ def main():
                         def component_failure(repo,exc):
                             failure=dict(stage='components',repository=repo,**error_fields(exc),at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
                             if re.fullmatch('[a-z][a-z0-9_]{0,100}',str(exc)):failure['safe_code']=str(exc)
+                            if hasattr(exc,'workflow_label'):failure['workflow_label']=exc.workflow_label
+                            if hasattr(exc,'diagnostic'):failure['workflow']=exc.diagnostic
                             root.value.setdefault('failures',[]).append(failure);root.save()
                         try:
                             with span('three_repository_component_scan'):
@@ -133,6 +151,8 @@ def main():
                         except Exception as exc:
                             failure=dict(stage='components',**error_fields(exc),at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
                             if re.fullmatch('[a-z][a-z0-9_]{0,100}',str(exc)):failure['safe_code']=str(exc)
+                            if hasattr(exc,'workflow_label'):failure['workflow_label']=exc.workflow_label
+                            if hasattr(exc,'diagnostic'):failure['workflow']=exc.diagnostic
                             root.value.setdefault('failures',[]).append(failure);root.save()
                             raise
                         batch=dict(schema='matrix_daily_acceptance_v1',date=date,workspace=WORKSPACE,knowledge_base_id=80001,results=results,three_repository_reports_accepted=True,single_repository_test=False,daily_cloud_download_verified=True,sent=False,daily_automation_ready=False)
