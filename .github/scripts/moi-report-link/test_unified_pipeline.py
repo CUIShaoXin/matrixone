@@ -327,6 +327,29 @@ class ArchiveReverificationTests(unittest.TestCase):
   objects.verify_object.assert_not_called();objects.verify_object.return_value=False
   with self.assertRaisesRegex(Exception,'verified_archive_missing'):reverify_archives(objects,self.proofs(),'2026-10-28')
 
+class FinalizeContractResumeTests(unittest.TestCase):
+ def test_fresh_finalize_and_completed_resume_use_the_same_reduced_contract(self):
+  from cloud_daily import finalize_contract_nodes,json_bytes,sha256
+  legacy=[{'name':n} for n in ('finalize','osv','details','employee','employee_report','validation')]
+  fresh=finalize_contract_nodes({},'repo_finalize',legacy)
+  self.assertEqual([n['name'] for n in fresh],['finalize','osv','details','validation'])
+  persisted={'repo_finalize':{'status':'completed','input_sha256':sha256(json_bytes(fresh))}}
+  self.assertEqual(finalize_contract_nodes(persisted,'repo_finalize',legacy),fresh)
+ def test_historical_finalize_keeps_its_original_employee_contract(self):
+  from cloud_daily import finalize_contract_nodes,json_bytes,sha256
+  legacy=[{'name':n} for n in ('finalize','employee','employee_report','validation')]
+  persisted={'repo_finalize':{'status':'completed','input_sha256':sha256(json_bytes(legacy))}}
+  self.assertEqual(finalize_contract_nodes(persisted,'repo_finalize',legacy),legacy)
+ def test_unknown_or_unbound_executed_contract_blocks_resume(self):
+  from cloud_daily import finalize_contract_nodes
+  for state in ({'status':'completed','input_sha256':'bad'}, {'status':'running','execution_id':'x'}):
+   with self.assertRaisesRegex(Exception,'workflow_resume_input_changed'):
+    finalize_contract_nodes({'repo_finalize':state},'repo_finalize',[{'name':'employee'}])
+ def test_unsubmitted_planned_stage_selects_the_fresh_contract(self):
+  from cloud_daily import finalize_contract_nodes
+  self.assertEqual(finalize_contract_nodes({'repo_finalize':{'status':'planned'}},'repo_finalize',[{'name':'osv'},{'name':'employee'}]),[{'name':'osv'}])
+
+
 class EmployeeEvidenceSummaryTests(unittest.TestCase):
  def scan(self):
   return dict(commit='f8478038'+'a'*32,facts=dict(report_date_shanghai='2026-10-28',
