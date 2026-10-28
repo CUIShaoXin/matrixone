@@ -143,11 +143,14 @@ def verify_login_free(url, expected):
         raise RuntimeError("login_free_http_" + str(error.code)) from None
 
 import time
+import threading
 import xml.etree.ElementTree as ET
 from pipeline_telemetry import emit, span
 
 TRANSIENT = (TimeoutError, ConnectionError, urllib.error.URLError)
 PART_SIZE = 8 * 1024 * 1024
+ZIP_READ_LIMIT = 256 * 1024 * 1024
+ZIP_READ_LOCK = threading.RLock()
 
 
 def xml_values(raw, name):
@@ -157,6 +160,28 @@ def xml_values(raw, name):
 
 class Objects(SignedObjects):
     def call(self, method, key, raw=None, headers=None, response_limit=32*1024*1024, timeout=None, query=None):
+        # Snapshot keys contain the date and fixed commit. Reuse only in this
+        # process; every consumer still checks its expected size and SHA256.
+        if method == 'GET' and key.startswith('snapshots/') and key.endswith('.zip') and raw is None and not headers and not query:
+            with ZIP_READ_LOCK:
+                cache = getattr(self, '_zip_reads', None)
+                if cache is None:
+                    self._zip_reads = cache = {}
+                if key in cache:
+                    result = cache[key]
+                    if len(result[2]) > response_limit:
+                        raise ValueError('report_object_exceeds_limit')
+                    emit('archive_read_cache_hit', bytes=len(result[2]))
+                    return result[0], dict(result[1]), result[2]
+                result = self._call_uncached(method, key, raw, headers, response_limit, timeout, query)
+                if result[0] == 200 and len(result[2]) <= ZIP_READ_LIMIT:
+                    while cache and sum(len(v[2]) for v in cache.values()) + len(result[2]) > ZIP_READ_LIMIT:
+                        cache.pop(next(iter(cache)))
+                    cache[key] = result[0], dict(result[1]), result[2]
+                return result
+        return self._call_uncached(method, key, raw, headers, response_limit, timeout, query)
+
+    def _call_uncached(self, method, key, raw=None, headers=None, response_limit=32*1024*1024, timeout=None, query=None):
         for attempt in range(3):
             try:
                 with span('minio_zip' if key.endswith('.zip') else 'minio_artifact', method=method, request_bytes=len(raw or b''), attempt=attempt+1):
