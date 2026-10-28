@@ -5,9 +5,157 @@ import re
 import threading
 import time
 import urllib.error
+import urllib.parse
+import uuid
 from pipeline_telemetry import emit,span
 
 KB_LOCK=threading.RLock()
+# Binding confirmed by pipeline-repair-20261028's file-executions/retry proof.
+# Do not retry another workflow merely because it also processed the same file.
+KB_WORKFLOW_ID='kb-rag-workflow-27cf84dc519c77e1fb2659e8'
+WORKFLOWS='/workflow/v2/workflow-apps'
+EXECUTION_ACTIVE={'preparing','waiting','pending','triggered','running','submitted',
+                  'scheduled','queued','paused','cancelling','canceling'}
+EXECUTION_SUCCESS={'completed','success','succeeded'}
+
+
+def transient(exc):
+    statuses=('moi_http_429','moi_http_500','moi_http_502','moi_http_503','moi_http_504')
+    if isinstance(exc,urllib.error.HTTPError):return exc.code in (429,500,502,503,504)
+    return isinstance(exc,(TimeoutError,urllib.error.URLError,ConnectionError)) or str(exc) in statuses
+
+
+def fact_timeout(deadline):
+    if deadline is None:return 90
+    remaining=deadline-time.time()
+    if remaining<=0:raise ValueError('knowledge_ingestion_deadline')
+    return min(90,remaining)
+
+
+def execution_facts(job,fid,deadline=None):
+    # Verified in the archived workflow.go ListFileExecutions handler: file_id
+    # is the query parameter; summaries intentionally do not expose dispatch IDs.
+    data=job.api.data(job.api.request(WORKFLOWS+'/file-executions?'+urllib.parse.urlencode({'file_id':fid}),timeout=fact_timeout(deadline)))
+    facts=data.get('executions',[])
+    if (not isinstance(facts,list) or any(not isinstance(v,dict) for v in facts)
+            or data.get('total',len(facts))!=len(facts)):
+        raise ValueError('knowledge_file_execution_facts_invalid')
+    for fact in facts:
+        if fact.get('file_id',fid)!=fid:
+            raise ValueError('knowledge_file_execution_identity_mismatch')
+    return [v for v in facts if v.get('workflow_id')==KB_WORKFLOW_ID]
+
+
+def execution_dispatch(job,fid,eid,deadline=None):
+    # workflow.go workflowPagination uses offset/limit (not page/page_size).
+    # execution.go ExecutionListItem exposes both file_id and dispatch_job_id;
+    # GetExecution deliberately strips dispatch_job_id and cannot supply it.
+    for offset in range(0,10000,100):
+        data=job.api.data(job.api.request(WORKFLOWS+'/'+KB_WORKFLOW_ID+'/executions?'+
+                                        urllib.parse.urlencode(dict(offset=offset,limit=100)),timeout=fact_timeout(deadline)))
+        values=data.get('executions',[])
+        if not isinstance(values,list) or any(not isinstance(v,dict) for v in values):
+            raise ValueError('knowledge_execution_list_invalid')
+        selected=[v for v in values if v.get('execution_id')==eid]
+        if selected:
+            if len(selected)!=1:raise ValueError('knowledge_execution_identity_mismatch')
+            value=selected[0]
+            if (value.get('workflow_id')!=KB_WORKFLOW_ID or value.get('file_id')!=fid
+                    or value.get('execution_mode')!='volume_trigger'
+                    or not value.get('dispatch_job_id')):
+                raise ValueError('knowledge_execution_identity_mismatch')
+            return value
+        if offset+len(values)>=data.get('total',offset+len(values)):break
+        if not values:raise ValueError('knowledge_execution_list_incomplete')
+    raise ValueError('knowledge_execution_dispatch_unavailable')
+
+
+def lineage_request_id(job,fid,eid):
+    return str(uuid.uuid5(uuid.NAMESPACE_URL,job.state['prefix']+'/80001/'+fid+'/'+eid+'/lineage-1'))
+
+
+def recover_lineage(job,fid,state,allow_retry=True):
+    deadline=state['ingestion_deadline_epoch'] if allow_retry else None
+    facts=execution_facts(job,fid,deadline)
+    recovery=state.get('lineage_recovery')
+    if recovery:
+        original=recovery['original_execution']
+        if (recovery.get('attempts')!=1 or original.get('workflow_id')!=KB_WORKFLOW_ID
+                or recovery.get('file_id')!=fid
+                or recovery.get('request_id')!=lineage_request_id(job,fid,original['execution_id'])):
+            raise ValueError('knowledge_lineage_checkpoint_identity_mismatch')
+        if recovery['status']=='blocked':
+            if recovery.get('failure_reason')=='retry_execution_failed':raise ValueError('knowledge_lineage_retry_exhausted')
+            raise ValueError('knowledge_lineage_retry_blocked')
+        if recovery['status'] not in ('accepted','submission_unknown'):
+            raise ValueError('knowledge_lineage_checkpoint_identity_mismatch')
+        # A reservation is consumed even if a process died before POST. After
+        # any uncertain submission only read original file facts; never replay
+        # POST or append/select/reconcile to conceal the missing acknowledgement.
+        newer=[v for v in facts if v.get('execution_id') not in recovery['prior_execution_ids']]
+        if len(newer)>1:raise ValueError('knowledge_lineage_recovery_ambiguous')
+        if newer:
+            value=newer[0];dispatch=execution_dispatch(job,fid,value['execution_id'],deadline)
+            if (dispatch.get('status')!=value.get('status')
+                    or recovery.get('dispatch_job_id',dispatch['dispatch_job_id'])!=dispatch['dispatch_job_id']):
+                raise ValueError('knowledge_lineage_recovery_identity_mismatch')
+            recovery.update(new_execution=dict(value),new_dispatch_job_id=dispatch['dispatch_job_id'],
+                            correlation='acknowledged_dispatch' if recovery.get('dispatch_job_id') else 'same_file_observation')
+            if value.get('status') not in EXECUTION_ACTIVE|EXECUTION_SUCCESS:
+                recovery.update(status='blocked',failure_reason='retry_execution_failed');job.journal.save()
+                raise ValueError('knowledge_lineage_retry_exhausted')
+            job.journal.save()
+        return True
+    if not allow_retry or not facts:return False
+    # FileExecutions returns newest first. Any active same-file execution is
+    # sufficient to prohibit a retry, including while sources still says failed.
+    if any(v.get('status') in EXECUTION_ACTIVE for v in facts):return True
+    latest=facts[0]
+    if latest.get('status') in EXECUTION_SUCCESS:return True
+    error=re.fullmatch(r'\[moi:data\.lineage\.register\] register lineage for source_file_id '+
+                       re.escape(fid)+r': \[1\] Internal Server Error \(request_id: ([0-9a-f-]{36})\)',latest.get('error') or '')
+    if latest.get('status')!='failed' or latest.get('execution_mode')!='volume_trigger' or not error:
+        raise ValueError('knowledge_ingestion_failed_requires_backend_repair')
+    original=execution_dispatch(job,fid,latest['execution_id'],deadline)
+    if original.get('status')!='failed' or original.get('error')!=latest['error']:
+        raise ValueError('knowledge_execution_identity_mismatch')
+    if time.time()>=state['ingestion_deadline_epoch']:raise ValueError('knowledge_ingestion_deadline')
+    rid=lineage_request_id(job,fid,latest['execution_id'])
+    request=dict(source_dispatch_job_id=original['dispatch_job_id'],execution_ids=[latest['execution_id']],
+                 all_failed=False,request_id=rid)
+    recovery=dict(attempts=1,file_id=fid,request_id=rid,request=request,
+                  original_execution=dict(latest),original_dispatch_job_id=original['dispatch_job_id'],
+                  failure_request_id=error[1],prior_execution_ids=[v['execution_id'] for v in facts],
+                  status='submission_unknown',reserved_epoch=time.time())
+    state['lineage_recovery']=recovery
+    try:
+        job.journal.save()
+    except Exception:
+        # PUT may have committed despite a failed readback. Keep the reservation
+        # in memory too; sacrificing this attempt is safer than a second POST.
+        raise ValueError('knowledge_lineage_checkpoint_unconfirmed') from None
+    if time.time()>=state['ingestion_deadline_epoch']:raise ValueError('knowledge_ingestion_deadline')
+    timeout=fact_timeout(deadline)
+    try:
+        answer=job.api.data(job.api.request(WORKFLOWS+'/'+KB_WORKFLOW_ID+'/executions/batch-retry',
+                                            request,method='POST',timeout=timeout))
+    except Exception as exc:
+        if transient(exc):
+            emit('knowledge_lineage_submission_unknown',same_sources=True,attempts=1)
+            return True
+        recovery.update(status='blocked',error_type=type(exc).__name__);job.journal.save()
+        raise ValueError('knowledge_lineage_retry_rejected') from None
+    if (answer.get('source_dispatch_job_id')!=original['dispatch_job_id']
+            or type(answer.get('accepted_count')) is not int or answer['accepted_count']!=1
+            or not answer.get('dispatch_job_id') or answer['dispatch_job_id']==original['dispatch_job_id']
+            or type(answer.get('replayed')) is not bool
+            or answer.get('status') not in ('waiting','pending','running','completed')):
+        recovery['status']='blocked';job.journal.save()
+        raise ValueError('knowledge_lineage_retry_response_invalid')
+    recovery.update(status='accepted',response=answer,dispatch_job_id=answer['dispatch_job_id'])
+    job.journal.save()
+    emit('knowledge_lineage_retry_accepted',same_sources=True,attempts=1)
+    return True
 
 
 def rows(api):
@@ -27,17 +175,42 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
     with KB_LOCK,span('knowledge_ingestion'):
         saved=job.state.setdefault('knowledge_registration',{})
         start=time.monotonic();seen_rounds={};last_reconcile=start-60
+        pending_fids={a['file_id'] for a in artifacts}
+        # Same batch/FID retains its original budget across process resumes.
+        # Always inspect succeeded sources before enforcing a historical deadline.
+        new_budget=False
+        for artifact in artifacts:
+            state=saved.setdefault(artifact['file_id'],{})
+            if 'ingestion_deadline_epoch' not in state:
+                first=min([time.time()]+[state[k] for k in ('missing_runtime_first_observed_epoch','active_dispatch_first_observed_epoch') if k in state])
+                state['ingestion_deadline_epoch']=first+deadline_seconds;new_budget=True
+        if new_budget:job.journal.save()
         while time.monotonic()-start<deadline_seconds:
             operation='source_inventory'
             try:
                 inventory=rows(job.api);ready=True
+                pending_fids={a['file_id'] for a in artifacts
+                              if not any(v.get('ingest_status')=='succeeded' for v in matching(inventory,a['file_id']))}
                 for artifact in artifacts:
                     fid=artifact['file_id'];found=matching(inventory,fid)
                     # Detect and retain duplicates; never add another copy to mask failed ingestion.
                     if len(found)>1:emit('knowledge_duplicate_source',count=len(found))
                     if any(v.get('ingest_status')=='succeeded' for v in found):
+                        state=saved[fid]
+                        if state.get('lineage_recovery') and not state['lineage_recovery'].get('source_succeeded'):
+                            # Success is an actual source fact, even if recovery
+                            # metadata is still unavailable or its clock expired.
+                            try:recover_lineage(job,fid,state,allow_retry=False)
+                            except Exception:emit('knowledge_lineage_success_metadata_unavailable',same_sources=True)
+                            state['lineage_recovery']['source_succeeded']=True
                         saved.setdefault(fid,{})['succeeded']=True;continue
                     ready=False;state=saved.setdefault(fid,{})
+                    if time.time()>=state['ingestion_deadline_epoch']:
+                        raise ValueError('knowledge_ingestion_deadline')
+                    if state.get('lineage_recovery') or (not found and state.get('observed')):
+                        operation='file_execution_facts'
+                        recover_lineage(job,fid,state)
+                        continue
                     if found:
                         state['observed']=True
                         if all(v.get('ingest_status')=='failed' for v in found):
@@ -50,6 +223,10 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
                             jobs=job.api.data(job.api.request('/semantic-models/80001/source-jobs',timeout=90))
                             active=[v for v in jobs.get('items',[]) if fid in (v.get('source_file_id'),v.get('kb_file_id')) and v.get('job_status') in ('pending','queued','running')]
                             if not active:
+                                operation='file_execution_facts'
+                                if any(v.get('source_file_id')!=fid or v.get('kb_file_id',fid)!=fid for v in found):
+                                    raise ValueError('knowledge_source_identity_mismatch')
+                                if recover_lineage(job,fid,state):continue
                                 # The live source view can briefly project a missing execution
                                 # before its real file-runtime facts are visible. Re-observe
                                 # these exact source IDs only; never reappend or accept failure.
@@ -67,7 +244,7 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
                     else:
                         seen_rounds[fid]=seen_rounds.get(fid,0)+1
                         # Native raw-volume save may enqueue registration. Let it become visible first.
-                        if seen_rounds[fid]>=3 and not state.get('append_attempted'):
+                        if seen_rounds[fid]>=3 and not state.get('append_attempted') and not state.get('observed'):
                             state['append_attempted']=True
                             try:
                                 job.journal.save()
@@ -105,7 +282,7 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
                                 raise ValueError('knowledge_registration_preview_identity_invalid')
                 job.journal.save()
                 if ready:return
-                if time.monotonic()-last_reconcile>=60:
+                if not any(v.get('lineage_recovery') for v in saved.values()) and time.monotonic()-last_reconcile>=60:
                     operation='source_jobs'
                     jobs=job.api.data(job.api.request('/semantic-models/80001/source-jobs',timeout=90))
                     # A conflict is an uncertain dispatch; cool down before observing again.
@@ -120,11 +297,12 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
                     job.state.setdefault('knowledge_conflicts',[]).append(dict(operation=operation,http_status=409,at_utc=dt.datetime.now(dt.timezone.utc).isoformat()))
                     job.journal.save()
                     emit('knowledge_dispatch_conflict',operation=operation,http_status=409,same_sources=True)
-                transient=conflict or isinstance(exc,(TimeoutError,urllib.error.URLError,ConnectionError)) or str(exc) in ('moi_http_429','moi_http_500','moi_http_502','moi_http_503','moi_http_504')
-                if not transient:raise
+                if not (conflict or transient(exc)):raise
                 # Re-observe the same source/jobs after an uncertain append or reconcile.
                 # Persisted append_attempted prevents replaying a source registration.
                 emit('knowledge_read_recovery',same_sources=True,error_type=type(exc).__name__)
+            if any(time.time()>=saved[fid]['ingestion_deadline_epoch'] for fid in pending_fids):
+                raise ValueError('knowledge_ingestion_deadline')
             time.sleep(poll_seconds)
         raise ValueError('knowledge_ingestion_deadline')
 

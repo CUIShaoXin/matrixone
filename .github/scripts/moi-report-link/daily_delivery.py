@@ -3,14 +3,18 @@
 An uncertain send is never submitted again. Recovery only reads the original
 runtime task. The claim deliberately favors a missed delivery over a duplicate.
 """
+import copy
 import datetime as dt
 import hashlib
+import http.client
 import json
+import math
 import os
 from pathlib import Path
 import re
 import time
 import uuid
+import urllib.error
 
 from cloud_daily import DailyAPI, WORKSPACE, json_bytes, verify_rag
 from cloud_publish import verify_batch
@@ -22,6 +26,7 @@ LOCAL = dt.timezone(dt.timedelta(hours=8))
 REPOS = ('matrixone', 'taas', 'matrixflow')
 NAMES = dict(zip(REPOS, ('MatrixOne', 'TaaS', 'MatrixFlow')))
 CHANNEL = '09567f53-8dad-41d8-842e-2e269a6c86e2'
+_DAILY_API_TYPE = DailyAPI
 sha = lambda raw: hashlib.sha256(raw).hexdigest()
 
 
@@ -43,7 +48,8 @@ def create_once(objects, key, value):
     """One conditional PUT. Do not route through retrying publish/PUT helpers."""
     raw = json_bytes(value)
     try:
-        SignedObjects.call(objects, 'PUT', key, raw, {
+        put = objects.call if isinstance(objects, RecoveryObjects) else lambda *args: SignedObjects.call(objects, *args)
+        put('PUT', key, raw, {
             'if-none-match': '*', 'content-type': 'application/json',
             'x-amz-meta-sha256': sha(raw),
         })
@@ -185,7 +191,9 @@ def send_events(task, kind):
     def walk(v):
         if isinstance(v, dict):
             if v.get('type') == kind and 'wecom_robot_message' in v.get('toolId', ''):
-                found[v['callId']] = v
+                cid = v['callId']
+                require(cid not in found or found[cid] == v, 'delivery_invocation_count_invalid')
+                found[cid] = v
             for c in v.values(): walk(c)
         elif isinstance(v, list):
             for c in v: walk(c)
@@ -218,7 +226,7 @@ def verify_send(task, claim):
         stamp = re.sub(r'(\.\d{6})\d+', r'\1', result['created_at']).replace('Z', '+00:00')
         at = dt.datetime.fromisoformat(stamp)
         require(at.tzinfo is not None and at.astimezone(LOCAL).date().isoformat() == claim['date'], 'delivery_ack_wrong_date')
-    return dict(schema='matrix_daily_delivery_v1', date=claim['date'], scope='three-repositories',
+    final = dict(schema='matrix_daily_delivery_v1', date=claim['date'], scope='three-repositories',
                 sent=True, status='sent', channel_instance_id=CHANNEL, task_id=task['id'],
                 attempt_id=claim['attempt_id'], tool_call_id=cid, tool_output=result,
                 tool_receipt_protocol='native_channel_ack_v1' if native else 'work_item_completed_v1',
@@ -226,82 +234,365 @@ def verify_send(task, claim):
                 content=claim['content'], content_sha256=sha(claim['content'].encode()),
                 publication_file_id=claim['publication_file_id'], prefix=claim['prefix'],
                 verified_at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
+    if 'report_identity' in claim:
+        final['report_identity'] = claim['report_identity']
+    return final
 
 
-def native_receipt(api, objects, base, final):
+# The same budget covers polling and receipt reconciliation. A zero poll interval
+# is useful for fault drills; the attempt cap also prevents a hot retry loop.
+MAX_RECOVERY_ATTEMPTS = 128
+REPORT_IDENTITY_FIELDS = ('schema', 'date', 'scope', 'prefix', 'run_id', 'commits',
+                          'publication_file_id', 'publication_sha256')
+
+
+def transient(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in (408, 429, 500, 502, 503, 504)
+    return (isinstance(exc, (TimeoutError, ConnectionError, urllib.error.URLError,
+                             http.client.IncompleteRead))
+            or str(exc) in tuple(prefix + str(c) for prefix in ('minio_http_', 'moi_http_')
+                                 for c in (408, 429, 500, 502, 503, 504)))
+
+
+def remaining(deadline):
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise ValueError('delivery_uncertain_read_original_task_only')
+    return left
+
+
+def pause(deadline, poll_seconds):
+    time.sleep(min(max(poll_seconds, 0), remaining(deadline)))
+
+
+class DeadlineOpener:
+    def __init__(self, opener, deadline):
+        self.opener, self.deadline = opener, deadline
+
+    def open(self, request, timeout=60):
+        return self.opener.open(request, timeout=min(timeout, remaining(self.deadline)))
+
+
+class RecoveryAPI:
+    """Keep the client's per-request socket timeout within the shared budget."""
+    def __init__(self, api, deadline):
+        if isinstance(api, _DAILY_API_TYPE):
+            api = copy.copy(api)
+            api.opener = DeadlineOpener(api.opener, deadline)
+            # Recovery owns retries; avoid nested client loops and sleeps.
+            api.file = super(_DAILY_API_TYPE, api).file
+            api.request = super(_DAILY_API_TYPE, api).request
+        self.api, self.deadline = api, deadline
+
+    def __getattr__(self, name):
+        method = getattr(self.api, name)
+        def call(*args, **kwargs):
+            remaining(self.deadline)
+            result = method(*args, **kwargs)
+            remaining(self.deadline)
+            return result
+        return call
+
+
+class RecoveryObjects:
+    """One storage operation per attempt; bypass Objects' nested retry budgets."""
+    def __init__(self, objects, deadline):
+        self.objects, self.deadline = objects, deadline
+
+    def call(self, method, key, raw=None, headers=None):
+        timeout = min(45, remaining(self.deadline))
+        if isinstance(self.objects, SignedObjects):
+            return SignedObjects.call(self.objects, method, key, raw, headers, timeout=timeout)
+        return self.objects.call(method, key, raw, headers, timeout=timeout)
+
+    def publish(self, key, raw, content_type):
+        # Diagnostic only: no mandatory readback and no nested publish retries.
+        self.call('PUT', key, raw, {'content-type': content_type})
+
+
+def report_identity(pointer):
+    return {k: pointer[k] for k in REPORT_IDENTITY_FIELDS if k in pointer}
+
+
+def validate_claim(claim, date, pointer=None):
+    require(claim.get('date') == date and claim.get('channel_instance_id') == CHANNEL
+            and all(isinstance(claim.get(k), str) and claim[k] for k in
+                    ('task_id', 'attempt_id', 'content', 'publication_file_id', 'prefix')),
+            'delivery_claim_conflict')
+    if 'content_sha256' in claim:
+        require(claim['content_sha256'] == sha(claim['content'].encode()), 'delivery_claim_conflict')
+    identity = claim.get('report_identity')
+    if identity is not None:
+        require(identity.get('schema') == 'matrix_daily_ready_v1'
+                and identity.get('date') == date and identity.get('scope') == 'three-repositories'
+                and all(identity.get(k) == claim[k] for k in ('prefix', 'publication_file_id')),
+                'delivery_claim_conflict')
+    if pointer is not None:
+        require(pointer.get('schema') == 'matrix_daily_ready_v1' and pointer.get('date') == date
+                and pointer.get('scope') == 'three-repositories', 'delivery_ready_wrong_identity')
+        require(all(claim[k] == pointer.get(k) for k in ('prefix', 'publication_file_id'))
+                and (identity is None or identity == report_identity(pointer)), 'delivery_claim_conflict')
+
+
+def validate_completion(stored, final):
+    # Different observers may verify the same immutable ack at different times.
+    # Every other field, including report identity and raw tool output, must agree.
+    require(isinstance(stored, dict)
+            and {k: v for k, v in stored.items() if k != 'verified_at_utc'}
+            == {k: v for k, v in final.items() if k != 'verified_at_utc'},
+            'delivery_completion_conflict')
+
+
+def diagnostic(objects, key, value):
+    try:
+        objects.publish(key, json_bytes(value), 'application/json')
+    except Exception:
+        # Diagnostics are not delivery evidence and cannot veto real task/ack reads.
+        pass
+
+
+def find_native_receipt(api, final):
+    """Reconcile a lost upload response by catalog/file reads, never re-upload."""
+    name = 'matrix-security-delivery-' + final['date'].replace('-', '') + '.json'
+    found = None
+    for page in range(1, 101):
+        result = api.data(api.request('/catalog/file/list', {
+            'filters': [{'name': 'volume_id', 'values': ['130001']}],
+            'page': page, 'page_size': 100}))
+        rows = result.get('list')
+        require(isinstance(rows, list), 'delivery_history_unreadable')
+        for row in rows:
+            if (row.get('origin_file_name') or row.get('name')) == name:
+                fid = row.get('file_id', row.get('id'))
+                raw = api.file(fid)
+                require(raw == json_bytes(final), 'delivery_native_receipt_mismatch')
+                found = dict(file_id=fid, bytes=len(raw), sha256=sha(raw), readback_verified=True)
+        if len(rows) < 100:
+            return found
+    raise ValueError('delivery_history_pagination_incomplete')
+
+
+def native_receipt(api, objects, base, final, recovery=None):
     saved = read_json(objects, base + '/native-delivery-receipt.json', missing=True)
-    if saved:
+    if saved is not None:
         require(checked_file(api, saved) == json_bytes(final), 'delivery_native_receipt_mismatch')
         return saved
-    artifact = api.upload('matrix-security-delivery-' + final['date'].replace('-', '') + '.json', json_bytes(final))
-    objects.publish(base + '/native-delivery-receipt.json', json_bytes(artifact), 'application/json')
-    return artifact
+    recovery = {} if recovery is None else recovery
+    artifact = recovery.get('artifact') or find_native_receipt(api, final)
+    if artifact is None:
+        # Persist upload permission separately: after an unknown upload or a
+        # crash, subsequent observers may only discover the original native file.
+        intent = recovery.setdefault('upload_intent', dict(
+            task_id=final['task_id'], receipt_sha256=sha(json_bytes(final)), owner=str(uuid.uuid4())))
+        _, saved_intent = create_once(objects, base + '/native-receipt-upload-claim.json', intent)
+        require(all(saved_intent.get(k) == intent[k] for k in ('task_id', 'receipt_sha256')),
+                'delivery_native_receipt_conflict')
+        if saved_intent != intent or recovery.get('upload_started'):
+            raise TimeoutError('delivery_native_upload_uncertain_read_only')
+        # A lost intent confirmation is recoverable by this observer while it
+        # still knows it has not attempted upload. After restart, read only.
+        recovery['upload_started'] = True
+        artifact = api.upload('matrix-security-delivery-' + final['date'].replace('-', '') + '.json', json_bytes(final))
+    recovery['artifact'] = artifact
+    _, saved = create_once(objects, base + '/native-delivery-receipt.json', artifact)
+    require(checked_file(api, saved) == json_bytes(final), 'delivery_native_receipt_mismatch')
+    return saved
 
 
-def deliver(api, objects, date, preview=False, poll_seconds=15, deadline_seconds=900):
+def recover_claim(api, objects, date, claim, complete, deadline, poll_seconds, pointer=None):
+    """Read only the original task; retry receipt persistence, never submission."""
+    validate_claim(claim, date, pointer)
+    api = RecoveryAPI(api, deadline)
+    objects = RecoveryObjects(objects, deadline)
+    base = 'daily/' + date.replace('-', '')
+    final, stored = None, complete
+    snapshot_attempted = complete is not None
+    native_recovery = {}
+    for _ in range(MAX_RECOVERY_ATTEMPTS):
+        remaining(deadline)
+        try:
+            task = api.rpc('tasks/get', {'id': claim['task_id']}, str(uuid.uuid4()))
+        except Exception as exc:
+            if not transient(exc):
+                raise
+            pause(deadline, poll_seconds)
+            continue
+        state = task.get('status', {}).get('state')
+        require(task.get('id') == claim['task_id'], 'delivery_runtime_identity_changed')
+        if state == 'completed':
+            verified = verify_send(task, claim)
+            if 'report_identity' not in claim and (complete is None or 'report_identity' in complete):
+                try:
+                    ready = pointer if pointer is not None else read_json(objects, base + '/ready.json')
+                except Exception as exc:
+                    if not transient(exc):
+                        raise
+                    pause(deadline, poll_seconds)
+                    continue
+                validate_claim(claim, date, ready)
+                claim = dict(claim, report_identity=report_identity(ready))
+                verified = verify_send(task, claim)
+            if final is None:
+                final = verified  # Freeze receipt bytes across uncertain PUT/readback.
+            else:
+                validate_completion(final, verified)
+            if stored is not None:
+                validate_completion(stored, verified)
+        require(state not in ('failed', 'input-required', 'auth-required', 'rejected', 'canceled', 'cancelled'),
+                'delivery_task_terminal_do_not_resend')
+        require(state in ('completed', 'submitted', 'working', 'running', 'queued', 'pending', 'unknown'),
+                'delivery_task_state_invalid')
+        if not snapshot_attempted:
+            snapshot_attempted = True
+            diagnostic(objects, base + '/delivery-task-private.json', task)
+        if state != 'completed':
+            pause(deadline, poll_seconds)
+            continue
+        try:
+            remaining(deadline)
+            if stored is None:
+                # create_once uses If-None-Match even after a lost PUT/GET. A
+                # winner is accepted only after ALL ack/claim fields agree.
+                _, stored = create_once(objects, base + '/delivery-completed.json', final)
+            validate_completion(stored, final)
+            remaining(deadline)
+            artifact = native_receipt(api, objects, base, stored, native_recovery)
+            remaining(deadline)
+            return dict(status='already_sent' if complete is not None else 'sent_verified',
+                        sent=True, duplicate_prevented=True, successful_send_count=1,
+                        tool_call_id=stored['tool_call_id'], task_id=stored['task_id'],
+                        receipt_file_id=artifact['file_id'])
+        except Exception as exc:
+            if not transient(exc):
+                raise
+            pause(deadline, poll_seconds)
+    raise ValueError('delivery_uncertain_read_original_task_only')
+
+
+def recover_delivery(api, objects, date, poll_seconds=15, deadline_seconds=900):
+    """Receipt-only entry point: no report downloads and no message/send path."""
+    deadline = time.monotonic() + deadline_seconds
+    base = 'daily/' + date.replace('-', '')
+    bounded_objects = RecoveryObjects(objects, deadline)
+    for _ in range(MAX_RECOVERY_ATTEMPTS):
+        remaining(deadline)
+        try:
+            claim = read_json(bounded_objects, base + '/delivery-claim.json')
+            require(claim is not None, 'delivery_existing_claim_required')
+            complete = read_json(bounded_objects, base + '/delivery-completed.json', missing=True)
+        except Exception as exc:
+            if not transient(exc):
+                raise
+            pause(deadline, poll_seconds)
+            continue
+        return recover_claim(api, objects, date, claim, complete, deadline, poll_seconds)
+    raise ValueError('delivery_uncertain_read_original_task_only')
+
+
+def deliver(api, objects, date, preview=False, poll_seconds=15, deadline_seconds=900, not_before=None):
     base = 'daily/' + date.replace('-', '')
     complete = read_json(objects, base + '/delivery-completed.json', missing=True)
-    if complete:
-        task = api.rpc('tasks/get', {'id': complete['task_id']}, str(uuid.uuid4()))
+    if complete is not None and not preview:
+        deadline = time.monotonic() + deadline_seconds
         claim = read_json(objects, base + '/delivery-claim.json')
-        verified = verify_send(task, claim)
-        require(complete['date'] == date and complete['content_sha256'] == verified['content_sha256'] and complete['tool_call_id'] == verified['tool_call_id'], 'delivery_saved_completion_mismatch')
-        artifact = native_receipt(api, objects, base, complete)
-        return dict(status='already_sent', sent=True, duplicate_prevented=True, task_id=complete['task_id'], tool_call_id=complete['tool_call_id'], receipt_file_id=artifact['file_id'])
+        return recover_claim(api, objects, date, claim, complete, deadline, poll_seconds)
     pointer = read_json(objects, base + '/ready.json')
     require(pointer['schema'] == 'matrix_daily_ready_v1' and pointer['date'] == date and pointer['scope'] == 'three-repositories', 'delivery_ready_wrong_identity')
     bundle = check_bundle(api, objects, pointer['prefix'], date)
-    require(bundle['root']['publication_file_id'] == pointer['publication_file_id'] and bundle['publication_sha256'] == pointer['publication_sha256'], 'delivery_pointer_changed')
+    require(bundle['root']['publication_file_id'] == pointer['publication_file_id']
+            and bundle['publication_sha256'] == pointer['publication_sha256']
+            and all(bundle['root'].get(k) == pointer[k] for k in ('run_id', 'commits') if k in pointer),
+            'delivery_pointer_changed')
     content = compose(bundle, date)
     if preview:
         return dict(status='preview_passed', sent=False, pages_verified=bundle['pages_verified'], message_bytes=len(content.encode()))
     existing = read_json(objects, base + '/delivery-claim.json', missing=True)
-    created = False
-    if existing is None:
-        prior_delivery(api, date)
-        rid = 'matrix-daily-' + date.replace('-', '') + '-' + CHANNEL
-        tid = 'art-' + sha((WORKSPACE + '\0' + rid).encode())[:48]
-        prompt = ('用户已授权每天向既有“扫描漏洞”群发送已验收的安全日报。本次确定性校验已通过。只调用一次moi_wecom_robot_message，'
-                  'channel_instance_id=' + CHANNEL + '，msg_type=markdown。content逐字使用BEGIN_MESSAGE与END_MESSAGE之间正文（不含界标与分隔换行）。'
-                  '不得改写、拆分、换群、发其他消息、调用其他工具、读取凭据或扫描。超时或未知停止，禁止重试发送。'
-                  '控制器已在MinIO持久化全局当日唯一claim，负责回读真实任务并保存回执。完成工具调用后立即结束，不要再保存文件。\nBEGIN_MESSAGE\n'
-                  + content + '\nEND_MESSAGE')
-        request = dict(model='kimi-k3', idempotencyKey=rid, message=dict(kind='message', role='user', messageId=rid, parts=[dict(kind='text', text=prompt)]))
-        claim = dict(schema='matrix_daily_claim_v1', date=date, channel_instance_id=CHANNEL,
-                     attempt_id=rid, task_id=tid, content=content, request=request,
-                     publication_file_id=pointer['publication_file_id'], prefix=pointer['prefix'],
-                     owner=os.environ.get('GITHUB_RUN_ID', 'manual') + '-' + os.environ.get('GITHUB_RUN_ATTEMPT', '1'),
-                     at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
-        created, existing = create_once(objects, base + '/delivery-claim.json', claim)
+    if existing is not None:
+        deadline = time.monotonic() + deadline_seconds
+        return recover_claim(api, objects, date, existing, None, deadline, poll_seconds, pointer)
+    if not_before is not None:
+        wait_until_delivery(date, not_before)
+    prior_delivery(api, date)
+    if not_before is not None:
+        assert_send_time(date, not_before)
+    deadline = time.monotonic() + deadline_seconds
+    rid = 'matrix-daily-' + date.replace('-', '') + '-' + CHANNEL
+    tid = 'art-' + sha((WORKSPACE + '\0' + rid).encode())[:48]
+    prompt = ('用户已授权每天向既有“扫描漏洞”群发送已验收的安全日报。本次确定性校验已通过。只调用一次moi_wecom_robot_message，'
+              'channel_instance_id=' + CHANNEL + '，msg_type=markdown。content逐字使用BEGIN_MESSAGE与END_MESSAGE之间正文（不含界标与分隔换行）。'
+              '不得改写、拆分、换群、发其他消息、调用其他工具、读取凭据或扫描。超时或未知停止，禁止重试发送。'
+              '控制器已在MinIO持久化全局当日唯一claim，负责回读真实任务并保存回执。完成工具调用后立即结束，不要再保存文件。\nBEGIN_MESSAGE\n'
+              + content + '\nEND_MESSAGE')
+    request = dict(model='kimi-k3', idempotencyKey=rid, message=dict(kind='message', role='user', messageId=rid, parts=[dict(kind='text', text=prompt)]))
+    claim = dict(schema='matrix_daily_claim_v1', date=date, channel_instance_id=CHANNEL,
+                 attempt_id=rid, task_id=tid, content=content, request=request,
+                 publication_file_id=pointer['publication_file_id'], prefix=pointer['prefix'],
+                 content_sha256=sha(content.encode()), report_identity=report_identity(pointer),
+                 owner=os.environ.get('GITHUB_RUN_ID', 'manual') + '-' + os.environ.get('GITHUB_RUN_ATTEMPT', '1'),
+                 at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
+    if not_before is not None:
+        assert_send_time(date, not_before)
+    elif os.environ.get('MATRIX_EXPECTED_REPORT_DATE') is not None:
+        assert_expected_date(date)
+    created, existing = create_once(RecoveryObjects(objects, deadline), base + '/delivery-claim.json', claim)
     claim = existing
-    require(claim['date'] == date and claim['channel_instance_id'] == CHANNEL and claim['publication_file_id'] == pointer['publication_file_id'] and claim['content'] == content, 'delivery_claim_conflict')
-    started = time.monotonic()
+    validate_claim(claim, date, pointer)
+    require(claim['content'] == content, 'delivery_claim_conflict')
     if created:
-        # Exactly one caller gets permission to submit. An exception, process
-        # death, or uncertain response permanently removes permission to submit.
+        # Exactly one caller receives permission. Death or an uncertain response
+        # permanently removes permission to submit, including on process restart.
+        remaining(deadline)
+        if not_before is not None:
+            assert_send_time(date, not_before)
+        elif os.environ.get('MATRIX_EXPECTED_REPORT_DATE') is not None:
+            assert_expected_date(date)
         try:
-            task = api.rpc('message/send', claim['request'], claim['attempt_id'])
+            task = RecoveryAPI(api, deadline).rpc('message/send', claim['request'], claim['attempt_id'])
+        except Exception:
+            diagnostic(RecoveryObjects(objects, deadline), base + '/submission-uncertain.json',
+                       dict(task_id=claim['task_id'], resubmit_allowed=False))
+        else:
             require(task['id'] == claim['task_id'], 'delivery_runtime_identity_changed')
-        except Exception:
-            objects.publish(base + '/submission-uncertain.json', json_bytes(dict(task_id=claim['task_id'], resubmit_allowed=False)), 'application/json')
-    while time.monotonic() - started < deadline_seconds:
-        try:
-            task = api.rpc('tasks/get', {'id': claim['task_id']}, str(uuid.uuid4()))
-        except Exception:
-            # Read-only recovery only; no second message/send request.
-            time.sleep(poll_seconds)
-            continue
-        state = task.get('status', {}).get('state')
-        objects.publish(base + '/delivery-task-private.json', json_bytes(task), 'application/json')
-        if state == 'completed':
-            final = verify_send(task, claim)
-            _, stored = create_once(objects, base + '/delivery-completed.json', final)
-            require(stored['task_id'] == final['task_id'] and stored['content_sha256'] == final['content_sha256'], 'delivery_completion_conflict')
-            artifact = native_receipt(api, objects, base, stored)
-            return dict(status='sent_verified', sent=True, successful_send_count=1, tool_call_id=final['tool_call_id'], task_id=final['task_id'], receipt_file_id=artifact['file_id'])
-        require(state not in ('failed', 'input-required', 'rejected', 'canceled', 'cancelled'), 'delivery_task_terminal_do_not_resend')
-        time.sleep(poll_seconds)
-    raise ValueError('delivery_uncertain_read_original_task_only')
+    return recover_claim(api, objects, date, claim, None, deadline, poll_seconds, pointer)
+
+
+def delivery_not_before(date, value=None):
+    floor = dt.datetime.combine(dt.date.fromisoformat(date), dt.time(10), LOCAL)
+    if value is None:
+        return floor
+    try:
+        at = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+        require(at.tzinfo is not None and at.utcoffset() is not None, 'delivery_not_before_invalid')
+        at = at.astimezone(LOCAL)
+        require(at.date().isoformat() == date and at >= floor, 'delivery_not_before_invalid')
+        return at
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError('delivery_not_before_invalid') from None
+
+
+def assert_expected_date(date):
+    today = dt.datetime.now(LOCAL).date().isoformat()
+    require(today == date, 'delivery_current_date_changed')
+    expected = os.environ.get('MATRIX_EXPECTED_REPORT_DATE')
+    require(expected is None or expected == today, 'delivery_expected_date_mismatch')
+
+
+def assert_send_time(date, not_before):
+    assert_expected_date(date)
+    now = dt.datetime.now(LOCAL)
+    require(now.date().isoformat() == date, 'delivery_current_date_changed')
+    require(now.hour >= 10 and now >= not_before, 'delivery_before_ten_blocked')
+
+
+def wait_until_delivery(date, not_before):
+    while True:
+        now = dt.datetime.now(LOCAL)
+        require(now.date().isoformat() == date, 'delivery_current_date_changed')
+        if now >= not_before:
+            assert_send_time(date, not_before)
+            return
+        time.sleep(min(60, (not_before - now).total_seconds()))
 
 
 def main():
@@ -310,9 +601,23 @@ def main():
     start = time.monotonic()
     status = dict(date=date, sent=False, runtime_head=os.environ.get('MATRIX_RUNTIME_SHA'))
     try:
-        require(dt.datetime.now(LOCAL).hour >= 10 or os.environ.get('MATRIX_DELIVERY_PREVIEW') == 'true', 'delivery_before_ten_blocked')
+        assert_expected_date(date)
+        preview = os.environ.get('MATRIX_DELIVERY_PREVIEW') == 'true'
+        scheduled = os.environ.get('MATRIX_DELIVERY_NOT_BEFORE')
+        not_before = delivery_not_before(date, scheduled)
+        try:
+            deadline_seconds = float(os.environ.get('MATRIX_DELIVERY_DEADLINE_SECONDS', '900'))
+            require(math.isfinite(deadline_seconds) and deadline_seconds > 0, 'delivery_deadline_invalid')
+        except (ValueError, TypeError):
+            raise ValueError('delivery_deadline_invalid') from None
         api = DailyAPI(os.environ['MOI_API_KEY']); objects = Objects.from_workspace(api)
-        status.update(deliver(api, objects, date, preview=os.environ.get('MATRIX_DELIVERY_PREVIEW') == 'true'))
+        if not preview and (os.environ.get('MATRIX_DELIVERY_RECOVER_ONLY') == 'true'
+                or read_json(objects, 'daily/' + date.replace('-', '') + '/delivery-claim.json', missing=True) is not None):
+            status.update(recover_delivery(api, objects, date, deadline_seconds=deadline_seconds))
+        else:
+            require(preview or scheduled is not None or dt.datetime.now(LOCAL).hour >= 10, 'delivery_before_ten_blocked')
+            status.update(deliver(api, objects, date, preview=preview,
+                                  deadline_seconds=deadline_seconds, not_before=not_before))
     except Exception as exc:
         status.update(status='failed', **error_fields(exc))
         if re.fullmatch('[a-z][a-z0-9_]{0,100}', str(exc)): status['safe_code'] = str(exc)

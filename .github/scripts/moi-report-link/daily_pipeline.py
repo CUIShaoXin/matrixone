@@ -67,6 +67,7 @@ def main():
     status=dict(schema='matrix_unified_no_send_status_v1',date=date,run_id=run_id,mode=mode,sent=False,daily_automation_ready=False,execution_head=os.environ.get('MATRIX_RUNTIME_SHA',os.environ.get('GITHUB_SHA')))
     out=Path('out/pipeline');out.mkdir(parents=True,exist_ok=True)
     try:
+        require(os.environ.get('MATRIX_EXPECTED_REPORT_DATE',date)==date,'pipeline_expected_date_mismatch')
         require(re.fullmatch('[A-Za-z0-9_-]{1,80}',run_id) and mode in ('archives','reviews','full','maintenance'),'invalid_pipeline_input')
         api=DailyAPI(os.environ['MOI_API_KEY']);objects=preflight.Objects.from_workspace(api)
         if mode == 'maintenance':
@@ -155,6 +156,7 @@ def main():
                     root.value.update(published=True,publication_file_id=receipt['receipt_artifact']['file_id'],commits=commits);root.save()
                     status.update(status='passed',same_batch_end_to_end_passed=True,publication_file_id=root.value['publication_file_id'],component_focus_count=ncomp,code_findings=ncode,api_port_findings=receipt['added_findings'],kb_verified=True,minio_login_free_verified=True)
         if mode=='full' and status.get('same_batch_end_to_end_passed'):
+            require(dt.datetime.now(preflight.LOCAL).date().isoformat()==date,'pipeline_date_changed')
             from daily_delivery import export_ready
             export_ready(api,objects,prefix,date)
             status['daily_delivery_readiness_verified']=True

@@ -152,6 +152,10 @@ import xml.etree.ElementTree as ET
 from pipeline_telemetry import emit, span
 
 TRANSIENT = (TimeoutError, ConnectionError, urllib.error.URLError, http.client.IncompleteRead)
+RETRYABLE_HTTP_ERRORS = ('minio_http_429', 'minio_http_500', 'minio_http_502', 'minio_http_503', 'minio_http_504')
+PUBLISH_MAX_PUTS = 3
+PUBLISH_MAX_READS = 6
+PUBLISH_BUDGET_SECONDS = 240
 PART_SIZE = 8 * 1024 * 1024
 ZIP_READ_LIMIT = 256 * 1024 * 1024
 ZIP_READ_LOCK = threading.RLock()
@@ -164,7 +168,11 @@ def xml_values(raw, name):
 
 
 class Objects(SignedObjects):
-    def call(self, method, key, raw=None, headers=None, response_limit=32*1024*1024, timeout=None, query=None):
+    def call(self, method, key, raw=None, headers=None, response_limit=32*1024*1024, timeout=None, query=None, *, retry=True):
+        if not retry:
+            # Publication owns one shared budget and must observe uncertain PUTs
+            # before writing again. Do not nest retries or reuse cached readbacks.
+            return self._call_uncached(method, key, raw, headers, response_limit, timeout, query, retry=False)
         # Snapshot keys contain the date and fixed commit. Reuse only in this
         # process; every consumer still checks its expected size and SHA256.
         if method == 'GET' and key.startswith('snapshots/') and key.endswith('.zip') and raw is None and not headers and not query:
@@ -222,35 +230,81 @@ class Objects(SignedObjects):
             raise ValueError('archive_object_hash_mismatch')
         return 200, headers, body
 
-    def _call_uncached(self, method, key, raw=None, headers=None, response_limit=32*1024*1024, timeout=None, query=None):
-        for attempt in range(3):
+    def _call_uncached(self, method, key, raw=None, headers=None, response_limit=32*1024*1024, timeout=None, query=None, *, retry=True):
+        attempts = 3 if retry else 1
+        for attempt in range(attempts):
             try:
                 with span('minio_zip' if key.endswith('.zip') else 'minio_artifact', method=method, request_bytes=len(raw or b''), attempt=attempt+1):
                     return super().call(method, key, raw, headers, response_limit, timeout, query)
             except TRANSIENT:
                 # Uncertain writes must be reconciled by the transfer state machine.
-                if method not in ('GET','HEAD') or attempt == 2: raise
+                if method not in ('GET','HEAD') or attempt == attempts - 1: raise
             except RuntimeError as exc:
-                if str(exc) not in ('minio_http_429','minio_http_500','minio_http_502','minio_http_503','minio_http_504') or method not in ('GET','HEAD','PUT') or attempt == 2: raise
+                if str(exc) not in RETRYABLE_HTTP_ERRORS or method not in ('GET','HEAD','PUT') or attempt == attempts - 1: raise
             emit('network_retry', category='minio', method=method, attempt=attempt+1)
             time.sleep(2**attempt)
 
     def publish(self, key, raw, content_type):
         digest = sha256(raw)
-        for attempt in range(3):
+        headers = {'content-type': content_type, 'content-disposition': 'inline',
+                   'cache-control': 'private, max-age=300', 'x-amz-meta-sha256': digest}
+        deadline = time.monotonic() + PUBLISH_BUDGET_SECONDS
+        puts = reads = 0
+        need_put = True
+
+        def request_timeout():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                emit('artifact_publish_exhausted', reason='deadline', put_attempts=puts, observations=reads)
+                raise TimeoutError('minio_report_publish_deadline_exceeded')
+            return min(45, remaining)
+
+        for observation in range(PUBLISH_MAX_READS):
+            if need_put:
+                timeout = request_timeout()
+                puts += 1
+                need_put = False
+                try:
+                    self.call('PUT', key, raw, headers, timeout=timeout, retry=False)
+                except TRANSIENT:
+                    emit('artifact_put_uncertain', attempt=puts)
+                except RuntimeError as exc:
+                    if str(exc) not in RETRYABLE_HTTP_ERRORS:
+                        raise
+                    emit('artifact_put_uncertain', attempt=puts)
+            timeout = request_timeout()
+            reads += 1
+            last_error = None
             try:
-                self.call('PUT',key,raw,{'content-type':content_type,'content-disposition':'inline','cache-control':'private, max-age=300','x-amz-meta-sha256':digest})
-            except TRANSIENT:
-                emit('artifact_put_uncertain',attempt=attempt+1)
-            try:
-                status, headers, received = self.call('GET',key,response_limit=max(len(raw),32*1024*1024))
+                status, read_headers, received = self.call(
+                    'GET', key, response_limit=max(len(raw), 32*1024*1024), timeout=timeout, retry=False)
+            except TRANSIENT as exc:
+                last_error = exc
             except RuntimeError as exc:
-                if str(exc) != 'minio_http_404': raise
-                status,headers,received=404,{},b''
-            if status == 200 and received == raw:
-                return dict(key=key,bytes=len(raw),sha256=digest,readback_verified=True,content_type=headers.get('Content-Type'),content_disposition=headers.get('Content-Disposition'))
-            time.sleep(attempt+1)
-        raise ValueError('minio_report_readback_mismatch')
+                if str(exc) == 'minio_http_404':
+                    need_put = True
+                elif str(exc) in RETRYABLE_HTTP_ERRORS:
+                    last_error = exc
+                else:
+                    raise
+            else:
+                if status == 404:
+                    need_put = True
+                elif status != 200 or received != raw:
+                    # Never overwrite a successful read of different bytes.
+                    raise ValueError('minio_report_readback_mismatch')
+                else:
+                    return dict(key=key, bytes=len(raw), sha256=digest, readback_verified=True,
+                                content_type=read_headers.get('Content-Type'),
+                                content_disposition=read_headers.get('Content-Disposition'))
+            if reads == PUBLISH_MAX_READS or (need_put and puts == PUBLISH_MAX_PUTS):
+                emit('artifact_publish_exhausted', reason='attempts', put_attempts=puts, observations=reads)
+                if last_error is not None:
+                    raise last_error
+                raise ValueError('minio_report_readback_mismatch')
+            delay = min(2 ** min(observation, 2), request_timeout())
+            emit('artifact_readback_retry', attempt=reads, put_attempts=puts, missing=need_put)
+            time.sleep(delay)
 
     def verify_object(self, key, size, digest):
         try:
