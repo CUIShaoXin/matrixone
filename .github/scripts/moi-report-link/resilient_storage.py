@@ -7,6 +7,7 @@ this module changes bucket access policies or prints credential material.
 import datetime as dt
 import hashlib
 import hmac
+import http.client
 import json
 import urllib.error
 import urllib.parse
@@ -84,6 +85,9 @@ class SignedObjects:
                 body = response.read(response_limit + 1)
                 if len(body) > response_limit:
                     raise ValueError("report_object_exceeds_limit")
+                length = response.headers.get("Content-Length")
+                if method != "HEAD" and length is not None and len(body) != int(length):
+                    raise http.client.IncompleteRead(body, int(length) - len(body))
                 return response.status, dict(response.headers), body
         except urllib.error.HTTPError as error:
             raise RuntimeError("minio_http_" + str(error.code)) from None
@@ -147,10 +151,11 @@ import threading
 import xml.etree.ElementTree as ET
 from pipeline_telemetry import emit, span
 
-TRANSIENT = (TimeoutError, ConnectionError, urllib.error.URLError)
+TRANSIENT = (TimeoutError, ConnectionError, urllib.error.URLError, http.client.IncompleteRead)
 PART_SIZE = 8 * 1024 * 1024
 ZIP_READ_LIMIT = 256 * 1024 * 1024
 ZIP_READ_LOCK = threading.RLock()
+SNAPSHOT_RANGE_THRESHOLD = 32 * 1024 * 1024
 
 
 def xml_values(raw, name):
@@ -173,13 +178,49 @@ class Objects(SignedObjects):
                         raise ValueError('report_object_exceeds_limit')
                     emit('archive_read_cache_hit', bytes=len(result[2]))
                     return result[0], dict(result[1]), result[2]
-                result = self._call_uncached(method, key, raw, headers, response_limit, timeout, query)
+                result = self._read_snapshot(key, response_limit, timeout)
                 if result[0] == 200 and len(result[2]) <= ZIP_READ_LIMIT:
                     while cache and sum(len(v[2]) for v in cache.values()) + len(result[2]) > ZIP_READ_LIMIT:
                         cache.pop(next(iter(cache)))
                     cache[key] = result[0], dict(result[1]), result[2]
                 return result
         return self._call_uncached(method, key, raw, headers, response_limit, timeout, query)
+
+    def _read_snapshot(self, key, response_limit, timeout):
+        if response_limit <= SNAPSHOT_RANGE_THRESHOLD:
+            return self._call_uncached('GET', key, response_limit=response_limit, timeout=timeout)
+        status, headers, _ = self._call_uncached('HEAD', key, timeout=timeout)
+        hdr = {k.lower(): v for k, v in headers.items()}
+        size = int(hdr.get('content-length', '-1'))
+        if status != 200 or size < 0:
+            raise ValueError('archive_object_identity_conflict')
+        if size > response_limit:
+            raise ValueError('report_object_exceeds_limit')
+        if size <= SNAPSHOT_RANGE_THRESHOLD:
+            return self._call_uncached('GET', key, response_limit=response_limit, timeout=timeout)
+        etag = hdr.get('etag')
+        digest = hdr.get('x-amz-meta-sha256')
+        if not etag or not digest:
+            raise ValueError('archive_range_identity_missing')
+        # Each bounded range is retried independently. If-Match prevents joining
+        # bytes from different object revisions; the full SHA256 is still checked.
+        def read_part(offset):
+            end = min(offset + PART_SIZE, size) - 1
+            status, part_headers, part = self._call_uncached(
+                'GET', key, headers={'Range': 'bytes='+str(offset)+'-'+str(end), 'If-Match': etag},
+                response_limit=end-offset+1, timeout=timeout)
+            part_hdr = {k.lower(): v for k, v in part_headers.items()}
+            if (status != 206 or part_hdr.get('content-range') != 'bytes '+str(offset)+'-'+str(end)+'/'+str(size)
+                    or part_hdr.get('etag') != etag or len(part) != end-offset+1):
+                raise ValueError('archive_range_identity_mismatch')
+            return part
+        import concurrent.futures
+        with span('archive_range_read', bytes=size, parts=(size+PART_SIZE-1)//PART_SIZE):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                body = b''.join(pool.map(read_part, range(0, size, PART_SIZE)))
+        if len(body) != size or sha256(body) != digest:
+            raise ValueError('archive_object_hash_mismatch')
+        return 200, headers, body
 
     def _call_uncached(self, method, key, raw=None, headers=None, response_limit=32*1024*1024, timeout=None, query=None):
         for attempt in range(3):
