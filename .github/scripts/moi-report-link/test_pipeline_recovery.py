@@ -172,6 +172,28 @@ class RecoveryTests(unittest.TestCase):
   bad=task('input-required','reason.agent_runtime.finish.stream_transport');api=Model([bad,task('completed',id='t2')]);job=Job(api)
   self.assertEqual(run_review(job,'repo','primary','source','prompt',lambda t:t['id'],poll_seconds=0),'t2')
   self.assertEqual(len(job.state['model_tasks']['repo_primary']['attempts']),2);self.assertNotEqual(api.requests[0][2],api.requests[1][2]);self.assertTrue(any('attempt-1-task' in k for k in job.stored))
+ def test_readonly_audit_retries_exact_empty_runtime_failure_and_retains_it(self):
+  bad=task('failed','reason.agent_runtime.finish.error')
+  bad['artifacts']=[dict(name='session_title',metadata={'data_type':'agent.session_title'},parts=[dict(kind='data',data={'type':'agent.session_title','title':'audit'})])]
+  api=Model([bad,task('completed',id='t2')]);job=Job(api)
+  self.assertEqual(run_review(job,'repo','audit','source','prompt',lambda t:t['id'],poll_seconds=0,recover_empty_runtime_failure=True),'t2')
+  self.assertEqual(job.state['model_tasks']['repo_audit']['attempts'][0]['recovery_reason'],'empty_runtime_failure')
+  self.assertEqual(job.stored['repo/audit/attempt-1-task.json'],bad)
+  self.assertNotEqual(api.requests[0][2],api.requests[1][2])
+ def test_empty_runtime_recovery_is_opt_in_and_never_retries_output_or_auth(self):
+  title=dict(name='session_title',metadata={'data_type':'agent.session_title'},parts=[dict(kind='data',data={'type':'agent.session_title'})])
+  for reason,artifacts,opt in [('reason.agent_runtime.finish.error',[title],False),('reason.agent_runtime.finish.authentication',[title],True),('reason.agent_runtime.finish.error',[title,dict(name='response',parts=[])],True)]:
+   bad=task('failed',reason);bad['artifacts']=artifacts;api=Model([bad])
+   with self.assertRaisesRegex(ValueError,'nonrecoverable'):run_review(Job(api),'repo','audit','source','prompt',lambda t:t,poll_seconds=0,recover_empty_runtime_failure=opt)
+   self.assertEqual(len(api.requests),1)
+ def test_empty_runtime_recovery_remains_bounded_after_expired_restart(self):
+  bad=task('failed','reason.agent_runtime.finish.error');bad['artifacts']=[dict(name='session_title',metadata={'data_type':'agent.session_title'},parts=[dict(kind='data',data={'type':'agent.session_title'})])]
+  api=Model([bad,bad,bad]);job=Job(api)
+  with patch('kimi_recovery.time.time',return_value=100):
+   with self.assertRaisesRegex(ValueError,'nonrecoverable'):run_review(job,'repo','audit','source','prompt',lambda t:t,poll_seconds=0)
+  with patch('kimi_recovery.time.time',return_value=10000):
+   with self.assertRaisesRegex(ValueError,'attempts_exhausted'):run_review(job,'repo','audit','source','prompt',lambda t:t,poll_seconds=0,recover_empty_runtime_failure=True,max_attempts=2)
+  self.assertEqual([r[0] for r in api.requests],['message/send','tasks/get','message/send'])
  def test_request_timeout_reuses_identical_message(self):
   api=Model([TimeoutError(),task('completed')]);job=Job(api);run_review(job,'repo','primary','source','prompt',lambda t:t,poll_seconds=0)
   self.assertEqual(api.requests[0],api.requests[1]);self.assertEqual(len(job.state['model_tasks']['repo_primary']['attempts']),1)
