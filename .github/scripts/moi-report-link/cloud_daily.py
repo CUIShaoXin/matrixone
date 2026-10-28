@@ -39,6 +39,20 @@ def require(condition, code):
         raise Failure(code)
 
 
+def employee_evidence_summary(osv):
+    """Render only verified scan facts; free-form model drafts are not evidence."""
+    facts = osv['facts']
+    date, repository, commit = facts['report_date_shanghai'], facts['repository'], osv['commit']
+    expected = 'MATRIX-MINIO-FULLZIP-'+date.replace('-', '')+'-'+repository.rsplit('/', 1)[-1].upper()+'-'+commit[:8].upper()
+    require(facts['marker'] == expected and facts['commit'] == commit, 'employee_facts_identity_mismatch')
+    rows = [date+' · '+repository+' · '+facts['branch']+' / '+commit, '',
+            '组件扫描证据摘要：核对 '+str(facts['input_files'])+' 份清单，查询 '+str(facts['queried_package_versions'])+' 组声明／锁定版本。', '']
+    for component in facts.get('priority_components', [])[:5]:
+        rows.append('- '+component['name']+'：'+ ' / '.join(component['versions'])+'；关联公告 '+str(len(component['vulnerability_ids']))+' 条。研发需核实实际使用路径和触发条件。')
+    rows += ['', '完整风险、修复评估和依赖位置以同批结构化扫描及最终日报为准。公告匹配不等于线上可利用。', '', expected+'-EMPLOYEE', '']
+    return '\n'.join(rows).encode('utf-8')
+
+
 def json_bytes(value):
     return json.dumps(value, ensure_ascii=False, indent=2).encode()
 
@@ -395,6 +409,10 @@ class Runner:
                   self.node("employee", "moi:llm.output.generate",dict(prompt=EMPLOYEE_PROMPT,text="{{ .state.facts }}",temperature=0.1,max_tokens=3000),{"employee":".text"}),
                   self.sink("employee_report","{{ .state.employee }}",run_prefix+"-employee.md",140002,"markdown"),
                   self.sink("validation","{{ .state.validation }}",run_prefix+"-validation.json")]
+        # Resume the exact historical contract if it already ran. Fresh batches
+        # omit the redundant free-form LLM node; the final focus still uses Kimi.
+        if repo.name+"_finalize" not in self.state.get('stages', {}):
+            nodes = [node for node in nodes if node['name'] not in ('employee', 'employee_report')]
         generated=self.workflow(repo.name+"_finalize",nodes)
         # Correct the legacy operator's import description before publishing or KB registration.
         if saved.get("artifact_storage_version") != 2:
@@ -405,7 +423,7 @@ class Runner:
             facts["complete_details_entry"]="MinIO browser report published only after independent acceptance"
             osv["report_presentation_normalized_by"]="GitHub Actions cloud runner; scan results unchanged"
             detail=generated["details"][1].decode().replace("原生导入并核对全部筛选清单", "由云端runner流式导入筛选清单，并核对全部字节哈希")
-            employee=generated["employee_report"][1]
+            employee=employee_evidence_summary(osv)
             require((facts["marker"]+"-EMPLOYEE").encode() in employee, "employee_marker_missing")
             require((facts["marker"]+"-DETAIL") in detail, "detail_marker_missing")
             values={"osv":json_bytes(osv),"details":detail.encode(),"employee":employee}
@@ -413,7 +431,10 @@ class Runner:
             normalized_nodes=[]
             for kind in values:
                 suffix=".json" if kind=="osv" else ".md"
-                name=run_prefix+"-accepted-v4-"+kind+suffix
+                name=run_prefix+"-accepted-v5-"+kind+suffix
+                if kind == 'employee':
+                    normalized_nodes.append(self.sink(kind, employee.decode('utf-8'), name, 140002, 'markdown'))
+                    continue
                 original=generated["employee_report" if kind=="employee" else kind][0]
                 saved_key="normalize_"+kind
                 normalized_nodes.append(self.node("read_"+kind,"moi:parse",{
@@ -428,8 +449,10 @@ class Runner:
                     expression+=' | gsub('+json.dumps("原生导入并核对全部筛选清单",ensure_ascii=False)+'; '+json.dumps("由云端runner流式导入筛选清单，并核对全部字节哈希",ensure_ascii=False)+')'
                 normalized_nodes.append(self.sink(kind,"{{ "+expression+" }}",name,
                                                   140002 if kind=="employee" else 130001,"json" if kind=="osv" else "markdown"))
-            normalized=self.workflow(repo.name+"_store_accepted_v4",normalized_nodes)
+            normalized=self.workflow(repo.name+"_store_accepted_v5",normalized_nodes)
             saved["artifacts"]={kind:normalized[kind][0] for kind in values}
+            saved['employee_generation'] = dict(method='deterministic_verified_scan_facts_v1',
+                                               source_osv=generated['osv'][0], free_form_draft_used=False)
             for kind,body in values.items():
                 require(normalized[kind][1] == body if kind!="osv" else json.loads(normalized[kind][1])==json.loads(body),"normalized_report_readback_mismatch")
             saved.pop("kb_appended",None)
