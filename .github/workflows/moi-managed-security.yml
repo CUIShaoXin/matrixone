@@ -48,6 +48,8 @@ jobs:
           ref: ${{ inputs.runtime_ref }}
           persist-credentials: false
           sparse-checkout: .github/scripts/moi-report-link
+      - name: Ensure source inventory tool
+        run: command -v rg || (sudo apt-get update -qq && sudo apt-get install -y ripgrep)
       - name: Run isolated orchestration and recovery regressions
         working-directory: .github/scripts/moi-report-link
         run: |
