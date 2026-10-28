@@ -500,7 +500,7 @@ def publish_report(job, source, page, results, rendered=None):
     require(stored==md, 'native_report_bytes_mismatch')
     fid=artifact['file_id'];job.state['markdown_artifact']=artifact;job.journal.save()
     from knowledge_gate import ensure_sources,audit
-    ensure_sources(job,[artifact])
+    ensure_sources(job,[artifact],registration_volume_id=140002)
     targets=[dict(file_id=fid,marker=marker)]
     proof=audit(job,targets,'final_report')
     job.store('knowledge-tool-proof.json',proof)
