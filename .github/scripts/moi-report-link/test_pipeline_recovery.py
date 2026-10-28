@@ -227,4 +227,52 @@ class ArchiveReadCacheTests(unittest.TestCase):
    store.call('GET','snapshots/today/first.zip');store.call('GET','snapshots/today/second.zip');store.call('GET','snapshots/today/first.zip')
    self.assertEqual(call.call_count,3);self.assertLessEqual(sum(len(r[2]) for r in store._zip_reads.values()),5)
 
+class SnapshotRangeRecoveryTests(unittest.TestCase):
+ def store(self, body=b'abcdefghijklmnopqrst', fault=None):
+  store=Objects.__new__(Objects);etag='"revision-1"';lock=__import__('threading').Lock();seen=[]
+  headers={'Content-Length':str(len(body)),'ETag':etag,'X-Amz-Meta-Sha256':sha256(body)}
+  def network(method,key,raw=None,headers=None,response_limit=None,timeout=None,query=None):
+   if method=='HEAD':return 200,dict(store.head),b''
+   spec=headers['Range'].removeprefix('bytes=');start,end=map(int,spec.split('-'))
+   with lock:seen.append((start,end,headers.get('If-Match')))
+   part=body[start:end+1];hdr={'ETag':etag,'Content-Range':f'bytes {start}-{end}/{len(body)}'}
+   if fault=='revision' and start==4:hdr['ETag']='"changed"'
+   if fault=='short' and start==4:part=part[:-1]
+   if fault=='wrong-range' and start==4:hdr['Content-Range']='bytes 0-3/20'
+   if fault=='corrupt' and start==4:part=b'X'*len(part)
+   return 206,hdr,part
+  store.head=headers;store._call_uncached=network;store.seen=seen
+  return store
+ def test_bounded_ranges_reassemble_full_archive_and_are_cached(self):
+  store=self.store()
+  with patch('resilient_storage.SNAPSHOT_RANGE_THRESHOLD',8),patch('resilient_storage.PART_SIZE',4),patch('resilient_storage.emit'):
+   first=store.call('GET','snapshots/today/fixed.zip',response_limit=20)
+   second=store.call('GET','snapshots/today/fixed.zip',response_limit=20)
+  self.assertEqual(first[2],b'abcdefghijklmnopqrst');self.assertEqual(second,first)
+  self.assertEqual(sorted(store.seen),[(n,n+3,'"revision-1"') for n in range(0,20,4)])
+ def test_bad_range_or_changed_revision_never_enters_cache(self):
+  for fault in ('revision','short','wrong-range','corrupt'):
+   with self.subTest(fault=fault):
+    store=self.store(fault=fault)
+    with patch('resilient_storage.SNAPSHOT_RANGE_THRESHOLD',8),patch('resilient_storage.PART_SIZE',4):
+     with self.assertRaisesRegex(ValueError,'archive_(range_identity_mismatch|object_hash_mismatch)'):
+      store.call('GET','snapshots/today/fixed.zip',response_limit=20)
+    self.assertFalse(store._zip_reads)
+ def test_larger_than_expected_archive_is_rejected_before_download(self):
+  store=self.store()
+  with patch('resilient_storage.SNAPSHOT_RANGE_THRESHOLD',8):
+   with self.assertRaisesRegex(ValueError,'exceeds_limit'):store.call('GET','snapshots/today/fixed.zip',response_limit=19)
+  self.assertFalse(store.seen)
+ def test_incomplete_http_body_is_retried_without_caching_partial_bytes(self):
+  from unittest.mock import MagicMock
+  from resilient_storage import EXPECTED_ENDPOINT,EXPECTED_BUCKET
+  store=Objects({'endpoint':EXPECTED_ENDPOINT,'bucket_name':EXPECTED_BUCKET,'access_key_id':'test','access_key_secret':'test'})
+  short=MagicMock();short.status=200;short.headers={'Content-Length':'5'};short.read.return_value=b'zi';short.__enter__.return_value=short
+  complete=MagicMock();complete.status=200;complete.headers={'Content-Length':'5'};complete.read.return_value=b'zipok';complete.__enter__.return_value=complete
+  opener=MagicMock();opener.open.side_effect=[short,complete]
+  with patch('resilient_storage.urllib.request.build_opener',return_value=opener),patch('resilient_storage.time.sleep'),patch('resilient_storage.emit'):
+   self.assertEqual(store.call('GET','snapshots/today/fixed.zip')[2],b'zipok')
+   self.assertEqual(store.call('GET','snapshots/today/fixed.zip')[2],b'zipok')
+  self.assertEqual(opener.open.call_count,2)
+
 if __name__=='__main__':unittest.main()
