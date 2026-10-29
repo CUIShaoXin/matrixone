@@ -200,17 +200,31 @@ class StorageRecoveryTests(unittest.TestCase):
         self.assertEqual(self.clock.now, 105)
         self.assertEqual(self.clock.sleeps, [1])
 
-    def test_wrong_size_or_hash_fails_immediately_without_repairing_evidence(self):
+    def test_persistent_wrong_bytes_fail_without_repairing_evidence(self):
         for received in (b'short', self.raw + b'extra', b'x' * len(self.raw)):
             for failures in (0, 3):
                 with self.subTest(size=len(received), failures=failures):
                     store, fake = self.store(gets=[TimeoutError()] * failures + [
-                        (200, {'X-Amz-Meta-Sha256': storage.sha256(self.raw)}, received),
-                        (200, {}, self.raw)])
+                        (200, {'X-Amz-Meta-Sha256': storage.sha256(self.raw)}, received)
+                        ] * storage.PUBLISH_MAX_READS + [(200, {}, self.raw)])
                     with self.assertRaisesRegex(ValueError, 'readback_mismatch'):
                         self.publish(store)
-                    self.assertEqual(fake.methods(), ['PUT'] + ['GET'] * (failures + 1))
-                    self.assertEqual(len(fake.gets), 1)
+                    self.assertEqual(fake.methods(), ['PUT'] + ['GET'] * storage.PUBLISH_MAX_READS)
+                    self.assertEqual(fake.gets[-1][2], self.raw)
+
+    def test_previous_checkpoint_read_is_reobserved_without_rewriting(self):
+        for lost_put in (False, True):
+            with self.subTest(lost_put=lost_put):
+                store, fake = self.store(
+                    puts=[(True, TimeoutError())] if lost_put else (),
+                    gets=[(200, {}, b'previous checkpoint')])
+                self.assertTrue(self.publish(store)['readback_verified'])
+                self.assertEqual(fake.methods(), ['PUT', 'GET', 'GET'])
+
+    def test_conflict_followed_by_404_does_not_authorize_another_put(self):
+        store, fake = self.store(gets=[(200, {}, b'conflict'), RuntimeError('minio_http_404')])
+        self.assertTrue(self.publish(store)['readback_verified'])
+        self.assertEqual(fake.methods(), ['PUT', 'GET', 'GET', 'GET'])
 
     def test_unexpected_read_status_cannot_verify_matching_bytes(self):
         store, fake = self.store(gets=[(206, {}, self.raw)])

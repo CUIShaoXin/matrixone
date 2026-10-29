@@ -251,6 +251,7 @@ class Objects(SignedObjects):
         deadline = time.monotonic() + PUBLISH_BUDGET_SECONDS
         puts = reads = 0
         need_put = True
+        observed_conflict = False
 
         def request_timeout():
             remaining = deadline - time.monotonic()
@@ -282,17 +283,26 @@ class Objects(SignedObjects):
                 last_error = exc
             except RuntimeError as exc:
                 if str(exc) == 'minio_http_404':
-                    need_put = True
+                    need_put = not observed_conflict
                 elif str(exc) in RETRYABLE_HTTP_ERRORS:
                     last_error = exc
                 else:
                     raise
             else:
                 if status == 404:
-                    need_put = True
-                elif status != 200 or received != raw:
-                    # Never overwrite a successful read of different bytes.
+                    need_put = not observed_conflict
+                elif status != 200:
                     raise ValueError('minio_report_readback_mismatch')
+                elif received != raw:
+                    # An uncertain PUT may still expose the previous checkpoint.
+                    # Re-observe only: different bytes never authorize another PUT.
+                    # Acceptance still requires the exact intended bytes, with the
+                    # same shared deadline/read budget as transport recovery.
+                    observed_conflict = True
+                    last_error = ValueError('minio_report_readback_mismatch')
+                    emit('artifact_readback_conflict', expected_bytes=len(raw),
+                         received_bytes=len(received), expected_sha256=digest,
+                         received_sha256=sha256(received), observation=reads)
                 else:
                     return dict(key=key, bytes=len(raw), sha256=digest, readback_verified=True,
                                 content_type=read_headers.get('Content-Type'),

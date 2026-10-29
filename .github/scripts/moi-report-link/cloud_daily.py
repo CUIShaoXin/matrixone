@@ -290,16 +290,39 @@ class Runner:
                 retire(self, label)
                 return cached
         require(stage['status'] not in ('failed','cancelled','canceled','error','timeout'), 'moi_workflow_failed:'+label)
-        if stage["status"] == "planned":
+        if stage["status"] in ("planned", "deploying"):
             lines = ["workflow:", "  name: matrix_daily_" + label, "  root: root", "root:", "  chain:"]
             for node in nodes:
                 lines += ["    - work_item:", "        name: " + node["name"], "        id: " + node["id"], "        version: v1", "        input: " + yaml_inline(node["input"])]
                 if node.get("save"):
                     lines += ["        save:"] + ["          " + k + ": " + json.dumps(v) for k,v in node["save"].items()]
+            dsl = "\n".join(lines)+"\n"
+        if stage["status"] == "deploying":
+            # Deployment can succeed while persisting its acknowledgement fails.
+            # Read the original app; never deploy again or guess missing state.
+            from workflow_lifecycle import fresh_route
+            definition = self.api.data(self.api.request(fresh_route(
+                "/workflow/v2/workflow-apps/" + wid)))["workflow"]
+            summary = definition.get("execution_summary", {})
+            require(definition.get("id") == wid
+                    and definition.get("name") == "Matrix daily " + label
+                    and definition.get("description") == "Dynamic fixed-commit manifest scan; no group send"
+                    and definition.get("execution_mode") == "one_shot"
+                    and definition.get("source_type") == "manual_dsl"
+                    and definition.get("status") == "ready"
+                    and definition.get("dsl_yaml", "").rstrip("\n") == dsl.rstrip("\n")
+                    and summary.get("total_executions") == 0
+                    and summary.get("active_executions") == 0,
+                    "workflow_deployment_readback_identity_mismatch")
+            stage.update(status="deployed", deployment_reconciled=True,
+                         deployment_version_id=definition.get("latest_workflow_version_id"))
+            self.journal.save()
+            self.event(stage=label, status="deployment_ack_recovered", redeployed=False)
+        if stage["status"] == "planned":
             stage["status"] = "deploying"
             self.journal.save()
             self.api.request("/workflow/v2/workflow-deployments", dict(workflow_id=wid, source_type="manual_dsl", name="Matrix daily " + label,
-                             description="Dynamic fixed-commit manifest scan; no group send", execution_mode="one_shot", dsl_yaml="\n".join(lines)+"\n"), timeout=45)
+                             description="Dynamic fixed-commit manifest scan; no group send", execution_mode="one_shot", dsl_yaml=dsl), timeout=45)
             stage["status"] = "deployed"
             self.journal.save()
         require(stage["status"] != "deploying", "workflow_deployment_uncertain")

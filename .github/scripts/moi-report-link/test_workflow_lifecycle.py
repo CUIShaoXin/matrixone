@@ -4,7 +4,7 @@ import types
 import unittest
 import uuid
 
-from cloud_daily import Runner, WORKSPACE, Failure, sha256
+from cloud_daily import Runner, WORKSPACE, Failure, sha256, json_bytes
 
 
 class MemoryObjects:
@@ -91,6 +91,46 @@ class WorkflowLifecycleTests(unittest.TestCase):
         self.assertEqual(archive['outputs']['output']['sha256'], sha256(runner.api.raw))
         self.assertEqual(runner.workflow('lifecycle_probe', nodes), first)
         self.assertEqual((runner.api.deploys, runner.api.submits, runner.api.deletes), (1, 1, 1))
+
+    def uncertain_deployment(self, damage=None):
+        runner, nodes = self.runner()
+        original = runner.api.request
+        definition = {}
+        def request(path, payload=None, method=None, **kw):
+            if path.endswith('/workflow-deployments'):
+                original(path, payload, method, **kw)
+                definition.update(runner.api.definition, dsl_yaml=payload['dsl_yaml'],
+                                  source_type='manual_dsl', status='ready',
+                                  execution_summary=dict(total_executions=0, active_executions=0))
+                raise TimeoutError('lost deployment response')
+            if (runner.state.get('stages', {}).get('lifecycle_probe', {}).get('status') == 'deploying'
+                    and '/workflow-apps/' in path and '/executions' not in path):
+                answer = copy.deepcopy(definition)
+                if damage == 'dsl': answer['dsl_yaml'] += 'changed'
+                if damage == 'active': answer['execution_summary']['active_executions'] = 1
+                if damage == 'executed': answer['execution_summary']['total_executions'] = 1
+                if damage == 'identity': answer['id'] = 'another-workflow'
+                if damage == 'missing': raise Failure('moi_http_404')
+                return dict(workflow=answer)
+            return original(path, payload, method, **kw)
+        runner.api.request = request
+        with self.assertRaises(TimeoutError):
+            runner.workflow('lifecycle_probe', nodes)
+        return runner, nodes
+
+    def test_lost_deployment_ack_recovers_exact_app_without_redeployment(self):
+        runner, nodes = self.uncertain_deployment()
+        runner.workflow('lifecycle_probe', nodes)
+        self.assertTrue(runner.state['stages']['lifecycle_probe']['deployment_reconciled'])
+        self.assertEqual((runner.api.deploys, runner.api.submits), (1, 1))
+
+    def test_deployment_recovery_blocks_changed_missing_or_executed_app(self):
+        for damage in ('dsl', 'active', 'executed', 'identity', 'missing'):
+            with self.subTest(damage=damage):
+                runner, nodes = self.uncertain_deployment(damage)
+                with self.assertRaises(Failure):
+                    runner.workflow('lifecycle_probe', nodes)
+                self.assertEqual((runner.api.deploys, runner.api.submits), (1, 0))
 
     def test_next_batch_never_recreates_a_previously_deleted_app_id(self):
         runner, nodes = self.runner()
