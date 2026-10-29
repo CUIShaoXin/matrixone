@@ -377,24 +377,82 @@ class Runner:
         evidence, raw = self.workflow(label, nodes)["archive"]
         return evidence, json.loads(raw)
 
+    @timed("manifest_import")
+    def import_manifests(self, repo, proof, saved):
+        manifests = saved.setdefault("manifests", [])
+        expected = proof["manifests"]
+        require(len(manifests) <= len(expected), "manifest_import_prefix_invalid")
+        # A partially persisted list is a prefix, not a completed import.
+        # Never re-upload an accepted prefix or accept different remote bytes.
+        for i, item in enumerate(manifests):
+            entry = expected[i]
+            require(item.get("path") == entry["path"] and item.get("bytes") == entry["bytes"]
+                    and item.get("sha256") == entry["sha256"], "manifest_import_prefix_invalid")
+            raw = self.api.file(item["file_id"])
+            require(len(raw) == entry["bytes"] and sha256(raw) == entry["sha256"], "manifest_import_readback_mismatch")
+        if saved.get("manifest_import_complete"):
+            require(len(manifests) == len(expected) and not saved.get("manifest_upload_pending"), "manifest_import_incomplete")
+            return manifests
+        raw = self.objects.call("GET", proof["key"], response_limit=proof["bytes"])[2]
+        contents = extract_manifests(raw, proof)
+        for i in range(len(manifests), len(expected)):
+            entry = expected[i]
+            body = contents[entry["path"]]
+            name = repo.name + "-" + self.state["run_id"] + "-manifest-" + str(i) + ".txt"
+            listing = self.api.data(self.api.request("/catalog/file/list", dict(
+                filters=[dict(name="volume_id", values=["130001"]), dict(name="file_name", values=[name])],
+                page=1, page_size=100), timeout=90))
+            require(listing.get("total") == len(listing.get("list", [])), "manifest_inventory_incomplete")
+            found = [x for x in listing["list"] if x.get("name") == name and str(x.get("volume_id")) == "130001"]
+            require(len(found) <= 1, "manifest_import_name_ambiguous")
+            pending = saved.get("manifest_upload_pending")
+            if pending:
+                require(pending.get("name") == name and pending.get("path") == entry["path"]
+                        and pending.get("sha256") == entry["sha256"], "manifest_import_pending_mismatch")
+            if found:
+                fid = found[0]["id"]
+                require(not pending or not pending.get("file_id") or pending["file_id"] == fid,
+                        "manifest_import_identity_mismatch")
+                received = self.api.file(fid)
+                require(received == body, "manifest_import_readback_mismatch")
+                item = file_evidence(fid, received)
+            else:
+                # A lost upload response is never authority to upload again.
+                # A known FID can be attached only if no attach was attempted.
+                require(not pending or pending.get("file_id"), "manifest_upload_submission_unknown")
+                if not pending:
+                    pending = dict(name=name, path=entry["path"], sha256=entry["sha256"], status="upload_unknown")
+                    saved["manifest_upload_pending"] = pending
+                    self.journal.save()
+                    boundary = "moi" + uuid.uuid4().hex
+                    multipart = ("--" + boundary + '\r\nContent-Disposition: form-data; name="file"; filename="' + name + '"\r\nContent-Type: application/octet-stream\r\n\r\n').encode() + body + ("\r\n--" + boundary + "--\r\n").encode()
+                    answer = json.loads(self.api.binary("/catalog/file/upload", raw=multipart,
+                                                       content_type="multipart/form-data; boundary=" + boundary))
+                    require(answer.get("code") in ("OK", 0, 200), "moi_upload_rejected")
+                    pending.update(file_id=answer["data"]["file_id"], status="uploaded")
+                    self.journal.save()
+                fid = pending["file_id"]
+                received = self.api.file(fid)
+                require(received == body, "manifest_import_readback_mismatch")
+                require(not pending.get("attach_attempted"), "manifest_attach_submission_unknown")
+                pending["attach_attempted"] = True
+                self.journal.save()
+                self.api.request("/catalog/file/create", dict(volume_id=130001, file_ids=[fid]), timeout=90)
+                item = file_evidence(fid, received)
+            item.update(path=entry["path"], report_tag=repo.name, source_kind="verified_minio_zip_manifest_stream")
+            manifests.append(item)
+            saved.pop("manifest_upload_pending", None)
+            self.journal.save()
+        saved["manifest_import_complete"] = True
+        self.journal.save()
+        return manifests
+
     @timed("component_scan")
     def scan(self, repo, proof):
         saved = self.state.setdefault("repositories", {}).setdefault(repo.name, {})
         if saved.get("accepted"): return saved["result"]
         require(proof["report_date"] == self.state["date"] and proof.get("daily_cloud_download_verified") and proof.get("minio_readback_verified"), "daily_archive_unverified")
-        if "manifests" not in saved:
-            raw = self.objects.call("GET", proof["key"], response_limit=proof["bytes"])[2]
-            contents = extract_manifests(raw, proof)
-            saved["manifests"] = []
-            for i, entry in enumerate(proof["manifests"]):
-                name = repo.name + "-" + self.state["run_id"] + "-manifest-" + str(i) + ".txt"
-                item = self.api.upload(name, contents[entry["path"]])
-                item.update(path=entry["path"], report_tag=repo.name, source_kind="verified_minio_zip_manifest_stream")
-                saved["manifests"].append(item)
-            saved["manifest_import_complete"] = True
-            self.journal.save()
-        require(saved.get("manifest_import_complete") and len(saved["manifests"]) == len(proof["manifests"]), "manifest_import_incomplete")
-        manifests = saved["manifests"]
+        manifests = self.import_manifests(repo, proof, saved)
         common = dict(manifests=manifests, archive_proof=dict(proof, manifest_import_method=IMPORT_DESCRIPTION), repository=proof["repository"], branch=proof["branch"], commit=proof["commit"], report_tag=repo.name)
         run_prefix = "matrix-daily-" + repo.name + "-" + self.state["run_id"]
         nodes, docs = [], []
