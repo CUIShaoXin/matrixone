@@ -85,6 +85,8 @@ class UnifiedTests(unittest.TestCase):
   self.assertNotIn('succeeded',job.state['knowledge_registration']['fid'])
  def test_kb_audit_explicitly_omits_volume_filter_and_preserves_old_phase(self):
   job=Job(None)
+  repo=sorted(job.state['commits'])[0]
+  job.state['model_tasks']={repo+'_kb_matrixone_scope_v2':{'original':'retained'}}
   with patch('kimi_recovery.run_review',return_value=[]) as run:
    kb.audit(job,[dict(file_id='fid',marker='marker')],'matrixone')
   args=run.call_args.args

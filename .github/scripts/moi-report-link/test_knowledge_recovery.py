@@ -89,7 +89,7 @@ class FakeAPI:
         if route.path==kb.WORKFLOWS+'/'+kb.KB_WORKFLOW_ID+'/executions':
             if self.on_list:self.on_list()
             values=self.list_prefix+([self.retry_list] if self.commits and not self.hide_new else [])+[self.original_list]
-            offset=int(query['offset'][0]);limit=int(query['limit'][0]);assert limit==100
+            offset=int(query['offset'][0]);limit=int(query['limit'][0]);assert limit==10
             return dict(executions=copy.deepcopy(values[offset:offset+limit]),total=len(values))
         raise AssertionError(path)
 
@@ -190,11 +190,11 @@ class KnowledgeRecoveryTests(unittest.TestCase):
         self.job.journal.hook=fail;self.run_gate()
         self.assertEqual(len(self.api.posts),1);self.assertTrue(failures)
     def test_dispatch_lookup_uses_official_offset_pagination(self):
-        self.api.list_prefix=[dict(execution_id='unrelated-'+str(i)) for i in range(100)]
+        self.api.list_prefix=[dict(execution_id='unrelated-'+str(i)) for i in range(10)]
         self.run_gate()
         offsets=[parse_qs(urlsplit(path).query)['offset'][0] for path,_,_ in self.api.calls
                  if urlsplit(path).path==kb.WORKFLOWS+'/'+kb.KB_WORKFLOW_ID+'/executions']
-        self.assertEqual(offsets,['0','100','0','100'])
+        self.assertEqual(offsets,['0','10','0','10'])
     def test_pending_execution_prevents_retry_of_older_failed_lineage(self):
         self.no_reconcile();self.api.extra=[dict(self.api.new,status='pending')]
         with self.assertRaisesRegex(ValueError,'ingestion_deadline'):self.run_gate()

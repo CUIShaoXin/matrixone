@@ -7,6 +7,16 @@ import daily_delivery as d
 
 
 class DeliveryTests(unittest.TestCase):
+    def test_final_audit_accepts_one_immutable_v2_or_v3_task_but_never_ambiguous_tasks(self):
+        commits={r:'a'*40 for r in d.REPOS};repo=sorted(commits)[0]
+        for version in ('v2','v3'):
+            self.assertEqual(d.final_kb_task({repo+'_kb_final_report_scope_'+version:{'task_id':'task'}},commits),{'task_id':'task'})
+        for tasks in ({},
+                      {'other_kb_final_report_scope_v3':{'task_id':'task'}},
+                      {repo+'_kb_final_report_scope_v3':{}},
+                      {repo+'_kb_final_report_scope_v2':{'task_id':'old'},repo+'_kb_final_report_scope_v3':{'task_id':'new'}}):
+            with self.assertRaisesRegex(ValueError,'final_kb_task_missing'):d.final_kb_task(tasks,commits)
+
     def bundle(self):
         codes = {r: dict(retained_findings=[]) for r in d.REPOS}
         apis = {r: dict(findings=[]) for r in d.REPOS}

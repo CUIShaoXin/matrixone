@@ -82,5 +82,26 @@ class PendingAuditRecoveryTests(unittest.TestCase):
         self.assertEqual(saved,before)
         self.assertEqual(api.requests,[])
 
+    def test_lost_ack_in_current_process_reads_original_task_without_resubmission(self):
+        api,job,saved,task=self.setup_pending()
+        job.state.pop('model_tasks')
+        api.replies=[TimeoutError(),task]
+        with patch('kimi_recovery.time.time',return_value=100):
+            self.assertEqual(run_review(job,'repo','audit','source','prompt',lambda t:t['id'],
+                                       poll_seconds=0,recover_pending_submission=True),task['id'])
+        self.assertEqual([r[0] for r in api.requests],['message/send','tasks/get'])
+        attempts=job.state['model_tasks']['repo_audit']['attempts']
+        self.assertEqual(len(attempts),1)
+        self.assertEqual(attempts[0]['request_id'],saved['attempts'][0]['request_id'])
+
+    def test_lost_ack_and_unconfirmed_read_never_replays_submit(self):
+        api,job,_,_=self.setup_pending();job.state.pop('model_tasks')
+        api.replies=[TimeoutError(),TimeoutError()]
+        with patch('kimi_recovery.time.time',return_value=100):
+            with self.assertRaisesRegex(ValueError,'read_unconfirmed'):
+                run_review(job,'repo','audit','source','prompt',lambda t:t,poll_seconds=0,
+                           recover_pending_submission=True)
+        self.assertEqual([r[0] for r in api.requests],['message/send','tasks/get'])
+
 
 if __name__=='__main__':unittest.main()

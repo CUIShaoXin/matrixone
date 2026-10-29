@@ -67,6 +67,14 @@ def checked_file(api, artifact):
     return raw
 
 
+def final_kb_task(tasks,commits):
+    repo=sorted(commits)[0]
+    values=[v for k,v in tasks.items() if k in
+            (repo+'_kb_final_report_scope_v2',repo+'_kb_final_report_scope_v3')]
+    require(len(values)==1 and values[0].get('task_id'),'delivery_final_kb_task_missing')
+    return values[0]
+
+
 def check_bundle(api, objects, prefix, date):
     """Re-read accepted immutable inputs and actual final KB task, no inference."""
     require(re.fullmatch(r'receipts/' + date.replace('-', '') + r'/pipeline-[A-Za-z0-9_-]{1,80}', prefix), 'delivery_batch_prefix_invalid')
@@ -106,9 +114,8 @@ def check_bundle(api, objects, prefix, date):
             proof = value['actual_model_execution_proof']
             require(all(proof.get(k) and all(m.get('model') == 'kimi-k3' and m.get('status') == 'completed' for m in proof[k]) for k in ('primary', 'final')), 'delivery_actual_review_model_missing')
     marker = 'MATRIX-API-PORT-' + date.replace('-', '') + '-' + root['run_id']
-    kb = [v for k, v in reviews['model_tasks'].items() if k.endswith('_kb_final_report_scope_v2')]
-    require(len(kb) == 1 and kb[0].get('task_id'), 'delivery_final_kb_task_missing')
-    task = api.rpc('tasks/get', {'id': kb[0]['task_id']}, str(uuid.uuid4()))
+    kb = final_kb_task(reviews['model_tasks'],root['commits'])
+    task = api.rpc('tasks/get', {'id': kb['task_id']}, str(uuid.uuid4()))
     verify_rag(task, [dict(file_id=r['markdown_artifact']['file_id'], marker=marker)])
     require(task.get('status', {}).get('state') == 'completed' and llm_calls(task) and all(m.get('model') == 'kimi-k3' and m.get('status') == 'completed' for m in llm_calls(task)), 'delivery_kb_task_not_completed')
     md = checked_file(api, r['markdown_artifact'])

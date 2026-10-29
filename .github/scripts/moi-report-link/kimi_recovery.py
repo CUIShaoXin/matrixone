@@ -192,5 +192,11 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
                 attempt['request_timeouts'] = attempt.get('request_timeouts',0)+1
                 saved['status']='request_uncertain';job.journal.save()
                 emit('model_request_recovery', repository=repo, phase=phase, attempt=attempt['number'], same_task=True)
+            if recover_pending_submission and not attempt.get('task_id'):
+                # Lost acknowledgement in this process follows the same read-only
+                # contract as a restart; never call message/send again to find it.
+                recovered_task=read_pending_audit_task(job,key,digest,contract,saved)
+                revalidate=True
+                continue
             time.sleep(poll_seconds)
         raise ValueError('model_phase_deadline_exceeded')

@@ -32,10 +32,44 @@ def fact_timeout(deadline):
     return min(90,remaining)
 
 
+def execution_pages(job,deadline=None):
+    # Small official offset pages avoid the observed 100-row backend timeout.
+    seen=set();expected_total=None
+    for offset in range(0,10000,10):
+        data=job.api.data(job.api.request(WORKFLOWS+'/'+KB_WORKFLOW_ID+'/executions?'+
+                                        urllib.parse.urlencode(dict(offset=offset,limit=10)),
+                                        timeout=min(15,fact_timeout(deadline))))
+        values=data.get('executions',[]);total=data.get('total')
+        if (not isinstance(values,list) or len(values)>10
+                or any(not isinstance(v,dict) or not v.get('execution_id') for v in values)
+                or type(total) is not int or total<offset+len(values)):
+            raise ValueError('knowledge_execution_list_invalid')
+        if expected_total is not None and total!=expected_total:
+            raise ValueError('knowledge_execution_list_changed')
+        expected_total=total
+        ids=[v['execution_id'] for v in values]
+        if len(set(ids))!=len(ids) or seen.intersection(ids):
+            raise ValueError('knowledge_execution_list_changed')
+        seen.update(ids)
+        yield values
+        if offset+len(values)>=total:return
+        if len(values)!=10:raise ValueError('knowledge_execution_list_incomplete')
+    raise ValueError('knowledge_execution_list_incomplete')
+
+
 def execution_facts(job,fid,deadline=None):
     # Verified in the archived workflow.go ListFileExecutions handler: file_id
     # is the query parameter; summaries intentionally do not expose dispatch IDs.
-    data=job.api.data(job.api.request(WORKFLOWS+'/file-executions?'+urllib.parse.urlencode({'file_id':fid}),timeout=fact_timeout(deadline)))
+    try:
+        data=job.api.data(job.api.request(WORKFLOWS+'/file-executions?'+urllib.parse.urlencode({'file_id':fid}),timeout=min(15,fact_timeout(deadline))))
+    except Exception as exc:
+        if not transient(exc):raise
+        # A failed diagnostic read never means no execution exists. Read every
+        # small page before using the same-file facts to authorize recovery.
+        emit('knowledge_execution_small_page_fallback',same_sources=True)
+        facts=[v for page in execution_pages(job,deadline) for v in page
+               if v.get('file_id')==fid and v.get('workflow_id')==KB_WORKFLOW_ID]
+        return facts
     facts=data.get('executions',[])
     if (not isinstance(facts,list) or any(not isinstance(v,dict) for v in facts)
             or data.get('total',len(facts))!=len(facts)):
@@ -50,12 +84,7 @@ def execution_dispatch(job,fid,eid,deadline=None):
     # workflow.go workflowPagination uses offset/limit (not page/page_size).
     # execution.go ExecutionListItem exposes both file_id and dispatch_job_id;
     # GetExecution deliberately strips dispatch_job_id and cannot supply it.
-    for offset in range(0,10000,100):
-        data=job.api.data(job.api.request(WORKFLOWS+'/'+KB_WORKFLOW_ID+'/executions?'+
-                                        urllib.parse.urlencode(dict(offset=offset,limit=100)),timeout=fact_timeout(deadline)))
-        values=data.get('executions',[])
-        if not isinstance(values,list) or any(not isinstance(v,dict) for v in values):
-            raise ValueError('knowledge_execution_list_invalid')
+    for values in execution_pages(job,deadline):
         selected=[v for v in values if v.get('execution_id')==eid]
         if selected:
             if len(selected)!=1:raise ValueError('knowledge_execution_identity_mismatch')
@@ -65,8 +94,6 @@ def execution_dispatch(job,fid,eid,deadline=None):
                     or not value.get('dispatch_job_id')):
                 raise ValueError('knowledge_execution_identity_mismatch')
             return value
-        if offset+len(values)>=data.get('total',offset+len(values)):break
-        if not values:raise ValueError('knowledge_execution_list_incomplete')
     raise ValueError('knowledge_execution_dispatch_unavailable')
 
 
@@ -75,7 +102,10 @@ def lineage_request_id(job,fid,eid):
 
 
 def recover_lineage(job,fid,state,allow_retry=True):
+    from knowledge_save_recovery import recover_save_node, sink_failure
     deadline=state['ingestion_deadline_epoch'] if allow_retry else None
+    if state.get('save_node_recovery'):
+        return recover_save_node(job,fid,state,deadline=deadline)
     facts=execution_facts(job,fid,deadline)
     recovery=state.get('lineage_recovery')
     if recovery:
@@ -112,6 +142,8 @@ def recover_lineage(job,fid,state,allow_retry=True):
     if any(v.get('status') in EXECUTION_ACTIVE for v in facts):return True
     latest=facts[0]
     if latest.get('status') in EXECUTION_SUCCESS:return True
+    if latest.get('status')=='failed' and sink_failure(latest.get('error')):
+        return recover_save_node(job,fid,state,latest,deadline)
     error=re.fullmatch(r'\[moi:data\.lineage\.register\] register lineage for source_file_id '+
                        re.escape(fid)+r': \[1\] Internal Server Error \(request_id: ([0-9a-f-]{36})\)',latest.get('error') or '')
     if latest.get('status')!='failed' or latest.get('execution_mode')!='volume_trigger' or not error:
@@ -197,17 +229,18 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
                     if len(found)>1:emit('knowledge_duplicate_source',count=len(found))
                     if any(v.get('ingest_status')=='succeeded' for v in found):
                         state=saved[fid]
-                        if state.get('lineage_recovery') and not state['lineage_recovery'].get('source_succeeded'):
+                        recovery=state.get('lineage_recovery') or state.get('save_node_recovery')
+                        if recovery and not recovery.get('source_succeeded'):
                             # Success is an actual source fact, even if recovery
                             # metadata is still unavailable or its clock expired.
                             try:recover_lineage(job,fid,state,allow_retry=False)
                             except Exception:emit('knowledge_lineage_success_metadata_unavailable',same_sources=True)
-                            state['lineage_recovery']['source_succeeded']=True
+                            recovery['source_succeeded']=True
                         saved.setdefault(fid,{})['succeeded']=True;continue
                     ready=False;state=saved.setdefault(fid,{})
                     if time.time()>=state['ingestion_deadline_epoch']:
                         raise ValueError('knowledge_ingestion_deadline')
-                    if state.get('lineage_recovery') or (not found and state.get('observed')):
+                    if state.get('lineage_recovery') or state.get('save_node_recovery') or (not found and state.get('observed')):
                         operation='file_execution_facts'
                         recover_lineage(job,fid,state)
                         continue
@@ -282,7 +315,7 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
                                 raise ValueError('knowledge_registration_preview_identity_invalid')
                 job.journal.save()
                 if ready:return
-                if not any(v.get('lineage_recovery') for v in saved.values()) and time.monotonic()-last_reconcile>=60:
+                if not any(v.get('lineage_recovery') or v.get('save_node_recovery') for v in saved.values()) and time.monotonic()-last_reconcile>=60:
                     operation='source_jobs'
                     jobs=job.api.data(job.api.request('/semantic-models/80001/source-jobs',timeout=90))
                     # A conflict is an uncertain dispatch; cool down before observing again.
@@ -316,6 +349,16 @@ def audit(job,targets,label):
     # A semantic model ID is not a Catalog volume ID. The optional volume
     # filter silently excludes every source when the two are confused.
     prompt+='\n知识库semantic_model_id为80001；它不是volume_id。search_rag_chunks必须省略volume_id，只传file_ids=[目标file_id]、keywords=[目标marker]、max_hits=1、max_rows=1。禁止把80001填入volume_id。read_artifact才使用semantic_model_id=80001。按目标依次完成search→完整read→select；零命中立即结束并如实报告失败，不循环猜测编号或等待。完成工具核验后立即结束，不需要长篇解释。'
+    legacy_phase='kb_'+label+'_scope_v2'
+    # Existing requests keep their exact immutable v2 prompt and context. Only
+    # new phases get the unambiguous final-source-set contract.
+    legacy=repo+'_'+legacy_phase in job.state.get('model_tasks',{})
+    phase=legacy_phase if legacy else 'kb_'+label+'_scope_v3'
+    if not legacy:
+        prompt=prompt.replace('然后实际调用select_final_sources，选择同一file_id、chunk_id和artifact_id，必须返回accepted=true。',
+                              '记录每个目标核实后的file_id、chunk_id和artifact_id。')
+        prompt=prompt.replace('按目标依次完成search→完整read→select；',
+                              '按目标依次完成search→必要时完整read；全部目标均已核实后，只调用一次select_final_sources，sources数组必须同时包含全部目标的准确file_id、chunk_id、artifact_id，必须返回accepted=true。不得分别选择单个目标，也不得在最终汇总选择之后再选择子集；')
     context=json.dumps(targets,sort_keys=True)
     def parser(task):
         calls=llm_calls(task)
@@ -323,5 +366,5 @@ def audit(job,targets,label):
             raise ValueError('knowledge_actual_kimi_missing')
         return verify_rag(task,targets)
     # Retain the prior incorrect-scope task and its original inference budget.
-    return run_review(job,repo,'kb_'+label+'_scope_v2',context,prompt,parser,deadline_seconds=1200,
+    return run_review(job,repo,phase,context,prompt,parser,deadline_seconds=1200,
                       recover_empty_runtime_failure=True,recover_pending_submission=True)

@@ -72,8 +72,10 @@ def main():
         api=DailyAPI(os.environ['MOI_API_KEY']);objects=preflight.Objects.from_workspace(api)
         if mode == 'maintenance':
             from workflow_lifecycle import probe
+            from reliability_checks import knowledge_probe
             status.update(probe(api, objects, date, run_id), status='passed',
                           seconds=round(time.monotonic()-start,3))
+            status.update(knowledge_probe(api,objects,date,run_id),seconds=round(time.monotonic()-start,3))
             (out/'status.json').write_bytes(json_bytes(status))
             print(json.dumps(status), flush=True)
             return 0
