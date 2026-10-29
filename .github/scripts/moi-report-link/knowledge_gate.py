@@ -323,4 +323,5 @@ def audit(job,targets,label):
             raise ValueError('knowledge_actual_kimi_missing')
         return verify_rag(task,targets)
     # Retain the prior incorrect-scope task and its original inference budget.
-    return run_review(job,repo,'kb_'+label+'_scope_v2',context,prompt,parser,deadline_seconds=1200,recover_empty_runtime_failure=True)
+    return run_review(job,repo,'kb_'+label+'_scope_v2',context,prompt,parser,deadline_seconds=1200,
+                      recover_empty_runtime_failure=True,recover_pending_submission=True)

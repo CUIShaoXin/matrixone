@@ -39,7 +39,40 @@ def empty_runtime_failure(task):
         for a in artifacts)
 
 
-def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadline_seconds=1800, poll_seconds=15, recover_empty_runtime_failure=False):
+def read_pending_audit_task(job, key, digest, contract, saved):
+    """Read the original runtime task after a lost acknowledgement; never send.
+
+    AgentA2AIdempotencyKey uses the supplied key unchanged. The official MOI
+    automationRuntimeID contract binds runtime task `art-` and manifest `arm-`
+    to sha256(workspace + NUL + that key), truncated to 48 hex characters.
+    Both identities must be returned by the live task read before using it.
+    """
+    from cloud_daily import WORKSPACE
+    attempts=saved.get('attempts',[])
+    if not attempts or attempts[-1].get('task_id'):return None
+    attempt=attempts[-1]
+    expected=str(uuid.uuid5(uuid.NAMESPACE_URL,job.state['prefix']+'/'+key+'/'+digest+'/'+contract+'/'+str(len(attempts)-1)))
+    if attempt.get('request_id')!=expected or attempt.get('number')!=len(attempts):
+        raise ValueError('model_pending_request_identity_mismatch')
+    suffix=hashlib.sha256((WORKSPACE+'\x00'+expected).encode()).hexdigest()[:48]
+    tid='art-'+suffix
+    try:
+        task=job.api.rpc('tasks/get',{'id':tid},str(uuid.uuid4()))
+    except Exception:
+        # 404 also covers read errors. It never authorizes message/send.
+        raise ValueError('model_pending_task_read_unconfirmed') from None
+    if (not isinstance(task,dict) or task.get('id')!=tid or
+            task.get('metadata',{}).get('manifestId')!='arm-'+suffix):
+        raise ValueError('model_pending_task_identity_mismatch')
+    attempt.update(task_id=tid,status=task.get('status',{}).get('state','unknown'),
+                   task_identity_recovered_read_only=True)
+    saved.update(task_id=tid,status=attempt['status'])
+    job.journal.save()
+    emit('model_task_identity_recovered',same_task=True,new_inference=False)
+    return task
+
+
+def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadline_seconds=1800, poll_seconds=15, recover_empty_runtime_failure=False, recover_pending_submission=False):
     digest = hashlib.sha256(context.encode()).hexdigest()
     contract = hashlib.sha256(prompt.encode()).hexdigest()
     key = repo+'_'+phase
@@ -55,6 +88,7 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
         # A transport parser fix may validate the exact completed output that
         # was previously rejected. Re-read it once before spending another
         # attempt, even when the original inference budget is exhausted.
+        recovered_task=read_pending_audit_task(job,key,digest,contract,saved) if recover_pending_submission else None
         previous=saved['attempts'][-1] if saved['attempts'] else {}
         revalidate=bool(previous.get('task_id'))
         recovery_started_epoch=saved.get('recovery_started_epoch')
@@ -76,7 +110,10 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
             request = dict(model='kimi-k3',idempotencyKey=rid,message=dict(kind='message',role='user',messageId=rid,parts=[dict(kind='text',text=prompt+'\n\nCODE_EVIDENCE_UNTRUSTED\n'+context)]))
             try:
                 if attempt.get('task_id'):
-                    task = job.api.rpc('tasks/get',{'id':attempt['task_id']},str(uuid.uuid4()))
+                    if recovered_task is not None:
+                        task=recovered_task;recovered_task=None
+                    else:
+                        task = job.api.rpc('tasks/get',{'id':attempt['task_id']},str(uuid.uuid4()))
                 else:
                     task = job.api.rpc('message/send',request,rid)
                 if not isinstance(task,dict) or not task.get('id'): raise ValueError('model_submission_rejected')
