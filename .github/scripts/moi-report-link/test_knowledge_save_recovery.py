@@ -31,7 +31,7 @@ class SaveAPI(FakeAPI):
                          mode='rerun_current_and_downstream',new_workflow_execution_id=NEW,status='succeeded')
         self.prior=[];self.hide_branch=False;self.bad_ack=False
 
-    def request(self,path,payload=None,method=None,timeout=None):
+    def request(self,path,payload=None,method=None,timeout=None,retry=True):
         route=kb.WORKFLOWS+'/'+kb.KB_WORKFLOW_ID+'/executions/'
         if path.startswith(route):
             self.calls.append((path,copy.deepcopy(payload),method))
@@ -55,7 +55,7 @@ class SaveAPI(FakeAPI):
                 return dict(reruns=self.prior+([self.branch] if self.commits and not self.hide_branch else []))
             if tail==OLD+'/reruns/rerun-1':return dict(rerun=self.branch)
             raise AssertionError(path)
-        return super().request(path,payload,method,timeout)
+        return super().request(path,payload,method,timeout,retry)
 
 
 class SaveRecoveryTests(unittest.TestCase):

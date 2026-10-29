@@ -38,7 +38,7 @@ def execution_pages(job,deadline=None):
     for offset in range(0,10000,10):
         data=job.api.data(job.api.request(WORKFLOWS+'/'+KB_WORKFLOW_ID+'/executions?'+
                                         urllib.parse.urlencode(dict(offset=offset,limit=10)),
-                                        timeout=min(15,fact_timeout(deadline))))
+                                        timeout=min(15,fact_timeout(deadline)),retry=False))
         values=data.get('executions',[]);total=data.get('total')
         if (not isinstance(values,list) or len(values)>10
                 or any(not isinstance(v,dict) or not v.get('execution_id') for v in values)
@@ -61,7 +61,7 @@ def execution_facts(job,fid,deadline=None):
     # Verified in the archived workflow.go ListFileExecutions handler: file_id
     # is the query parameter; summaries intentionally do not expose dispatch IDs.
     try:
-        data=job.api.data(job.api.request(WORKFLOWS+'/file-executions?'+urllib.parse.urlencode({'file_id':fid}),timeout=min(15,fact_timeout(deadline))))
+        data=job.api.data(job.api.request(WORKFLOWS+'/file-executions?'+urllib.parse.urlencode({'file_id':fid}),timeout=min(15,fact_timeout(deadline)),retry=False))
     except Exception as exc:
         if not transient(exc):raise
         # A failed diagnostic read never means no execution exists. Read every
@@ -190,10 +190,10 @@ def recover_lineage(job,fid,state,allow_retry=True):
     return True
 
 
-def rows(api):
+def rows(api,deadline=None):
     values=[]
     for page in range(1,101):
-        data=api.data(api.request('/semantic-models/80001/sources?page='+str(page)+'&page_size=100',timeout=90))
+        data=api.data(api.request('/semantic-models/80001/sources?page='+str(page)+'&page_size=100',timeout=min(30,fact_timeout(deadline)),retry=False))
         current=data.get('items',data.get('sources',[]));values.extend(current)
         if len(current)<100:return values
     raise ValueError('knowledge_pagination_incomplete')
@@ -220,7 +220,10 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
         while time.monotonic()-start<deadline_seconds:
             operation='source_inventory'
             try:
-                inventory=rows(job.api);ready=True
+                # One bounded initial inventory still allows already-successful
+                # sources to be revalidated after a historical deadline.
+                inventory_deadline=max(time.time()+30,min(saved[fid]['ingestion_deadline_epoch'] for fid in pending_fids))
+                inventory=rows(job.api,inventory_deadline);ready=True
                 pending_fids={a['file_id'] for a in artifacts
                               if not any(v.get('ingest_status')=='succeeded' for v in matching(inventory,a['file_id']))}
                 for artifact in artifacts:

@@ -203,12 +203,12 @@ def extract_manifests(raw, proof):
 
 
 class DailyAPI(publication.ReportAPI):
-    def request(self,path,payload=None,method=None,timeout=35):
+    def request(self,path,payload=None,method=None,timeout=35,retry=True):
         read_only=(method or ('GET' if payload is None else 'POST'))=='GET' or path=='/connectors/get'
         operation=('knowledge_sources' if path.startswith('/semantic-models/80001/sources') else
                    'knowledge_reconcile' if path=='/semantic-models/80001/source-jobs/reconcile' else
                    'knowledge_jobs' if path.startswith('/semantic-models/80001/source-jobs') else 'other_catalog')
-        for attempt in range(3 if read_only else 1):
+        for attempt in range(3 if read_only and retry else 1):
             try:
                 with span('moi_catalog_read' if read_only else 'moi_catalog_mutation',attempt=attempt+1,operation=operation):
                     return super().request(path,payload,method,timeout)
@@ -216,7 +216,7 @@ class DailyAPI(publication.ReportAPI):
                 if re.fullmatch('moi_http_[0-9]{3}',str(exc)):
                     emit('moi_catalog_http_error',operation=operation,http_status=int(str(exc)[-3:]),read_only=read_only)
                 transient=isinstance(exc,(TimeoutError,urllib.error.URLError,ConnectionError)) or str(exc) in ('moi_http_429','moi_http_500','moi_http_502','moi_http_503','moi_http_504')
-                if not read_only or not transient or attempt==2:raise
+                if not read_only or not retry or not transient or attempt==2:raise
                 emit('moi_read_recovery',attempt=attempt+1)
                 time.sleep(2**attempt)
 

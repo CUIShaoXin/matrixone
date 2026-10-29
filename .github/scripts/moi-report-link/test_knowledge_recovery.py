@@ -56,7 +56,7 @@ class FakeAPI:
         self.read_fault=None;self.on_list=None
     @staticmethod
     def data(value):return value
-    def request(self,path,payload=None,method=None,timeout=None):
+    def request(self,path,payload=None,method=None,timeout=None,retry=True):
         self.calls.append((path,copy.deepcopy(payload),method))
         route=urlsplit(path);query=parse_qs(route.query)
         if payload is not None:

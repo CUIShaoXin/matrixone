@@ -28,7 +28,7 @@ def recover_save_node(job,fid,state,latest=None,deadline=None):
     recovery=state.get('save_node_recovery')
 
     def read(path):
-        return job.api.data(job.api.request(path,timeout=min(15,fact_timeout(deadline))))
+        return job.api.data(job.api.request(path,timeout=min(15,fact_timeout(deadline)),retry=False))
 
     def execution(path,eid):
         value=read(path).get('execution',{})

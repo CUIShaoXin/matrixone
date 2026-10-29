@@ -6,7 +6,20 @@ import time
 from cloud_daily import Journal,require
 from daily_delivery import read_json,checked_file
 from api_port_review import Job
-from knowledge_gate import audit,ensure_sources,execution_facts,EXECUTION_SUCCESS
+from knowledge_gate import audit,ensure_sources,execution_pages,EXECUTION_SUCCESS,KB_WORKFLOW_ID
+
+
+def observed_file_execution(job,fid,deadline):
+    # This read-only smoke check needs one matching successful execution, not a
+    # complete history of every file in the KB. It never authorizes a retry.
+    for values in execution_pages(job,deadline):
+        selected=[v for v in values if v.get('file_id')==fid]
+        if selected:
+            value=selected[0]
+            require(value.get('workflow_id')==KB_WORKFLOW_ID and value.get('dispatch_job_id')
+                    and value.get('status') in EXECUTION_SUCCESS,'maintenance_execution_not_successful')
+            return value
+    raise ValueError('maintenance_execution_not_found')
 
 
 def knowledge_probe(api,objects,date,run_id):
@@ -34,12 +47,11 @@ def knowledge_probe(api,objects,date,run_id):
     job=Job(api,objects,journal,Path('out/knowledge-maintenance'))
     reads=[]
     for item in artifacts:
-        start=time.monotonic();facts=execution_facts(job,item['file_id'],time.time()+120)
-        require(any(v.get('status') in EXECUTION_SUCCESS for v in facts),'maintenance_execution_not_successful')
+        start=time.monotonic();observed_file_execution(job,item['file_id'],time.time()+120)
         reads.append(round(time.monotonic()-start,3))
     ensure_sources(job,artifacts)
     proof=audit(job,targets,'maintenance_multifile')
     job.store('knowledge-proof.json',proof)
     return dict(kb_contract_check_available=True,kb_multifile_v3_verified=True,
-                kb_execution_facts_verified=True,kb_fact_read_seconds=reads,
+                kb_observed_execution_verified=True,kb_execution_read_seconds=reads,
                 original_daily_unchanged=True,no_group_send=True)
