@@ -344,6 +344,13 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
 
 
 def audit(job,targets,label):
+    repo=sorted(job.state['commits'])[0]
+    existing=job.state.get('model_tasks',{})
+    # Preserve every previously submitted native-tool contract. New turns use
+    # a deterministic CLI command and authoritative native citation receipts.
+    if not any(repo+'_kb_'+label+suffix in existing for suffix in ('_scope_v2','_scope_v3')):
+        from knowledge_cli_gate import audit as cli_audit
+        return cli_audit(job,targets,label)
     from cloud_daily import verify_rag
     from kimi_recovery import run_review
     from api_port_review import llm_calls

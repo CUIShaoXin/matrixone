@@ -25,12 +25,12 @@ class AuditContractTests(unittest.TestCase):
         api=Model([dict(id='t1',status={'state':'completed'}),dict(id='t1',status={'state':'completed'})])
         job=Job(api);targets=[dict(file_id='one',marker='first'),dict(file_id='two',marker='second')]
         with patch('api_port_review.llm_calls',return_value=[dict(model='kimi-k3',status='completed')]),\
-             patch('cloud_daily.verify_rag',return_value='verified'):
+             patch('knowledge_cli_gate.verify',return_value='verified'):
             self.assertEqual(audit(job,targets,'files'),'verified')
             self.assertEqual(audit(job,targets,'files'),'verified')
-        self.assertIn('repo_kb_files_scope_v3',job.state['model_tasks'])
+        self.assertIn('repo_kb_files_scope_cli_v1',job.state['model_tasks'])
         self.assertNotIn('repo_kb_files_scope_v2',job.state['model_tasks'])
-        self.assertNotEqual(job.state['model_tasks']['repo_kb_files_scope_v3']['contract_sha256'],LEGACY_HASH)
+        self.assertNotEqual(job.state['model_tasks']['repo_kb_files_scope_cli_v1']['contract_sha256'],LEGACY_HASH)
         self.assertEqual([r[0] for r in api.requests],['message/send','tasks/get'])
 
 

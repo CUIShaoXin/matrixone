@@ -70,7 +70,7 @@ def checked_file(api, artifact):
 def final_kb_task(tasks,commits):
     repo=sorted(commits)[0]
     values=[v for k,v in tasks.items() if k in
-            (repo+'_kb_final_report_scope_v2',repo+'_kb_final_report_scope_v3')]
+            (repo+'_kb_final_report_scope_v2',repo+'_kb_final_report_scope_v3',repo+'_kb_final_report_scope_cli_v1')]
     require(len(values)==1 and values[0].get('task_id'),'delivery_final_kb_task_missing')
     return values[0]
 

@@ -131,6 +131,10 @@ def merge_advisories(ids, groups):
 
 def verify_rag(audit, targets):
     require(audit.get("status", {}).get("state") == "completed", "rag_audit_not_completed")
+    from knowledge_cli_gate import matches as cli_matches, events as cli_events, verify as verify_cli
+    cli_calls,_=cli_events(audit)
+    if any(cli_matches(c,targets) for c in cli_calls.values()):
+        return verify_cli(audit,targets)
     calls, results = {}, {}
     def walk(value):
         if isinstance(value, dict):
