@@ -10,6 +10,47 @@ import time
 import urllib.parse
 
 
+def document_segments(read, sid, fid):
+    """Read the official cursor API without accepting a partial/changing snapshot."""
+    route='/semantic-models/80001/sources/'+urllib.parse.quote(sid,safe='')+'/document'
+    document=read(route)
+    segments=[];seen=set();cursors=set();etag=None;total=None;pages=0
+    while True:
+        pages+=1
+        ds=document.get('source',{});status=document.get('segment_status',{})
+        if (ds.get('model_id')!=80001 or ds.get('source_id')!=sid or ds.get('source_file_id')!=fid
+                or ds.get('kb_file_id')!=fid or ds.get('effective_enabled') is not True
+                or document.get('preview',{}).get('available') is not True
+                or status.get('available') is not True):
+            raise ValueError('knowledge_materialization_document_identity_mismatch')
+        if pages==1:
+            total=status.get('total');etag=document.get('etag')
+            if type(total) is not int or total<=0:
+                raise ValueError('knowledge_materialization_document_incomplete')
+        elif status.get('total')!=total or document.get('etag')!=etag:
+            raise ValueError('knowledge_materialization_document_snapshot_changed')
+        current=document.get('segments',[])
+        if not isinstance(current,list) or not current:
+            raise ValueError('knowledge_materialization_document_incomplete')
+        for segment in current:
+            identity=segment.get('segment_id')
+            if not isinstance(identity,str) or not identity or identity in seen:
+                raise ValueError('knowledge_materialization_duplicate_or_missing_segment')
+            seen.add(identity);segments.append(segment)
+        cursor=status.get('next_cursor')
+        if len(segments)>total:
+            raise ValueError('knowledge_materialization_document_incomplete')
+        if not cursor:
+            if len(segments)!=total:
+                raise ValueError('knowledge_materialization_document_incomplete')
+            return segments,etag,pages
+        if (not isinstance(cursor,str) or cursor in cursors or not etag
+                or len(segments)>=total or pages>=1000):
+            raise ValueError('knowledge_materialization_document_cursor_invalid')
+        cursors.add(cursor)
+        document=read(route+'?'+urllib.parse.urlencode(dict(page_size=100,cursor=cursor)))
+
+
 def verify(job,artifact,target,found,registration_volume_id):
     from knowledge_gate import KB_WORKFLOW_ID,WORKFLOWS,execution_facts,EXECUTION_ACTIVE,EXECUTION_SUCCESS
     fid=artifact['file_id']
@@ -55,16 +96,7 @@ def verify(job,artifact,target,found,registration_volume_id):
     if not marker or marker.encode() not in raw:raise ValueError('knowledge_materialization_marker_mismatch')
     sid=source.get('source_id')
     if not sid:raise ValueError('knowledge_materialization_source_identity_missing')
-    document=read('/semantic-models/80001/sources/'+urllib.parse.quote(sid,safe='')+'/document')
-    ds=document.get('source',{})
-    if (ds.get('model_id')!=80001 or ds.get('source_id')!=sid or ds.get('source_file_id')!=fid
-            or ds.get('kb_file_id')!=fid or ds.get('effective_enabled') is not True
-            or document.get('preview',{}).get('available') is not True
-            or document.get('segment_status',{}).get('available') is not True):
-        raise ValueError('knowledge_materialization_document_identity_mismatch')
-    segments=document.get('segments',[])
-    if not segments or document['segment_status'].get('total')!=len(segments):
-        raise ValueError('knowledge_materialization_document_incomplete')
+    segments,etag,pages=document_segments(read,sid,fid)
     hits=[s for s in segments if s.get('enabled') is True and marker in s.get('content','')
           and s.get('chunk_id') and str(s.get('metadata',{}).get('volume_id'))==str(registration_volume_id)]
     if not hits:raise ValueError('knowledge_materialization_marker_missing')
@@ -72,7 +104,7 @@ def verify(job,artifact,target,found,registration_volume_id):
                 original_source_projection=status,source_projection_repaired=False,
                 execution_id=eid,workflow_id=KB_WORKFLOW_ID,
                 artifact_sha256=artifact['sha256'],marker=marker,
-                vector_asset_id=no['vector_asset_id'],document_etag=document.get('etag'),
-                segment_count=len(segments),marker_chunk_ids=[s['chunk_id'] for s in hits],
+                vector_asset_id=no['vector_asset_id'],document_etag=etag,
+                segment_count=len(segments),document_pages=pages,marker_chunk_ids=[s['chunk_id'] for s in hits],
                 native_retrieval_and_citation_still_required=True,
                 checked_at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
