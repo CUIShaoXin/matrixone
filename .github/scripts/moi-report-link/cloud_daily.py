@@ -585,7 +585,7 @@ class Runner:
         self.state.setdefault("commits",{name:proof["commit"] for name,proof in self.state.get("archives",{}).items()})
         job=Job(self.api,self.objects,self.journal,Path("out/knowledge"))
         artifacts=[saved["knowledge_index"],saved["artifacts"]["employee"]]
-        ensure_sources(job,artifacts,registration_volume_id=140002)
+        ensure_sources(job,artifacts,registration_volume_id=140002,targets=targets)
         saved["rag_proof"]=audit(job,targets,tag);self.journal.save()
 
     @timed("component_publish")

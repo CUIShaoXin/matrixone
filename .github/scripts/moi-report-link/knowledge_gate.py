@@ -203,7 +203,7 @@ def matching(allrows,fid):
     return [r for r in allrows if fid in (r.get('source_file_id'),r.get('kb_file_id'),r.get('source_id'))]
 
 
-def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_visibility_grace_seconds=600,registration_volume_id=None):
+def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_visibility_grace_seconds=600,registration_volume_id=None,targets=None):
     with KB_LOCK,span('knowledge_ingestion'):
         saved=job.state.setdefault('knowledge_registration',{})
         start=time.monotonic();seen_rounds={};last_reconcile=start-60
@@ -240,7 +240,21 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
                             except Exception:emit('knowledge_lineage_success_metadata_unavailable',same_sources=True)
                             recovery['source_succeeded']=True
                         saved.setdefault(fid,{})['succeeded']=True;continue
-                    ready=False;state=saved.setdefault(fid,{})
+                    state=saved.setdefault(fid,{})
+                    target=next((t for t in targets or [] if t.get('file_id')==fid),None)
+                    # A completed original ingestion can be revalidated after
+                    # its old clock expired. This does not reset that clock or
+                    # turn a pending backend projection into a succeeded fact.
+                    if target and found:
+                        from knowledge_materialization import verify as verify_materialization
+                        proof=verify_materialization(job,artifact,target,found,registration_volume_id)
+                        if proof:
+                            state['materialized_readback']=proof
+                            pending_fids.discard(fid)
+                            emit('knowledge_materialized_source_verified',same_sources=True,
+                                 projection_status=proof['original_source_projection'])
+                            continue
+                    ready=False
                     if time.time()>=state['ingestion_deadline_epoch']:
                         raise ValueError('knowledge_ingestion_deadline')
                     if state.get('lineage_recovery') or state.get('save_node_recovery') or (not found and state.get('observed')):
