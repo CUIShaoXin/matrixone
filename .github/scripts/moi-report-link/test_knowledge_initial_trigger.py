@@ -122,4 +122,11 @@ class InitialTriggerTests(unittest.TestCase):
         self.run_recovery();self.state['initial_trigger']['file_id']='wrong'
         with self.assertRaisesRegex(ValueError,'checkpoint_identity_mismatch'):self.run_recovery()
         self.assertEqual(len(self.posts),1)
+    def test_first_processing_reservation_cannot_hide_later_real_failure(self):
+        self.run_recovery();self.found[0]['ingest_status']='failed'
+        self.assertFalse(self.run_recovery());self.assertEqual(len(self.posts),1)
+    def test_original_deadline_cannot_be_refreshed_after_reservation(self):
+        self.run_recovery();self.state['ingestion_deadline_epoch']=3000
+        with self.assertRaisesRegex(ValueError,'checkpoint_identity_mismatch'):self.run_recovery()
+        self.assertEqual(len(self.posts),1)
 if __name__=='__main__':unittest.main()

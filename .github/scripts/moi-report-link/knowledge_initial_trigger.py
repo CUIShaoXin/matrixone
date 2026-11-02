@@ -51,12 +51,19 @@ def recover(job, artifact, target, found, state, volume_id):
                 or previous.get('artifact_sha256') != artifact.get('sha256')
                 or previous.get('workflow_id') != KB_WORKFLOW_ID
                 or previous.get('attempts') != 1
+                or previous.get('original_ingestion_deadline_epoch') != deadline
                 or previous.get('request') != dict(volume_id=volume_id, file_ids=[fid])):
             raise ValueError('knowledge_initial_checkpoint_identity_mismatch')
         # A durable reservation consumes permission even if the process stopped
         # before POST. Normal materialization/fact reads observe the original.
         if previous.get('status') == 'rejected':
             raise ValueError('knowledge_initial_trigger_rejected')
+        if previous.get('status') not in ('acknowledged', 'submission_unknown'):
+            raise ValueError('knowledge_initial_checkpoint_identity_mismatch')
+        # A real failed projection remains subject to the original exact
+        # lineage/save-node recovery policy; this reservation cannot hide it.
+        if any(v.get('ingest_status') == 'failed' for v in found):
+            return False
         return True
     if (volume_id != 140002 or not target or target.get('file_id') != fid
             or not target.get('marker') or not same_source(found, fid)
@@ -119,7 +126,7 @@ def recover(job, artifact, target, found, state, volume_id):
         created, existing = create_once(job.objects, key, reservation)
     except Exception:
         raise ValueError('knowledge_initial_reservation_unconfirmed') from None
-    for k in ('schema', 'file_id', 'artifact_sha256', 'workflow_id', 'request', 'attempts'):
+    for k in ('schema', 'file_id', 'artifact_sha256', 'workflow_id', 'request', 'attempts', 'original_ingestion_deadline_epoch'):
         if existing.get(k) != reservation[k]:
             raise ValueError('knowledge_initial_reservation_identity_mismatch')
     state['initial_trigger'] = dict(existing)
