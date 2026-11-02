@@ -215,6 +215,7 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
             state=saved.setdefault(artifact['file_id'],{})
             if 'ingestion_deadline_epoch' not in state:
                 first=min([time.time()]+[state[k] for k in ('missing_runtime_first_observed_epoch','active_dispatch_first_observed_epoch') if k in state])
+                state['ingestion_started_epoch']=first
                 state['ingestion_deadline_epoch']=first+deadline_seconds;new_budget=True
         if new_budget:job.journal.save()
         while time.monotonic()-start<deadline_seconds:
@@ -263,6 +264,11 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
                         continue
                     if found:
                         state['observed']=True
+                        if target and registration_volume_id:
+                            from knowledge_initial_trigger import recover as recover_initial
+                            operation='initial_file_processing'
+                            if recover_initial(job,artifact,target,found,state,registration_volume_id):
+                                continue
                         if all(v.get('ingest_status')=='failed' for v in found):
                             if not state.get('failure_evidence_recorded'):
                                 state['failure_evidence']=job.store('knowledge-failure-'+fid+'.json',found)
@@ -270,7 +276,7 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
                                 state['failure_evidence_recorded']=True
                                 job.journal.save()
                             operation='source_jobs'
-                            jobs=job.api.data(job.api.request('/semantic-models/80001/source-jobs',timeout=90))
+                            jobs=job.api.data(job.api.request('/semantic-models/80001/source-jobs',timeout=min(15,fact_timeout(state['ingestion_deadline_epoch'])),retry=False))
                             active=[v for v in jobs.get('items',[]) if fid in (v.get('source_file_id'),v.get('kb_file_id')) and v.get('job_status') in ('pending','queued','running')]
                             if not active:
                                 operation='file_execution_facts'
@@ -332,11 +338,11 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
                                 raise ValueError('knowledge_registration_preview_identity_invalid')
                 job.journal.save()
                 if ready:return
-                if not any(v.get('lineage_recovery') or v.get('save_node_recovery') for v in saved.values()) and time.monotonic()-last_reconcile>=60:
+                if not any(v.get('lineage_recovery') or v.get('save_node_recovery') or v.get('initial_trigger') for v in saved.values()) and time.monotonic()-last_reconcile>=60:
                     operation='source_jobs'
-                    jobs=job.api.data(job.api.request('/semantic-models/80001/source-jobs',timeout=90))
                     # A conflict is an uncertain dispatch; cool down before observing again.
                     last_reconcile=time.monotonic()
+                    jobs=job.api.data(job.api.request('/semantic-models/80001/source-jobs',timeout=min(15,fact_timeout(min(saved[fid]['ingestion_deadline_epoch'] for fid in pending_fids))),retry=False))
                     if jobs.get('reconcile_required'):
                         operation='source_jobs_reconcile'
                         job.api.request('/semantic-models/80001/source-jobs/reconcile',{},method='POST',timeout=90)
