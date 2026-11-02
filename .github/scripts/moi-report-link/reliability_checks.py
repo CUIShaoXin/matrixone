@@ -6,7 +6,7 @@ import time
 from cloud_daily import Journal,require
 from daily_delivery import read_json,checked_file
 from api_port_review import Job
-from knowledge_gate import audit,ensure_sources,execution_pages,EXECUTION_SUCCESS,KB_WORKFLOW_ID
+from knowledge_gate import audit,ensure_sources,execution_pages,EXECUTION_SUCCESS,KB_WORKFLOW_ID,WORKFLOWS,fact_timeout
 
 
 def observed_file_execution(job,fid,deadline):
@@ -16,8 +16,25 @@ def observed_file_execution(job,fid,deadline):
         selected=[v for v in values if v.get('file_id')==fid]
         if selected:
             value=selected[0]
-            require(value.get('workflow_id')==KB_WORKFLOW_ID and value.get('dispatch_job_id')
+            require(value.get('workflow_id')==KB_WORKFLOW_ID and value.get('file_id')==fid
+                    and value.get('execution_mode') in ('volume_trigger','task_by_version')
                     and value.get('status') in EXECUTION_SUCCESS,'maintenance_execution_not_successful')
+            # Manual native delivery has no volume-dispatch job ID. This is a
+            # read-only proof; bind it to the actual original execution input
+            # rather than requiring a correlation field belonging to another
+            # scheduling mechanism.
+            actual=job.api.data(job.api.request(WORKFLOWS+'/'+KB_WORKFLOW_ID+'/executions/'+value['execution_id'],timeout=min(15,fact_timeout(deadline)),retry=False))['execution']
+            require(actual.get('execution_id')==value['execution_id']
+                    and actual.get('workflow_id')==KB_WORKFLOW_ID
+                    and actual.get('status') in EXECUTION_SUCCESS
+                    and actual.get('input_payload',{}).get('file_id')==fid
+                    and actual.get('input_payload',{}).get('volume_id')==140002,
+                    'maintenance_execution_not_successful')
+            if value.get('execution_mode')=='task_by_version':
+                require(actual.get('execution_mode')=='task_by_version'
+                        and actual.get('input_payload',{}).get('source_type')=='volume_trigger'
+                        and actual.get('input_payload',{}).get('workflow_app_id')==KB_WORKFLOW_ID,
+                        'maintenance_execution_not_successful')
             return value
     raise ValueError('maintenance_execution_not_found')
 
@@ -49,7 +66,7 @@ def knowledge_probe(api,objects,date,run_id):
     for item in artifacts:
         start=time.monotonic();observed_file_execution(job,item['file_id'],time.time()+120)
         reads.append(round(time.monotonic()-start,3))
-    ensure_sources(job,artifacts)
+    ensure_sources(job,artifacts,registration_volume_id=140002,targets=targets)
     proof=audit(job,targets,'maintenance_multifile')
     job.store('knowledge-proof.json',proof)
     return dict(kb_contract_check_available=True,kb_multifile_v3_verified=True,
