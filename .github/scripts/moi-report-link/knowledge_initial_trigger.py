@@ -145,3 +145,54 @@ def recover(job, artifact, target, found, state, volume_id):
     job.journal.save()
     emit('knowledge_initial_trigger_acknowledged', same_sources=True, attempts=1)
     return True
+
+
+def probe(api, objects, date, run_id):
+    """Actual cloud save -> original-file processing -> native Kimi citation."""
+    from pathlib import Path
+    from cloud_daily import Journal, Runner
+    from api_port_review import Job
+    from daily_delivery import read_json
+    from knowledge_gate import ensure_sources, audit, execution_facts, KB_WORKFLOW_ID, WORKFLOWS
+    pointer = read_json(objects, 'daily/' + date.replace('-', '') + '/ready.json', missing=True)
+    if pointer is None:
+        return dict(kb_initial_processing_check_available=False, no_group_send=True)
+    if pointer.get('date') != date or pointer.get('scope') != 'three-repositories':
+        raise ValueError('knowledge_initial_probe_ready_identity_mismatch')
+    prefix = 'receipts/' + date.replace('-', '') + '/kb-initial-processing-check-' + run_id
+    journal = Journal(objects, prefix + '/checkpoint.json', dict(date=date,
+        scope='knowledge-initial-processing-check', run_id=run_id, prefix=prefix,
+        commits=pointer['commits'], issues=[], events=[]))
+    marker = 'MATRIX-KB-INITIAL-CHECK-' + date.replace('-', '') + '-' + run_id
+    text = ('# Matrix daily pipeline readiness check\n\n' + marker + '\n\n'
+            'This is a bounded automatic ingestion check, not a security finding or daily report.\n')
+    runner = Runner(api, objects, journal)
+    outputs = runner.workflow('knowledge_initial_processing_probe', [runner.sink(
+        'probe', text, 'matrix-kb-initial-check-' + run_id + '.md', volume=140002, fmt='markdown')])
+    artifact, raw = outputs['probe']
+    if raw != text.encode() or journal.value['stages']['knowledge_initial_processing_probe']['cleanup'].get('status') != 'deleted':
+        raise ValueError('knowledge_initial_probe_save_or_cleanup_invalid')
+    job = Job(api, objects, journal, Path('out/knowledge-initial-check'))
+    target = dict(file_id=artifact['file_id'], marker=marker)
+    started = time.monotonic()
+    ensure_sources(job, [artifact], deadline_seconds=600, poll_seconds=5,
+        registration_volume_id=140002, targets=[target])
+    facts = execution_facts(job, artifact['file_id'], time.time() + 30)
+    if (len(facts) != 1 or facts[0].get('status') not in ('completed', 'success', 'succeeded')
+            or facts[0].get('workflow_id') != KB_WORKFLOW_ID):
+        raise ValueError('knowledge_initial_probe_execution_invalid')
+    actual = api.data(api.request(WORKFLOWS + '/' + KB_WORKFLOW_ID + '/executions/' + facts[0]['execution_id'], timeout=15, retry=False))['execution']
+    if (actual.get('input_payload', {}).get('file_id') != artifact['file_id']
+            or actual.get('input_payload', {}).get('volume_id') != 140002):
+        raise ValueError('knowledge_initial_probe_execution_invalid')
+    native = audit(job, [target], 'initial_processing_check')
+    job.store('knowledge-initial-processing-proof.json', native)
+    recovery = journal.value['knowledge_registration'][artifact['file_id']].get('initial_trigger')
+    if recovery and (recovery.get('status') != 'acknowledged' or recovery.get('attempts') != 1):
+        raise ValueError('knowledge_initial_probe_recovery_not_acknowledged')
+    return dict(kb_initial_processing_check_available=True,
+        kb_initial_processing_verified=True, kb_initial_trigger_recovery_used=bool(recovery),
+        kb_initial_trigger_attempts=1 if recovery else 0, kb_initial_probe_execution_id=facts[0]['execution_id'],
+        kb_initial_probe_file_id=artifact['file_id'], kb_initial_probe_file_sha256=artifact['sha256'],
+        kb_initial_probe_native_citation_verified=True, kb_initial_probe_temporary_app_deleted=True,
+        kb_initial_probe_seconds=round(time.monotonic() - started, 3), no_group_send=True)

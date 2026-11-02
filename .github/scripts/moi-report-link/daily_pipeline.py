@@ -73,9 +73,11 @@ def main():
         if mode == 'maintenance':
             from workflow_lifecycle import probe
             from reliability_checks import knowledge_probe
+            from knowledge_initial_trigger import probe as initial_processing_probe
             status.update(probe(api, objects, date, run_id), status='passed',
                           seconds=round(time.monotonic()-start,3))
             status.update(knowledge_probe(api,objects,date,run_id),seconds=round(time.monotonic()-start,3))
+            status.update(initial_processing_probe(api,objects,date,run_id),seconds=round(time.monotonic()-start,3))
             (out/'status.json').write_bytes(json_bytes(status))
             print(json.dumps(status), flush=True)
             return 0
