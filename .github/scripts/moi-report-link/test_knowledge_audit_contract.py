@@ -28,9 +28,9 @@ class AuditContractTests(unittest.TestCase):
              patch('knowledge_cli_gate.verify',return_value='verified'):
             self.assertEqual(audit(job,targets,'files'),'verified')
             self.assertEqual(audit(job,targets,'files'),'verified')
-        self.assertIn('repo_kb_files_scope_cli_v2',job.state['model_tasks'])
+        self.assertIn('repo_kb_files_scope_cli_full_v1',job.state['model_tasks'])
         self.assertNotIn('repo_kb_files_scope_v2',job.state['model_tasks'])
-        self.assertNotEqual(job.state['model_tasks']['repo_kb_files_scope_cli_v2']['contract_sha256'],LEGACY_HASH)
+        self.assertNotEqual(job.state['model_tasks']['repo_kb_files_scope_cli_full_v1']['contract_sha256'],LEGACY_HASH)
         self.assertEqual([r[0] for r in api.requests],['message/send','tasks/get'])
 
 

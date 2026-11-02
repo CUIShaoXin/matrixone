@@ -1,7 +1,7 @@
 import contextlib,copy,io,json,subprocess,types,unittest
 from pathlib import Path
 from unittest.mock import patch
-from knowledge_cli_gate import command_v2,verify,SCHEMA_V2,audit
+from knowledge_cli_gate import command_v2,verify,SCHEMA_V2,audit_v2_legacy as audit
 from test_knowledge_cli_gate import TARGETS,task
 from knowledge_cli_gate import command
 

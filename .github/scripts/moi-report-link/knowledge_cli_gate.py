@@ -86,13 +86,15 @@ def events(task):
 
 
 def matches(call,targets):
+    from knowledge_cli_fulltext import command as full_command
     args=call.get('arguments',{})
     return (call.get('toolId')=='mcp__moi-tools__bash' and isinstance(args,dict) and
-            args.get('command') in (command(targets),command_v2(targets)) and set(args)<= {'command','timeout'} and
+            args.get('command') in (command(targets),command_v2(targets),full_command(targets)) and set(args)<= {'command','timeout'} and
             ('timeout' not in args or (type(args['timeout']) is int and 1<=args['timeout']<=300)))
 
 
 def verify(task,targets):
+    from knowledge_cli_fulltext import command as full_command,SCHEMA as FULL_SCHEMA
     if task.get('status',{}).get('state')!='completed':raise ValueError('rag_audit_not_completed')
     expected=command(targets);calls,results=events(task);proofs=[]
     for cid,call in calls.items():
@@ -107,6 +109,7 @@ def verify(task,targets):
         try:data=json.loads(value['stdout'])
         except (KeyError,ValueError,TypeError):continue
         selected_schema=SCHEMA_V2 if call['arguments']['command']==command_v2(targets) else SCHEMA
+        if call['arguments']['command']==full_command(targets):selected_schema=FULL_SCHEMA
         if data.get('schema')!=selected_schema:continue
         searches=data.get('searches',[]);selection=data.get('selection',{})
         if selection.get('accepted') is not True or selection.get('count')!=len(targets) or not selection.get('call_id'):continue
@@ -124,6 +127,11 @@ def verify(task,targets):
                         s.get('n')==len(s['p']) and s.get('a') and s.get('c')]
             if len(candidates)!=1:break
             hit=candidates[0]
+            if selected_schema==FULL_SCHEMA:
+                if hit.get('read_protocol') not in ('search_complete_preview','search_then_full_read_evidence'):break
+                if type(hit.get('content_chars')) is not int or hit['content_chars']<len(hit['p']):break
+                digest=hit.get('content_sha256','')
+                if not isinstance(digest,str) or len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest):break
             if not any(r.get('semantic_model_id')==80001 and r.get('file_id')==hit['f'] and
                        r.get('artifact_id')==hit['a'] and hit['c'] in r.get('chunk_ids',[]) for r in refs):break
             found.append(dict(file_id=hit['f'],hits=[dict(call_id=cid,chunk_id=hit['c'],artifact_id=hit['a'],
@@ -134,7 +142,7 @@ def verify(task,targets):
     return proofs
 
 
-def audit(job,targets,label):
+def audit_v2_legacy(job,targets,label):
     from kimi_recovery import run_review
     from api_port_review import llm_calls
     import time,uuid
@@ -198,3 +206,8 @@ def audit(job,targets,label):
     if remaining_attempts<=0:raise ValueError('model_recovery_attempts_exhausted')
     return run_review(job,repo,phase,context,prompt,parser,max_attempts=remaining_attempts,
         deadline_seconds=1200,recover_empty_runtime_failure=True,recover_pending_submission=True)
+
+
+def audit(job,targets,label):
+    from knowledge_cli_fulltext import audit as full_audit
+    return full_audit(job,targets,label)
