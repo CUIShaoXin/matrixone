@@ -3,9 +3,11 @@ import datetime as dt
 import hashlib
 import json
 from pathlib import Path
+import re
 
 from cloud_daily import json_bytes
 from daily_delivery import read_json
+from status_evidence import write as write_evidence
 
 REPOSITORIES = (('matrixone', 'main'), ('taas', 'main'), ('matrixflow', 'dev'))
 
@@ -103,10 +105,13 @@ def snapshot(api, objects, ctx):
             if name not in ('three_repository_acquisition', 'three_repository_component_scan',
                             'component_focus_summary', 'daily_delivery_readiness',
                             'code_repository', 'api_context_for', 'api_publish_report',
-                            'knowledge_ingestion'): continue
+                            'knowledge_ingestion', 'component_knowledge'): continue
             identity = name + (':'+event['repository'] if event.get('repository') else '')
             value['stages'][identity] = dict(status=event.get('status', 'running'),
                 at_utc=event['at_utc'], error_type=event.get('error_type'))
+            code = event.get('safe_code')
+            if isinstance(code, str) and re.fullmatch(r'[a-z][a-z0-9_]{0,100}', code):
+                value['stages'][identity]['safe_code'] = code
     for name, path in (('scan', 'out/pipeline/status.json'), ('delivery', 'out/delivery/status.json'),
                        ('overall', 'out/orchestration/status.json')):
         source = Path(path)
@@ -182,6 +187,8 @@ def sync(api, objects, ctx):
     value = snapshot(api, objects, ctx)
     key = ctx.prefix+'/orchestration/status.json'
     raw = json_bytes(value)
+    # Keep a safe local artifact even if remote persistence or MOI upload fails.
+    write_evidence(value, raw)
     # The complete status survives a MOI outage before upload is attempted.
     objects.publish(key, raw, 'application/json')
     return upload_saved(api, objects, ctx)
@@ -229,6 +236,7 @@ def upload_saved(api, objects, ctx):
         if objects.call('GET', key)[2] == raw: break
     else:
         raise ValueError('status_update_contended')
+    write_evidence(value, raw)
     if report_error is not None: raise report_error
     digest = hashlib.sha256(raw).hexdigest()
     receipt_key = ctx.prefix+'/orchestration/sync-'+digest+'.json'

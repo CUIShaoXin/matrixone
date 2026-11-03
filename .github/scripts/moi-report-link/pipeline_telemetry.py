@@ -6,6 +6,7 @@ import functools
 import json
 import os
 from pathlib import Path
+import re
 import threading
 import time
 import urllib.error
@@ -42,7 +43,12 @@ def span(label, **fields):
     try:
         yield
     except BaseException as exc:
-        emit('stage_end', status='failed', seconds=round(time.monotonic()-start, 3), **fields, **error_fields(exc))
+        failure = error_fields(exc)
+        # Preserve a machine reason at its original stage, including failures
+        # hidden later by an outer component_scan_incomplete summary.
+        if re.fullmatch(r'[a-z][a-z0-9_]{0,100}', str(exc)):
+            failure['safe_code'] = str(exc)
+        emit('stage_end', status='failed', seconds=round(time.monotonic()-start, 3), **fields, **failure)
         raise
     else:
         emit('stage_end', status='passed', seconds=round(time.monotonic()-start, 3), **fields)

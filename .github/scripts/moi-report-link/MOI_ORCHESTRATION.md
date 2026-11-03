@@ -152,6 +152,13 @@ MOI不可用时快照先保存MinIO，最终结果显式标记replay_required。
 ZIP本地缓存也按业务日期与run_id隔离，不跨业务批次复用下载缓存。
 发送结果未知时状态保留null，不转写成确认未发送。
 状态同步的超时仍可能留下MOI文件但丢失上传回执；重放可能产生同内容状态文件，不能据此声称文件上传exactly-once。
+
+完整状态另外生成白名单字段投影 `out/orchestration/evidence.json`，由开发入口的 Actions
+artifact 保留。它绑定原完整快照的 SHA-256，包含批次、GitHub 身份、逐仓固定提交、ZIP
+字节数/哈希/对象位置、阶段状态、安全失败码和回执文件身份，不包含报告签名 URL、
+凭据或任意错误正文。运行心跳和最终同步在访问 MOI 前写出投影；MOI 上传失败时仍可
+从 artifact 排查。单独 status-sync / status-reconcile 也更新投影，不启动扫描或发送。
+该文件是诊断证据，不能替代 MOI 原生统一运行记录、真实 GitHub 终态或企业微信工具回执。
 `moi_actions.reconcile(actions, api, objects, context)` 供MOI调度owner查询已绑定的真实Actions attempt。
 它校验仓库、workflow、触发事件、批次标题、run和attempt，并将completed证据按run/attempt条件创建到
 `orchestration/actions/GITHUB_RUN_ID/ATTEMPT.json`。尚未写出首个快照时使用原dispatch绑定，
