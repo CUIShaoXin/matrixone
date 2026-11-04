@@ -299,7 +299,7 @@ def parse_review(task, repo, commit):
     return result, calls
 
 def model_review(job, repo, phase, context, prior=None):
-    from kimi_recovery import run_review
+    from review_conversations import run_isolated_review as run_review
     prompt=PROMPT.replace('REPO',repo).replace('COMMIT',job.state['commits'][repo])
     prompt += '\n仅输出完整严格JSON，最多2项findings，每项evidence最多3处。reasoning最多180字；trigger、impact、suggested_fix和verification各最多100字。总输出最多2200中文字符，不能截断；证据不足可findings=[]。'
     if phase.startswith('final'):

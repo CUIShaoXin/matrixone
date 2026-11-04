@@ -71,12 +71,14 @@ def main():
         require(re.fullmatch('[A-Za-z0-9_-]{1,80}',run_id) and mode in ('archives','reviews','full','maintenance'),'invalid_pipeline_input')
         api=DailyAPI(os.environ['MOI_API_KEY']);objects=preflight.Objects.from_workspace(api)
         if mode == 'maintenance':
+            from review_conversations import probe as review_conversation_probe
             from workflow_lifecycle import probe
             from reliability_checks import knowledge_probe
             from knowledge_initial_trigger import probe as initial_processing_probe
             status.update(probe(api, objects, date, run_id), status='passed',
                           seconds=round(time.monotonic()-start,3))
             status.update(knowledge_probe(api,objects,date,run_id),seconds=round(time.monotonic()-start,3))
+            status.update(review_conversation_probe(api,objects,date,run_id),seconds=round(time.monotonic()-start,3))
             status.update(initial_processing_probe(api,objects,date,run_id),seconds=round(time.monotonic()-start,3))
             (out/'status.json').write_bytes(json_bytes(status))
             print(json.dumps(status), flush=True)

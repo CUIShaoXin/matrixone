@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 
 from api_port_review import extract, task_json, llm_calls, sha, require, SECRET
-from kimi_recovery import run_review
+from review_conversations import run_isolated_review as run_review
 from pipeline_telemetry import timed
 
 SEEDS = {
