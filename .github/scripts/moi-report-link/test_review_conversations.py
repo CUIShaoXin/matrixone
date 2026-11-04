@@ -94,10 +94,10 @@ class RootConversationTests(unittest.TestCase):
     def test_reservation_uncertain_blocks_without_post_or_resubmission(self):
         api, job = self.job()
         with patch('daily_delivery.create_once', side_effect=TimeoutError()):
-            with self.assertRaisesRegex(ValueError,'unconfirmed'):self.run_model(job)
+            with self.assertRaisesRegex(ValueError,'conversation_missing'):self.run_model(job)
         # No task was submitted. Restart remains read-only, never a second POST.
         with patch('daily_delivery.create_once') as create:
-            with self.assertRaisesRegex(ValueError,'unconfirmed'):self.run_model(job)
+            with self.assertRaisesRegex(ValueError,'conversation_missing'):self.run_model(job)
         create.assert_not_called();self.assertEqual(api.posts,[])
         self.assertTrue(all(r[0]=='tasks/get' for r in api.requests))
 
@@ -107,16 +107,42 @@ class RootConversationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'reservation_conflict'):self.run_model(job)
         self.assertEqual(api.posts,[])
 
-    def test_completed_legacy_task_keeps_original_context_and_no_conversation_create(self):
-        api, job = self.job()
-        from kimi_recovery import run_review
-        # Original task history needs no root migration.
-        with patch('daily_delivery.create_once', side_effect=lambda o,k,p:(True,p)):
-            self.run_model(job)
-        before=copy.deepcopy(job.state['model_tasks']['repo_primary'])
+    def test_evidence_write_failure_before_inference_resumes_original_root(self):
+        api,job=self.job();original_store=job.store;failed=[False]
+        def store(name,value):
+            if name.endswith('-conversation.json') and not failed[0]:
+                failed[0]=True
+                raise ValueError('evidence_write_failed')
+            return original_store(name,value)
+        job.store=store
+        with patch('daily_delivery.create_once',side_effect=lambda o,k,p:(True,p)):
+            with self.assertRaisesRegex(ValueError,'evidence_write_failed'):self.run_model(job)
+        self.assertEqual(api.requests,[]);self.assertEqual(len(api.posts),1)
         with patch('daily_delivery.create_once') as create:
             self.run_model(job)
         create.assert_not_called();self.assertEqual(len(api.posts),1)
+        self.assertEqual([r[0] for r in api.requests],['message/send'])
+
+    def test_pre_submission_restart_does_not_refresh_expired_inference_budget(self):
+        api,job=self.job();original_store=job.store
+        def store(name,value):
+            if name.endswith('-conversation.json'):raise ValueError('evidence_write_failed')
+            return original_store(name,value)
+        job.store=store
+        with patch('daily_delivery.create_once',side_effect=lambda o,k,p:(True,p)):
+            with self.assertRaisesRegex(ValueError,'evidence_write_failed'):self.run_model(job)
+        job.state['model_tasks']['repo_primary']['started_epoch']=0
+        with self.assertRaisesRegex(ValueError,'deadline_exceeded'):self.run_model(job)
+        self.assertEqual(api.requests,[]);self.assertEqual(len(api.posts),1)
+
+    def test_completed_legacy_task_keeps_original_context_and_no_conversation_create(self):
+        api, job = self.job()
+        from kimi_recovery import run_review
+        run_review(job,'repo','primary','source','prompt',lambda t:t['id'],poll_seconds=0)
+        before=copy.deepcopy(job.state['model_tasks']['repo_primary'])
+        with patch('daily_delivery.create_once') as create:
+            self.run_model(job)
+        create.assert_not_called();self.assertEqual(len(api.posts),0)
         self.assertEqual(job.state['model_tasks']['repo_primary']['task_id'],before['task_id'])
 
 

@@ -51,6 +51,14 @@ def read_pending_audit_task(job, key, digest, contract, saved):
     attempts=saved.get('attempts',[])
     if not attempts or attempts[-1].get('task_id'):return None
     attempt=attempts[-1]
+    root=attempt.get('root_conversation',{})
+    if (root.get('plan',{}).get('schema')=='matrix_review_conversation_v1'
+            and root.get('creation_reserved') and not attempt.get('submission_reserved')):
+        # New source reviews persist this marker before conversation creation,
+        # and submission_reserved before the first inference RPC. They can
+        # resume pre-submission work by reading that same root; a legacy or
+        # possibly submitted request must still use original-task-only recovery.
+        return None
     expected=str(uuid.uuid5(uuid.NAMESPACE_URL,job.state['prefix']+'/'+key+'/'+digest+'/'+contract+'/'+str(len(attempts)-1)))
     if attempt.get('request_id')!=expected or attempt.get('number')!=len(attempts):
         raise ValueError('model_pending_request_identity_mismatch')
@@ -196,7 +204,8 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
                 # Lost acknowledgement in this process follows the same read-only
                 # contract as a restart; never call message/send again to find it.
                 recovered_task=read_pending_audit_task(job,key,digest,contract,saved)
-                revalidate=True
-                continue
+                if recovered_task is not None:
+                    revalidate=True
+                    continue
             time.sleep(poll_seconds)
         raise ValueError('model_phase_deadline_exceeded')
