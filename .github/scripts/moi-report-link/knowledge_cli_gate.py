@@ -90,7 +90,7 @@ def matches(call,targets):
     args=call.get('arguments',{})
     return (call.get('toolId')=='mcp__moi-tools__bash' and isinstance(args,dict) and
             args.get('command') in (command(targets),command_v2(targets),full_command(targets)) and set(args)<= {'command','timeout'} and
-            ('timeout' not in args or (type(args['timeout']) is int and 1<=args['timeout']<=300)))
+            ('timeout' not in args or (type(args['timeout']) is int and (1<=args['timeout']<=300 or args['timeout']==600))))
 
 
 def verify(task,targets):

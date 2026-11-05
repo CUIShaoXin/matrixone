@@ -24,6 +24,19 @@ class NativeCLITests(unittest.TestCase):
  def test_tool_timeout_option_preserves_exact_command(self):
   t=task();t['history'][0]['arguments']['timeout']=300
   self.assertEqual(len(verify(t,TARGETS)),2)
+ def test_observed_native_timeout_600_preserves_exact_evidence(self):
+  t=task();t['history'][0]['arguments']['timeout']=600
+  self.assertEqual(len(verify(t,TARGETS)),2)
+ def test_unknown_timeout_values_still_rejected(self):
+  for option in (True,0,301,599,601,600.0,'600'):
+   with self.subTest(timeout=option):
+    self.reject(lambda t:t['history'][0]['arguments'].update(timeout=option))
+ def test_timeout_600_cannot_hide_command_or_citation_mismatch(self):
+  self.reject(lambda t:t['history'][0]['arguments'].update(timeout=600,command='echo fake'))
+  def wrong_ref(t):
+   t['history'][0]['arguments']['timeout']=600
+   t['artifacts'][0]['metadata']['source_refs'][0]['chunk_ids']=['wrong']
+  self.reject(wrong_ref)
  def test_other_shell_options_are_rejected(self):self.reject(lambda t:t['history'][0]['arguments'].update(extra='unexpected'))
  def test_arbitrary_model_shell_cannot_supply_proof(self):self.reject(lambda t:t['history'][0]['arguments'].update(command='echo fake'))
  def test_changed_target_cannot_supply_proof(self):
