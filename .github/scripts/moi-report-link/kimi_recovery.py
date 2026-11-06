@@ -39,6 +39,26 @@ def empty_runtime_failure(task):
         for a in artifacts)
 
 
+def authorization_failed(task):
+    # 2026-11-06 production observation: the runtime intermittently rejects one
+    # request with the exact authorization machine reason while sibling tasks
+    # with identical credentials succeed before and after. Retry only the
+    # pre-output shape: no history and no response artifact, so a transient
+    # rejection gets one bounded identical attempt while any task that
+    # produced conversation history or real output stays terminal.
+    if task.get('status', {}).get('state') != 'failed': return False
+    reason = task.get('metadata', {}).get('reason_display', {}).get('i18n_key')
+    if reason != 'reason.agent_runtime.authorization_failed' or task.get('history'): return False
+    artifacts = task.get('artifacts', [])
+    return bool(artifacts) and all(
+        a.get('name') == 'session_title' and
+        a.get('metadata', {}).get('data_type') == 'agent.session_title' and
+        bool(a.get('parts')) and all(
+            p.get('kind') == 'data' and p.get('data', {}).get('type') == 'agent.session_title'
+            for p in a['parts'])
+        for a in artifacts)
+
+
 def read_pending_audit_task(job, key, digest, contract, saved):
     """Read the original runtime task after a lost acknowledgement; never send.
 
@@ -183,7 +203,8 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
                     return value
                 if status in TERMINAL:
                     reason = ('stream_transport' if interrupted(task) else
-                              'empty_runtime_failure' if recover_empty_runtime_failure and empty_runtime_failure(task) else None)
+                              'empty_runtime_failure' if recover_empty_runtime_failure and empty_runtime_failure(task) else
+                              'authorization_failed' if authorization_failed(task) else None)
                     if reason is None: raise ValueError('model_terminal_nonrecoverable')
                     attempt.update(retry_authorized=True,recovery_reason=reason)
                     if revalidating:

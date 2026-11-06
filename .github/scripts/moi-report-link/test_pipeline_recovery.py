@@ -197,6 +197,31 @@ class RecoveryTests(unittest.TestCase):
  def test_request_timeout_reuses_identical_message(self):
   api=Model([TimeoutError(),task('completed')]);job=Job(api);run_review(job,'repo','primary','source','prompt',lambda t:t,poll_seconds=0)
   self.assertEqual(api.requests[0],api.requests[1]);self.assertEqual(len(job.state['model_tasks']['repo_primary']['attempts']),1)
+ def test_pre_output_authorization_failure_gets_one_bounded_identical_retry(self):
+  title=dict(name='session_title',metadata={'data_type':'agent.session_title'},parts=[dict(kind='data',data={'type':'agent.session_title','title':'audit'})])
+  bad=task('failed','reason.agent_runtime.authorization_failed');bad['artifacts']=[title]
+  api=Model([bad,task('completed',id='t2')]);job=Job(api)
+  self.assertEqual(run_review(job,'repo','primary','source','prompt',lambda t:t['id'],poll_seconds=0),'t2')
+  attempts=job.state['model_tasks']['repo_primary']['attempts']
+  self.assertEqual(len(attempts),2);self.assertEqual(attempts[0]['recovery_reason'],'authorization_failed')
+  self.assertEqual(job.stored['repo/primary/attempt-1-task.json'],bad)
+  self.assertNotEqual(api.requests[0][2],api.requests[1][2])
+  self.assertEqual(api.requests[0][1]['message']['parts'],api.requests[1][1]['message']['parts'])
+ def test_authorization_failure_with_history_or_output_is_never_retried(self):
+  title=dict(name='session_title',metadata={'data_type':'agent.session_title'},parts=[dict(kind='data',data={'type':'agent.session_title'})])
+  for shape in ('history','output_artifact','no_artifacts'):
+   bad=task('failed','reason.agent_runtime.authorization_failed')
+   if shape=='history':bad['history']=[{'parts':[]}];bad['artifacts']=[title]
+   elif shape=='output_artifact':bad['artifacts']=[title,dict(name='response',parts=[])]
+   api=Model([bad])
+   with self.assertRaisesRegex(ValueError,'nonrecoverable'):run_review(Job(api),'repo','primary','source','prompt',lambda t:t,poll_seconds=0)
+   self.assertEqual(len(api.requests),1)
+ def test_authorization_recovery_is_bounded(self):
+  title=dict(name='session_title',metadata={'data_type':'agent.session_title'},parts=[dict(kind='data',data={'type':'agent.session_title'})])
+  bad=task('failed','reason.agent_runtime.authorization_failed');bad['artifacts']=[title]
+  api=Model([bad,bad,bad]);job=Job(api)
+  with self.assertRaisesRegex(ValueError,'attempts_exhausted'):run_review(job,'repo','primary','source','prompt',lambda t:t,poll_seconds=0)
+  self.assertEqual(len(api.requests),3)
  def test_poll_timeout_reuses_task(self):
   api=Model([task('working'),TimeoutError(),task('completed')]);job=Job(api);run_review(job,'repo','primary','source','prompt',lambda t:t,poll_seconds=0)
   self.assertEqual([x[0] for x in api.requests],['message/send','tasks/get','tasks/get']);self.assertEqual(api.requests[1][1],api.requests[2][1])
