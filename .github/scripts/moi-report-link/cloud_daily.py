@@ -356,6 +356,24 @@ class Runner:
             stage["status"] = "deployed"
             self.journal.save()
         require(stage["status"] != "deploying", "workflow_deployment_uncertain")
+        if stage["status"] == "submitting":
+            # An executions POST can fail before or after reaching the server.
+            # Reconcile with the app's real execution history: zero executions
+            # means the POST never landed (safe to submit); otherwise adopt the
+            # existing execution instead of creating a duplicate.
+            from workflow_lifecycle import fresh_route
+            definition = self.api.data(self.api.request(fresh_route(
+                "/workflow/v2/workflow-apps/" + wid)))["workflow"]
+            summary = definition.get("execution_summary", {})
+            if not summary.get("total_executions"):
+                stage["status"] = "deployed"
+                self.journal.save()
+            else:
+                latest = summary.get("latest_execution_id")
+                require(bool(latest), "workflow_execution_identity_unknown")
+                stage.update(execution_id=latest, status="running")
+                self.journal.save()
+                self.event(stage=label, status="execution_ack_recovered", resubmitted=False)
         if stage["status"] == "deployed":
             stage["status"] = "submitting"
             self.journal.save()

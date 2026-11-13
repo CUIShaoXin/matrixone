@@ -31,6 +31,7 @@ class WorkflowAPI:
         self.lost_delete = False
         self.active = 0
         self.changed = False
+        self.summary_total = None
 
     @staticmethod
     def data(value):
@@ -70,7 +71,8 @@ class WorkflowAPI:
         if not self.exists:
             raise Failure('moi_http_404')
         definition = dict(self.definition, execution_summary=dict(active_executions=self.active,
-                          latest_execution_id='another-run' if self.changed else 'execution-1', total_executions=1))
+                          latest_execution_id='another-run' if self.changed else 'execution-1',
+                          total_executions=self.summary_total if self.summary_total is not None else (1 if self.submits else 0)))
         return {'workflow': definition}
 
 
@@ -206,6 +208,37 @@ class WorkflowLifecycleTests(unittest.TestCase):
             runner.workflow('lifecycle_probe', nodes)
         self.assertEqual(runner.api.deploys, 1)
         self.assertEqual(runner.api.submits, 0)
+
+    def submitting_execution(self, total):
+        runner, nodes = self.runner()
+        api = runner.api
+        original = api.request
+        api.lost_once = False
+        def request(path, payload=None, method=None, **kw):
+            if path.endswith('/executions') and not api.lost_once:
+                api.lost_once = True
+                raise TimeoutError('lost execution response')
+            return original(path, payload, method, **kw)
+        api.request = request
+        with self.assertRaises(TimeoutError):
+            runner.workflow('lifecycle_probe', nodes)
+        self.assertEqual(runner.state['stages']['lifecycle_probe']['status'], 'submitting')
+        api.summary_total = total
+        return runner, nodes
+
+    def test_submitting_with_zero_executions_resubmits(self):
+        runner, nodes = self.submitting_execution(None)
+        runner.workflow('lifecycle_probe', nodes)
+        self.assertEqual(runner.api.submits, 1)
+        self.assertEqual(runner.state['stages']['lifecycle_probe']['status'], 'completed')
+
+    def test_submitting_with_existing_execution_adopts_without_resubmit(self):
+        runner, nodes = self.submitting_execution(1)
+        runner.workflow('lifecycle_probe', nodes)
+        self.assertEqual(runner.api.submits, 0)
+        stage = runner.state['stages']['lifecycle_probe']
+        self.assertEqual(stage['execution_id'], 'execution-1')
+        self.assertEqual(stage['status'], 'completed')
 
     def test_uncertain_delete_is_reconciled_without_second_delete(self):
         runner, nodes = self.runner()
