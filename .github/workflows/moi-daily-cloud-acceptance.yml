@@ -18,7 +18,7 @@ on:
       runtime_ref:
         description: Reviewed immutable runtime revision
         required: true
-        default: 7f42cc05f7fa2381555a7fa5aa77acd5f6c71a34
+        default: 8d58925c45babc00dbef53da8f93fb9242b80fa9
       resume_run_id:
         description: Same-day checkpoint only; blank starts the daily batch on schedule
         required: false
@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.runtime_ref || '7f42cc05f7fa2381555a7fa5aa77acd5f6c71a34' }}
+          ref: ${{ inputs.runtime_ref || '8d58925c45babc00dbef53da8f93fb9242b80fa9' }}
           persist-credentials: false
           sparse-checkout: |
             .github/scripts/moi-report-link
@@ -76,7 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.runtime_ref || '7f42cc05f7fa2381555a7fa5aa77acd5f6c71a34' }}
+          ref: ${{ inputs.runtime_ref || '8d58925c45babc00dbef53da8f93fb9242b80fa9' }}
           persist-credentials: false
           sparse-checkout: |
             .github/scripts/moi-report-link
