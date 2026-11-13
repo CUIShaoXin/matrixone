@@ -45,9 +45,9 @@ class WorkflowAPI:
         if path.endswith('/workflow-deployments'):
             self.deploys += 1
             self.exists = True
-            self.wid = payload['workflow_id']
+            self.wid = payload.get('workflow_id', 'server-assigned-' + str(self.deploys) + '-' + str(id(self)))
             self.definition = dict(id=self.wid, name=payload['name'], description=payload['description'], execution_mode='one_shot')
-            return {}
+            return {'workflow': {'id': self.wid}}
         if path.endswith('/executions'):
             self.submits += 1
             return {'workflow_run': {'execution_id': 'execution-1'}}
@@ -65,6 +65,8 @@ class WorkflowAPI:
             if self.lost_delete:
                 raise TimeoutError()
             return {}
+        if '/workflow-apps?name=' in path:
+            return {'workflows': [self.definition] if self.exists else []}
         if not self.exists:
             raise Failure('moi_http_404')
         definition = dict(self.definition, execution_summary=dict(active_executions=self.active,
@@ -105,12 +107,15 @@ class WorkflowLifecycleTests(unittest.TestCase):
                 raise TimeoutError('lost deployment response')
             if (runner.state.get('stages', {}).get('lifecycle_probe', {}).get('status') == 'deploying'
                     and '/workflow-apps/' in path and '/executions' not in path):
+                if runner.api.wid not in path:
+                    raise Failure('moi_http_404')
+                if damage == 'missing':
+                    raise Failure('moi_http_404')
                 answer = copy.deepcopy(definition)
                 if damage == 'dsl': answer['dsl_yaml'] += 'changed'
                 if damage == 'active': answer['execution_summary']['active_executions'] = 1
                 if damage == 'executed': answer['execution_summary']['total_executions'] = 1
                 if damage == 'identity': answer['id'] = 'another-workflow'
-                if damage == 'missing': raise Failure('moi_http_404')
                 return dict(workflow=answer)
             return original(path, payload, method, **kw)
         runner.api.request = request
@@ -143,6 +148,64 @@ class WorkflowLifecycleTests(unittest.TestCase):
         new_id = later.state['stages']['lifecycle_probe']['workflow_id']
         self.assertNotEqual(old_id, new_id)
         self.assertEqual(later.state['stages']['lifecycle_probe']['cleanup']['status'], 'deleted')
+
+    def server_assigned_deployment(self, mode):
+        runner, nodes = self.runner()
+        api = runner.api
+        original = api.request
+        server_id = 'server-side-99'
+        payloads = []
+        def request(path, payload=None, method=None, **kw):
+            if path.endswith('/workflow-deployments'):
+                api.deploys += 1
+                payloads.append(payload)
+                if mode == 'never_created' and api.deploys == 1:
+                    raise TimeoutError('lost before create')
+                api.exists = True
+                api.wid = server_id
+                api.definition = dict(id=server_id, name=payload['name'], description=payload['description'],
+                                      execution_mode='one_shot', source_type='manual_dsl', status='ready',
+                                      dsl_yaml=payload['dsl_yaml'],
+                                      execution_summary=dict(total_executions=0, active_executions=0))
+                if api.deploys == 1:
+                    raise TimeoutError('lost response')
+                return {'workflow': {'id': server_id}}
+            if '/workflow-apps?name=' in path:
+                if mode == 'ambiguous':
+                    return {'workflows': [dict(api.definition), dict(api.definition, id='other-id')]}
+                return {'workflows': [api.definition] if api.exists else []}
+            if '/workflow-apps/' in path and '/executions' not in path and '/result' not in path:
+                if server_id not in path or not api.exists:
+                    raise Failure('moi_http_404')
+                return {'workflow': api.definition}
+            return original(path, payload, method, **kw)
+        api.request = request
+        with self.assertRaises(TimeoutError):
+            runner.workflow('lifecycle_probe', nodes)
+        return runner, nodes, payloads, server_id
+
+    def test_deploying_with_never_created_app_redeploys_without_client_id(self):
+        runner, nodes, payloads, server_id = self.server_assigned_deployment('never_created')
+        runner.workflow('lifecycle_probe', nodes)
+        self.assertEqual(runner.api.deploys, 2)
+        self.assertNotIn('workflow_id', payloads[1])
+        self.assertEqual(runner.state['stages']['lifecycle_probe']['workflow_id'], server_id)
+
+    def test_deploying_recovers_original_app_by_name_without_redeploy(self):
+        runner, nodes, payloads, server_id = self.server_assigned_deployment('name_adopt')
+        runner.workflow('lifecycle_probe', nodes)
+        self.assertEqual(runner.api.deploys, 1)
+        self.assertEqual(runner.api.submits, 1)
+        stage = runner.state['stages']['lifecycle_probe']
+        self.assertEqual(stage['workflow_id'], server_id)
+        self.assertTrue(stage['deployment_reconciled'])
+
+    def test_deploying_name_lookup_ambiguity_blocks(self):
+        runner, nodes, payloads, server_id = self.server_assigned_deployment('ambiguous')
+        with self.assertRaisesRegex(Failure, 'name_ambiguous'):
+            runner.workflow('lifecycle_probe', nodes)
+        self.assertEqual(runner.api.deploys, 1)
+        self.assertEqual(runner.api.submits, 0)
 
     def test_uncertain_delete_is_reconciled_without_second_delete(self):
         runner, nodes = self.runner()

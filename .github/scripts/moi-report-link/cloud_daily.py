@@ -303,30 +303,56 @@ class Runner:
             dsl = "\n".join(lines)+"\n"
         if stage["status"] == "deploying":
             # Deployment can succeed while persisting its acknowledgement fails.
-            # Read the original app; never deploy again or guess missing state.
+            # MOI now assigns workflow ids itself, so a stale client-generated
+            # placeholder may never exist. Resolve the original app by id, then
+            # by the unique stage name; redeploy only when neither exists.
             from workflow_lifecycle import fresh_route
-            definition = self.api.data(self.api.request(fresh_route(
-                "/workflow/v2/workflow-apps/" + wid)))["workflow"]
-            summary = definition.get("execution_summary", {})
-            require(definition.get("id") == wid
-                    and definition.get("name") == "Matrix daily " + label
-                    and definition.get("description") == "Dynamic fixed-commit manifest scan; no group send"
-                    and definition.get("execution_mode") == "one_shot"
-                    and definition.get("source_type") == "manual_dsl"
-                    and definition.get("status") == "ready"
-                    and definition.get("dsl_yaml", "").rstrip("\n") == dsl.rstrip("\n")
-                    and summary.get("total_executions") == 0
-                    and summary.get("active_executions") == 0,
-                    "workflow_deployment_readback_identity_mismatch")
-            stage.update(status="deployed", deployment_reconciled=True,
-                         deployment_version_id=definition.get("latest_workflow_version_id"))
-            self.journal.save()
-            self.event(stage=label, status="deployment_ack_recovered", redeployed=False)
+            definition = None
+            resolved_id = wid
+            try:
+                definition = self.api.data(self.api.request(fresh_route(
+                    "/workflow/v2/workflow-apps/" + wid)))["workflow"]
+            except Failure as exc:
+                if str(exc) != "moi_http_404": raise
+            if definition is None:
+                from urllib.parse import quote
+                found = self.api.data(self.api.request(fresh_route(
+                    "/workflow/v2/workflow-apps?name=" + quote("Matrix daily " + label))))
+                candidates = [w for w in found.get("workflows", [])
+                              if w.get("name") == "Matrix daily " + label]
+                require(len(candidates) <= 1, "workflow_deployment_name_ambiguous")
+                if candidates:
+                    resolved_id = candidates[0]["id"]
+                    definition = self.api.data(self.api.request(fresh_route(
+                        "/workflow/v2/workflow-apps/" + candidates[0]["id"])))["workflow"]
+            if definition is not None:
+                summary = definition.get("execution_summary", {})
+                require(definition.get("id") == resolved_id
+                        and definition.get("name") == "Matrix daily " + label
+                        and definition.get("description") == "Dynamic fixed-commit manifest scan; no group send"
+                        and definition.get("execution_mode") == "one_shot"
+                        and definition.get("source_type") == "manual_dsl"
+                        and definition.get("status") == "ready"
+                        and definition.get("dsl_yaml", "").rstrip("\n") == dsl.rstrip("\n")
+                        and summary.get("total_executions") == 0
+                        and summary.get("active_executions") == 0,
+                        "workflow_deployment_readback_identity_mismatch")
+                stage.update(workflow_id=definition["id"], status="deployed", deployment_reconciled=True,
+                             deployment_version_id=definition.get("latest_workflow_version_id"))
+                self.journal.save()
+                self.event(stage=label, status="deployment_ack_recovered", redeployed=False)
+            else:
+                # The app provably never existed: this deployment never ran.
+                stage["status"] = "planned"
+                self.journal.save()
         if stage["status"] == "planned":
             stage["status"] = "deploying"
             self.journal.save()
-            self.api.request("/workflow/v2/workflow-deployments", dict(workflow_id=wid, source_type="manual_dsl", name="Matrix daily " + label,
-                             description="Dynamic fixed-commit manifest scan; no group send", execution_mode="one_shot", dsl_yaml=dsl), timeout=45)
+            created = self.api.data(self.api.request("/workflow/v2/workflow-deployments", dict(source_type="manual_dsl", name="Matrix daily " + label,
+                             description="Dynamic fixed-commit manifest scan; no group send", execution_mode="one_shot", dsl_yaml=dsl), timeout=45))
+            new_id = (created.get("workflow") or {}).get("id") or (created.get("deployment") or {}).get("workflow_app_id")
+            require(bool(new_id), "workflow_deployment_id_missing")
+            stage["workflow_id"] = new_id
             stage["status"] = "deployed"
             self.journal.save()
         require(stage["status"] != "deploying", "workflow_deployment_uncertain")
