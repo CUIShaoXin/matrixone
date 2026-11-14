@@ -18,7 +18,7 @@ on:
       runtime_ref:
         description: Reviewed immutable runtime revision
         required: true
-        default: 017c2412fdfec353c591f0a7d70f17d7ad72c790
+        default: b0656f10a1157ed62358d718dc0f1066d0a48d3d
       resume_run_id:
         description: Same-day checkpoint only; blank starts the daily batch on schedule
         required: false
@@ -28,14 +28,14 @@ jobs:
   scan:
     if: github.event_name == 'schedule' && github.event.schedule == '17 16 * * *' || github.event_name == 'workflow_dispatch' && inputs.mode != 'deliver' && inputs.mode != 'preview'
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 390
     concurrency:
       group: moi-matrix-daily-scan
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.runtime_ref || '017c2412fdfec353c591f0a7d70f17d7ad72c790' }}
+          ref: ${{ inputs.runtime_ref || 'b0656f10a1157ed62358d718dc0f1066d0a48d3d' }}
           persist-credentials: false
           sparse-checkout: |
             .github/scripts/moi-report-link
@@ -76,7 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.runtime_ref || '017c2412fdfec353c591f0a7d70f17d7ad72c790' }}
+          ref: ${{ inputs.runtime_ref || 'b0656f10a1157ed62358d718dc0f1066d0a48d3d' }}
           persist-credentials: false
           sparse-checkout: |
             .github/scripts/moi-report-link
