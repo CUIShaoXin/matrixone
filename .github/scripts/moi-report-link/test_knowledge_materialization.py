@@ -17,7 +17,11 @@ class MaterializationTests(unittest.TestCase):
         doc=dict(source=dict(model_id=80001,source_id=sid,source_file_id=fid,kb_file_id=fid,effective_enabled=True),preview=dict(available=True),etag='snapshot-1',segment_status=dict(available=True,total=1),segments=[dict(segment_id='segment-1',enabled=True,chunk_id='chunk-1',content=raw.decode(),metadata=dict(volume_id='140002'))])
         self.calls=[];self.facts=[fact];self.execution=execution;self.node=node;self.doc=doc;self.raw=raw
         def request(path,payload=None,**kw):
-            self.assertIsNone(payload);self.assertFalse(kw['retry']);self.assertLessEqual(kw['timeout'],30 if path.startswith('/semantic-models/80001/sources?') else 15);self.calls.append(path)
+            self.assertIsNone(payload);self.assertFalse(kw['retry'])
+            if path.startswith('/semantic-models/80001/sources?'):
+                self.assertEqual(kw['timeout'],90);self.assertIn('page_size=20',path)
+            else:self.assertLessEqual(kw['timeout'],15)
+            self.calls.append(path)
             if path.endswith('/file-executions?file_id='+fid):return dict(executions=self.facts,total=len(self.facts))
             if path.endswith('/executions/'+eid):return dict(execution=self.execution)
             if path.endswith('/nodes/root.register_lineage'):return self.node

@@ -6,6 +6,55 @@ from source_code_review import accepted,context_for,review_repository
 from test_pipeline_recovery import Job
 
 class UnifiedTests(unittest.TestCase):
+ def test_sources_use_small_pages_and_retry_backoff(self):
+  import time
+  class API:
+   def __init__(self):self.calls=[]
+   @staticmethod
+   def data(value):return value
+   def request(self,path,**kwargs):
+    self.calls.append((path,kwargs))
+    if 'page=1&' in path and len(self.calls)<3:raise TimeoutError('slow sources')
+    return dict(items=[dict(source_id='row-'+str(len(self.calls)+i)) for i in range(20 if 'page=1&' in path else 1)])
+  api=API()
+  with patch.object(kb.time,'sleep') as sleep:
+   values=kb.rows(api,time.time()+480)
+  self.assertEqual(len(values),21)
+  self.assertEqual([call[0] for call in api.calls].count('/semantic-models/80001/sources?page=1&page_size=20'),3)
+  self.assertTrue(all('page_size=20' in call[0] and call[1]['timeout']==90 and call[1]['retry'] is False for call in api.calls))
+  self.assertEqual([call.args[0] for call in sleep.call_args_list],[15,30])
+
+ def test_sources_retries_are_bounded_and_auth_errors_do_not_retry(self):
+  import time
+  from cloud_daily import Failure
+  class API:
+   def __init__(self,error):self.error=error;self.calls=0
+   @staticmethod
+   def data(value):return value
+   def request(self,path,**kwargs):self.calls+=1;raise self.error
+  api=API(TimeoutError('persistent'))
+  with patch.object(kb.time,'sleep') as sleep:
+   with self.assertRaises(TimeoutError):kb.rows(api,time.time()+480)
+  self.assertEqual(api.calls,4)
+  self.assertEqual([call.args[0] for call in sleep.call_args_list],[15,30,60])
+  api=API(Failure('moi_http_403'))
+  with patch.object(kb.time,'sleep') as sleep:
+   with self.assertRaisesRegex(Failure,'moi_http_403'):kb.rows(api,time.time()+480)
+  self.assertEqual(api.calls,1);sleep.assert_not_called()
+
+ def test_expired_ingestion_gets_bounded_readback_not_thirty_second_failure(self):
+  class API:
+   def __init__(self):self.calls=[]
+   @staticmethod
+   def data(value):return value
+   def request(self,path,**kwargs):
+    self.calls.append((path,kwargs));return dict(items=[dict(source_file_id='fid',ingest_status='succeeded')])
+  api=API();job=Job(api);job.state['knowledge_registration']={'fid':{'ingestion_deadline_epoch':100}}
+  with patch.object(kb.time,'time',return_value=1000):
+   kb.ensure_sources(job,[dict(file_id='fid',name='x.md')])
+  self.assertEqual(api.calls[0][1]['timeout'],90)
+  self.assertTrue(job.state['knowledge_registration']['fid']['succeeded'])
+
  def test_kb_read_preflight_uses_bounded_reads_and_stops_on_first_failure(self):
   from daily_pipeline import knowledge_preflight
   from cloud_daily import Failure

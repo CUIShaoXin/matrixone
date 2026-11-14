@@ -17,6 +17,10 @@ WORKFLOWS='/workflow/v2/workflow-apps'
 EXECUTION_ACTIVE={'preparing','waiting','pending','triggered','running','submitted',
                   'scheduled','queued','paused','cancelling','canceling'}
 EXECUTION_SUCCESS={'completed','success','succeeded'}
+SOURCES_PAGE_SIZE=20
+SOURCES_MAX_ATTEMPTS=4
+SOURCES_BACKOFF_SECONDS=(15,30,60)
+SOURCES_READ_BUDGET_SECONDS=480
 
 
 def transient(exc):
@@ -190,12 +194,26 @@ def recover_lineage(job,fid,state,allow_retry=True):
     return True
 
 
+def source_page(api,page,deadline):
+    path='/semantic-models/80001/sources?'+urllib.parse.urlencode(dict(page=page,page_size=SOURCES_PAGE_SIZE))
+    for attempt in range(SOURCES_MAX_ATTEMPTS):
+        try:
+            return api.data(api.request(path,timeout=fact_timeout(deadline),retry=False))
+        except Exception as exc:
+            if not transient(exc) or attempt==SOURCES_MAX_ATTEMPTS-1:raise
+            delay=SOURCES_BACKOFF_SECONDS[attempt]
+            emit('knowledge_sources_retry',page=page,attempt=attempt+1,delay_seconds=delay)
+            time.sleep(delay)
+
+
 def rows(api,deadline=None):
     values=[]
     for page in range(1,101):
-        data=api.data(api.request('/semantic-models/80001/sources?page='+str(page)+'&page_size=100',timeout=min(30,fact_timeout(deadline)),retry=False))
-        current=data.get('items',data.get('sources',[]));values.extend(current)
-        if len(current)<100:return values
+        data=source_page(api,page,deadline)
+        current=data.get('items',data.get('sources',[]))
+        if not isinstance(current,list):raise ValueError('knowledge_sources_page_invalid')
+        values.extend(current)
+        if len(current)<SOURCES_PAGE_SIZE:return values
     raise ValueError('knowledge_pagination_incomplete')
 
 
@@ -223,7 +241,11 @@ def ensure_sources(job,artifacts,deadline_seconds=1800,poll_seconds=15,runtime_v
             try:
                 # One bounded initial inventory still allows already-successful
                 # sources to be revalidated after a historical deadline.
-                inventory_deadline=max(time.time()+30,min(saved[fid]['ingestion_deadline_epoch'] for fid in pending_fids))
+                # The inventory has its own shared read window so several
+                # backoff rounds can run. Each FID retains its original
+                # ingestion deadline; an expired one permits only this bounded
+                # readback of facts already produced by the platform.
+                inventory_deadline=max(time.time()+SOURCES_READ_BUDGET_SECONDS,min(saved[fid]['ingestion_deadline_epoch'] for fid in pending_fids))
                 inventory=rows(job.api,inventory_deadline);ready=True
                 pending_fids={a['file_id'] for a in artifacts
                               if not any(v.get('ingest_status')=='succeeded' for v in matching(inventory,a['file_id']))}
