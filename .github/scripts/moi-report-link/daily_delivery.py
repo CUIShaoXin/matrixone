@@ -105,6 +105,8 @@ def check_bundle(api, objects, prefix, date):
     require(set(api_results) == set(codes) == set(REPOS), 'delivery_review_repository_missing')
     for repo in REPOS:
         for kind, value in [('code', codes[repo]), ('api', api_results[repo])]:
+            findings_field = 'retained_findings' if kind == 'code' else 'findings'
+            require(isinstance(value.get(findings_field), list), 'delivery_review_findings_missing')
             saved = reviews['code_repositories' if kind == 'code' else 'repositories'][repo]
             require(saved.get('accepted'), 'delivery_source_review_not_accepted')
             artifact = saved['result']
@@ -214,7 +216,17 @@ def verify_send(task, claim):
     require(len(calls) == len(results) == 1 and calls.keys() == results.keys(), 'delivery_invocation_count_invalid')
     cid = next(iter(calls))
     args = calls[cid]['arguments']
-    require(args.get('channel_instance_id') == CHANNEL and args.get('msg_type') == 'markdown' and args.get('content') == claim['content'], 'delivery_sent_content_mismatch')
+    actual_content = args.get('content')
+    normalization = None
+    require(isinstance(actual_content, str), 'delivery_sent_content_mismatch')
+    if actual_content != claim['content']:
+        # The native tool may remove exactly one terminal LF. Bind the receipt
+        # to the bytes actually sent; every other difference remains fatal.
+        require(claim['content'].endswith('\n') and actual_content == claim['content'][:-1],
+                'delivery_sent_content_mismatch')
+        normalization = 'one_trailing_lf_removed'
+    require(args.get('channel_instance_id') == CHANNEL and args.get('msg_type') == 'markdown',
+            'delivery_sent_content_mismatch')
     result = results[cid]['output']
     require(isinstance(result, dict), 'delivery_tool_output_invalid')
     output = result.get('output', result)
@@ -238,9 +250,12 @@ def verify_send(task, claim):
                 attempt_id=claim['attempt_id'], tool_call_id=cid, tool_output=result,
                 tool_receipt_protocol='native_channel_ack_v1' if native else 'work_item_completed_v1',
                 sent_at_utc=result.get('created_at'),
-                content=claim['content'], content_sha256=sha(claim['content'].encode()),
+                content=actual_content, content_sha256=sha(actual_content.encode()),
                 publication_file_id=claim['publication_file_id'], prefix=claim['prefix'],
                 verified_at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
+    if normalization:
+        final.update(transport_normalization=normalization,
+                     claim_content_sha256=sha(claim['content'].encode()))
     if 'report_identity' in claim:
         final['report_identity'] = claim['report_identity']
     return final

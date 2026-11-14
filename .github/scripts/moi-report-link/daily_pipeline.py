@@ -47,6 +47,15 @@ def scan_components(runner,archives,on_failure):
     return results
 
 
+def knowledge_preflight(api):
+    """Fail before expensive scanning when the existing KB read plane is down."""
+    with span('knowledge_read_preflight'):
+        sources=api.data(api.request('/semantic-models/80001/sources?page=1&page_size=1',timeout=90,retry=False))
+        require(isinstance(sources,dict),'knowledge_sources_preflight_invalid')
+        jobs=api.data(api.request('/semantic-models/80001/source-jobs',timeout=90,retry=False))
+        require(isinstance(jobs,dict),'knowledge_jobs_preflight_invalid')
+
+
 def reverify_archives(objects, archives, date):
     commits = {}
     with span('three_repository_archive_reverification'):
@@ -85,6 +94,9 @@ def main():
             return 0
         prefix='receipts/'+date.replace('-','')+'/pipeline-'+run_id
         root=open_journal(objects,prefix+'/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix,sent=False))
+        if mode == 'full' and not root.value.get('published'):
+            knowledge_preflight(api)
+            status['knowledge_read_preflight_verified']=True
         if mode == 'archives' and set(root.value.get('archives', {})) == {r.name for r in preflight.REPOSITORIES}:
             commits = reverify_archives(objects, root.value['archives'], date)
             status.update(status='passed', commits=commits, archives_verified=True,

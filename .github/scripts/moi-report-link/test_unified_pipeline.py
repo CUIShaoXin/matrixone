@@ -6,6 +6,25 @@ from source_code_review import accepted,context_for,review_repository
 from test_pipeline_recovery import Job
 
 class UnifiedTests(unittest.TestCase):
+ def test_kb_read_preflight_uses_bounded_reads_and_stops_on_first_failure(self):
+  from daily_pipeline import knowledge_preflight
+  from cloud_daily import Failure
+  class API:
+   def __init__(self,fail=False):self.calls=[];self.fail=fail
+   @staticmethod
+   def data(value):return value
+   def request(self,path,**kwargs):
+    self.calls.append((path,kwargs))
+    if self.fail:raise Failure('moi_http_500')
+    return {'items':[]}
+  api=API();knowledge_preflight(api)
+  self.assertEqual([call[0] for call in api.calls],[
+   '/semantic-models/80001/sources?page=1&page_size=1','/semantic-models/80001/source-jobs'])
+  self.assertTrue(all(call[1]['timeout']==90 and call[1]['retry'] is False for call in api.calls))
+  api=API(fail=True)
+  with self.assertRaisesRegex(Failure,'moi_http_500'):knowledge_preflight(api)
+  self.assertEqual(len(api.calls),1)
+
  def focus_fixture(self):
   expected={'date':'2026-10-26','components':[dict(repo='matrixone',name='golang.org/x/crypto',advisories=[dict(id='GHSA-test',details='SSH servers which use the affected certificate callback may panic.')])]}
   item=dict(repo='matrixone',name='golang.org/x/crypto',risk='在使用受影响证书回调时可能触发服务崩溃。',action='核对SSH证书回调的配置与实际调用路径。',evidence=[dict(id='GHSA-test',quote='affected certificate callback')])

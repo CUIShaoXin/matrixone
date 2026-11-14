@@ -43,8 +43,13 @@ class SupervisorTests(unittest.TestCase):
 
     def test_persistent_network_failure_is_bounded(self):
         def run(*args): return {'status': 'failed', 'error_type': 'TimeoutError'}
-        self.assertEqual(self.run_supervisor('scan', run)['attempts'], 6)
+        self.assertEqual(self.run_supervisor('scan', run)['attempts'], 14)
         self.assertEqual(self.run_supervisor('deliver', run)['attempts'], 5)
+
+    def test_fast_scan_failures_use_increasing_bounded_backoff(self):
+        self.assertEqual([s.retry_delay('scan', attempt) for attempt in range(1, 9)],
+                         [30, 60, 120, 240, 480, 960, 1800, 1800])
+        self.assertEqual(s.retry_delay('deliver', 10), 30)
 
     def test_warmup_verifies_before_ten_but_supplies_send_barrier(self):
         clock = Clock(); observed = []

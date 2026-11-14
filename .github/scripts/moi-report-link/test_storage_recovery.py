@@ -133,6 +133,23 @@ class StorageRecoveryTests(unittest.TestCase):
                 self.assertTrue(self.publish(store)['readback_verified'])
                 self.assertEqual(fake.methods(), ['PUT'] + ['GET'] * 4)
 
+    def test_plain_get_uses_five_bounded_attempts_with_backoff(self):
+        store, fake = self.store(gets=[urllib.error.URLError('tls reset')] * 4
+                                 + [(200, {}, self.raw)])
+        self.assertEqual(store.call('GET', self.key)[2], self.raw)
+        self.assertEqual(fake.methods(), ['GET'] * 5)
+        self.assertEqual(self.clock.sleeps, [1, 2, 4, 8])
+
+    def test_plain_get_stops_after_five_and_put_does_not_inherit_read_retries(self):
+        store, fake = self.store(gets=[urllib.error.URLError('tls reset')] * 5)
+        with self.assertRaises(urllib.error.URLError):
+            store.call('GET', self.key)
+        self.assertEqual(fake.methods(), ['GET'] * 5)
+        store, fake = self.store(puts=[(False, TimeoutError('lost put'))])
+        with self.assertRaises(TimeoutError):
+            store.call('PUT', self.key, self.raw)
+        self.assertEqual(fake.methods(), ['PUT'])
+
     def test_uncertain_put_http_response_is_reconciled_before_retry(self):
         for code in (429, 500, 502, 503, 504):
             with self.subTest(code=code):
@@ -280,7 +297,7 @@ class StorageRecoveryTests(unittest.TestCase):
         with patch.object(store, 'publish', side_effect=AssertionError('claim_used_publish')):
             with self.assertRaises(TimeoutError):
                 daily_delivery.create_once(store, self.key, {'owner': 'first'})
-        self.assertEqual(fake.methods(), ['PUT', 'GET', 'GET', 'GET'])
+        self.assertEqual(fake.methods(), ['PUT'] + ['GET'] * 5)
         self.assertEqual(fake.requests[0]['headers']['if-none-match'], '*')
 
 

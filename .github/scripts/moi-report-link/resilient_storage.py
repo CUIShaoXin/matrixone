@@ -231,7 +231,10 @@ class Objects(SignedObjects):
         return 200, headers, body
 
     def _call_uncached(self, method, key, raw=None, headers=None, response_limit=32*1024*1024, timeout=None, query=None, *, retry=True):
-        attempts = 3 if retry else 1
+        # Read-only requests get more time to ride out TLS/connection resets.
+        # Keep the existing write budget unchanged: a lost PUT is reconciled
+        # by the publication state machine, never by generic replay.
+        attempts = (5 if method in ('GET', 'HEAD') else 3) if retry else 1
         for attempt in range(attempts):
             try:
                 with span('minio_zip' if key.endswith('.zip') else 'minio_artifact', method=method, request_bytes=len(raw or b''), attempt=attempt+1):
@@ -242,7 +245,7 @@ class Objects(SignedObjects):
             except RuntimeError as exc:
                 if str(exc) not in RETRYABLE_HTTP_ERRORS or method not in ('GET','HEAD','PUT') or attempt == attempts - 1: raise
             emit('network_retry', category='minio', method=method, attempt=attempt+1)
-            time.sleep(2**attempt)
+            time.sleep(min(20, 2**attempt))
 
     def publish(self, key, raw, content_type):
         digest = sha256(raw)

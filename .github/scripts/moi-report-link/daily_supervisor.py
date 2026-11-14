@@ -36,6 +36,15 @@ def retryable(status, kind):
                     for n in (408, 429, 500, 502, 503, 504)}
 
 
+def retry_delay(kind, attempt):
+    if kind != 'scan':
+        return 30
+    # A fast KB preflight failure must not exhaust all retries in a few minutes.
+    # Start with short intervals, then give the platform up to 30 minutes per
+    # observation window. The shared six-hour budget remains authoritative.
+    return min(1800, 30 * 2 ** min(max(attempt - 1, 0), 6))
+
+
 def wait_until(target, date, now=local_now, sleep=time.sleep):
     while True:
         current = now()
@@ -77,7 +86,7 @@ def supervise(kind, scheduled=False, env=None, now=local_now, sleep=time.sleep,
         env['MATRIX_PIPELINE_RESUME_RUN_ID'] = env.get('MATRIX_PIPELINE_RESUME_RUN_ID') or (
             'daily-' + date.replace('-', '') if scheduled else
             env['GITHUB_RUN_ID'] + '-' + env.get('GITHUB_RUN_ATTEMPT', '1'))
-        budget, max_attempts = 360 * 60, 6
+        budget, max_attempts = 360 * 60, 14
     else:
         budget, max_attempts = 15 * 60, 5
         if scheduled:
@@ -116,7 +125,7 @@ def supervise(kind, scheduled=False, env=None, now=local_now, sleep=time.sleep,
             break
         remaining = budget - (monotonic() - start)
         if attempt < max_attempts and remaining > 0:
-            sleep(min(30, remaining))
+            sleep(min(retry_delay(kind, attempt), remaining))
     final = dict(status='failed', phase=kind, date=date, attempts=len(attempts),
                  same_batch=True, seconds=round(monotonic()-start, 3))
     if attempts:

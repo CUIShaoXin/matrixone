@@ -62,6 +62,24 @@ class DeliveryTests(unittest.TestCase):
         receipt = d.verify_send(self.native_task(), self.claim())
         self.assertTrue(receipt['sent']); self.assertEqual(receipt['tool_receipt_protocol'], 'native_channel_ack_v1')
 
+    def test_one_removed_terminal_lf_binds_receipt_to_actual_sent_content(self):
+        claim = self.claim(); claim['content'] += '\n'
+        task = self.native_task()
+        actual = task['events'][0]['arguments']['content']
+        self.assertEqual(claim['content'][:-1], actual)
+        receipt = d.verify_send(task, claim)
+        self.assertEqual(receipt['content'], actual)
+        self.assertEqual(receipt['content_sha256'], d.sha(actual.encode()))
+        self.assertEqual(receipt['claim_content_sha256'], d.sha(claim['content'].encode()))
+        self.assertEqual(receipt['transport_normalization'], 'one_trailing_lf_removed')
+
+    def test_other_whitespace_changes_still_block_delivery_acceptance(self):
+        claim = self.claim(); claim['content'] += '\n'
+        for actual in (claim['content'] + '\n', claim['content'][:-1] + ' ', ' ' + claim['content']):
+            task = self.native_task(); task['events'][0]['arguments']['content'] = actual
+            with self.assertRaisesRegex(ValueError, 'sent_content_mismatch'):
+                d.verify_send(task, claim)
+
     def test_native_ack_rejects_false_ok_wrong_operation_request_or_workspace(self):
         for key, value in [('ok', False), ('operation', 'other'), ('request_id', 'wrong'), ('workspace_id', 'wrong')]:
             task = self.native_task(); task['events'][1]['output']['output'][key] = value
