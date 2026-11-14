@@ -77,7 +77,7 @@ def supervise(kind, scheduled=False, env=None, now=local_now, sleep=time.sleep,
         env['MATRIX_PIPELINE_RESUME_RUN_ID'] = env.get('MATRIX_PIPELINE_RESUME_RUN_ID') or (
             'daily-' + date.replace('-', '') if scheduled else
             env['GITHUB_RUN_ID'] + '-' + env.get('GITHUB_RUN_ATTEMPT', '1'))
-        budget, max_attempts = 270 * 60, 3
+        budget, max_attempts = 360 * 60, 6
     else:
         budget, max_attempts = 15 * 60, 5
         if scheduled:

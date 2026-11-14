@@ -43,7 +43,7 @@ class SupervisorTests(unittest.TestCase):
 
     def test_persistent_network_failure_is_bounded(self):
         def run(*args): return {'status': 'failed', 'error_type': 'TimeoutError'}
-        self.assertEqual(self.run_supervisor('scan', run)['attempts'], 3)
+        self.assertEqual(self.run_supervisor('scan', run)['attempts'], 6)
         self.assertEqual(self.run_supervisor('deliver', run)['attempts'], 5)
 
     def test_warmup_verifies_before_ten_but_supplies_send_barrier(self):

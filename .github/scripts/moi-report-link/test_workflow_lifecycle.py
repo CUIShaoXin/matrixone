@@ -3,6 +3,7 @@ import json
 import types
 import unittest
 import uuid
+from unittest.mock import patch
 
 from cloud_daily import Runner, WORKSPACE, Failure, sha256, json_bytes
 
@@ -47,7 +48,9 @@ class WorkflowAPI:
             self.deploys += 1
             self.exists = True
             self.wid = payload.get('workflow_id', 'server-assigned-' + str(self.deploys) + '-' + str(id(self)))
-            self.definition = dict(id=self.wid, name=payload['name'], description=payload['description'], execution_mode='one_shot')
+            self.definition = dict(id=self.wid, name=payload['name'], description=payload['description'],
+                                   execution_mode='one_shot', source_type='manual_dsl', status='ready',
+                                   dsl_yaml=payload['dsl_yaml'])
             return {'workflow': {'id': self.wid}}
         if path.endswith('/executions'):
             self.submits += 1
@@ -68,6 +71,8 @@ class WorkflowAPI:
             return {}
         if '/workflow-apps?name=' in path:
             return {'workflows': [self.definition] if self.exists else []}
+        if getattr(self, 'wid', None) is None or self.wid not in path:
+            raise Failure('moi_http_404')
         if not self.exists:
             raise Failure('moi_http_404')
         definition = dict(self.definition, execution_summary=dict(active_executions=self.active,
@@ -121,8 +126,11 @@ class WorkflowLifecycleTests(unittest.TestCase):
                 return dict(workflow=answer)
             return original(path, payload, method, **kw)
         runner.api.request = request
-        with self.assertRaises(TimeoutError):
+        if damage is None:
             runner.workflow('lifecycle_probe', nodes)
+        else:
+            with self.assertRaises(Failure):
+                runner.workflow('lifecycle_probe', nodes)
         return runner, nodes
 
     def test_lost_deployment_ack_recovers_exact_app_without_redeployment(self):
@@ -161,7 +169,7 @@ class WorkflowLifecycleTests(unittest.TestCase):
             if path.endswith('/workflow-deployments'):
                 api.deploys += 1
                 payloads.append(payload)
-                if mode == 'never_created' and api.deploys == 1:
+                if mode == 'never_created' and len(payloads) == 1:
                     raise TimeoutError('lost before create')
                 api.exists = True
                 api.wid = server_id
@@ -182,7 +190,10 @@ class WorkflowLifecycleTests(unittest.TestCase):
                 return {'workflow': api.definition}
             return original(path, payload, method, **kw)
         api.request = request
-        with self.assertRaises(TimeoutError):
+        if mode == 'ambiguous':
+            with self.assertRaisesRegex(Failure, 'name_ambiguous'):
+                runner.workflow('lifecycle_probe', nodes)
+        else:
             runner.workflow('lifecycle_probe', nodes)
         return runner, nodes, payloads, server_id
 
@@ -209,6 +220,60 @@ class WorkflowLifecycleTests(unittest.TestCase):
         self.assertEqual(runner.api.deploys, 1)
         self.assertEqual(runner.api.submits, 0)
 
+    def test_deployment_post_retries_after_transient_404(self):
+        runner, nodes = self.runner()
+        api = runner.api
+        original = api.request
+        calls = {'n': 0}
+        def request(path, payload=None, method=None, **kw):
+            if path.endswith('/workflow-deployments') and calls['n'] == 0:
+                calls['n'] += 1
+                raise Failure('moi_http_404')
+            return original(path, payload, method, **kw)
+        api.request = request
+        with patch('cloud_daily.time.sleep', lambda s: None):
+            runner.workflow('lifecycle_probe', nodes)
+        self.assertEqual(api.deploys, 1)
+        self.assertEqual(runner.state['stages']['lifecycle_probe']['status'], 'completed')
+
+    def test_deployment_post_failure_adopts_app_created_by_failed_post(self):
+        runner, nodes = self.runner()
+        api = runner.api
+        original = api.request
+        def request(path, payload=None, method=None, **kw):
+            if path.endswith('/workflow-deployments') and api.deploys == 0:
+                original(path, payload, method, **kw)
+                raise Failure('moi_http_404')
+            return original(path, payload, method, **kw)
+        api.request = request
+        with patch('cloud_daily.time.sleep', lambda s: None):
+            runner.workflow('lifecycle_probe', nodes)
+        self.assertEqual(api.deploys, 1)
+        self.assertEqual(runner.state['stages']['lifecycle_probe']['status'], 'completed')
+
+    def test_execution_post_retries_after_transient_404(self):
+        runner, nodes = self.runner()
+        api = runner.api
+        original = api.request
+        calls = {'n': 0}
+        def request(path, payload=None, method=None, **kw):
+            if path.endswith('/executions') and calls['n'] == 0:
+                calls['n'] += 1
+                raise Failure('moi_http_404')
+            return original(path, payload, method, **kw)
+        api.request = request
+        with patch('cloud_daily.time.sleep', lambda s: None):
+            runner.workflow('lifecycle_probe', nodes)
+        self.assertEqual(api.submits, 1)
+        self.assertEqual(runner.state['stages']['lifecycle_probe']['status'], 'completed')
+
+    def test_knowledge_sources_read_uses_longer_timeout(self):
+        from cloud_daily import DailyAPI
+        with patch('cloud_daily.publication.ReportAPI.request', return_value={}) as parent:
+            api = DailyAPI('key')
+            api.request('/semantic-models/80001/sources')
+            self.assertGreaterEqual(parent.call_args.args[3], 90)
+
     def submitting_execution(self, total):
         runner, nodes = self.runner()
         api = runner.api
@@ -220,9 +285,6 @@ class WorkflowLifecycleTests(unittest.TestCase):
                 raise TimeoutError('lost execution response')
             return original(path, payload, method, **kw)
         api.request = request
-        with self.assertRaises(TimeoutError):
-            runner.workflow('lifecycle_probe', nodes)
-        self.assertEqual(runner.state['stages']['lifecycle_probe']['status'], 'submitting')
         api.summary_total = total
         return runner, nodes
 
