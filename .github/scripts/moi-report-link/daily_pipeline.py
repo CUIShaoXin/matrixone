@@ -94,7 +94,7 @@ def main():
             return 0
         prefix='receipts/'+date.replace('-','')+'/pipeline-'+run_id
         root=open_journal(objects,prefix+'/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix,sent=False))
-        if mode == 'full' and not root.value.get('published'):
+        if mode == 'full' and not root.value.get('published') and os.environ.get('MATRIX_CONTENT_RECOVERY') != 'true':
             knowledge_preflight(api)
             status['knowledge_read_preflight_verified']=True
         if mode == 'archives' and set(root.value.get('archives', {})) == {r.name for r in preflight.REPOSITORIES}:

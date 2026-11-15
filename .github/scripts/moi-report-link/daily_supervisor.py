@@ -87,6 +87,8 @@ def supervise(kind, scheduled=False, env=None, now=local_now, sleep=time.sleep,
             'daily-' + date.replace('-', '') if scheduled else
             env['GITHUB_RUN_ID'] + '-' + env.get('GITHUB_RUN_ATTEMPT', '1'))
         budget, max_attempts = 360 * 60, 14
+        if env.get('MATRIX_CONTENT_RECOVERY') == 'true':
+            max_attempts = 1
     else:
         budget, max_attempts = 15 * 60, 5
         if scheduled:

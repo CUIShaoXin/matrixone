@@ -19,10 +19,12 @@ class Clock:
 
 
 class SupervisorTests(unittest.TestCase):
-    def run_supervisor(self, kind, runner, clock=None, scheduled=False):
+    def run_supervisor(self, kind, runner, clock=None, scheduled=False, env=None):
         clock = clock or Clock()
+        environment = {'GITHUB_RUN_ID': '123'}
+        environment.update(env or {})
         with tempfile.TemporaryDirectory() as tmp:
-            return s.supervise(kind, scheduled, {'GITHUB_RUN_ID': '123'}, clock.now,
+            return s.supervise(kind, scheduled, environment, clock.now,
                                clock.sleep, clock.mono, runner, Path(tmp))
 
     def test_scan_recovery_uses_same_explicit_batch(self):
@@ -50,6 +52,11 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual([s.retry_delay('scan', attempt) for attempt in range(1, 9)],
                          [30, 60, 120, 240, 480, 960, 1800, 1800])
         self.assertEqual(s.retry_delay('deliver', 10), 30)
+
+    def test_content_recovery_does_not_reenter_after_kb_failure(self):
+        def run(*args): return {'status': 'failed', 'safe_code': 'knowledge_ingestion_deadline'}
+        final = self.run_supervisor('scan', run, env={'MATRIX_CONTENT_RECOVERY': 'true'})
+        self.assertEqual(final['attempts'], 1)
 
     def test_warmup_verifies_before_ten_but_supplies_send_barrier(self):
         clock = Clock(); observed = []

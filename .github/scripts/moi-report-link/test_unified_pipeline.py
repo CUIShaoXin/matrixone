@@ -74,6 +74,19 @@ class UnifiedTests(unittest.TestCase):
   with self.assertRaisesRegex(Failure,'moi_http_500'):knowledge_preflight(api)
   self.assertEqual(len(api.calls),1)
 
+ def test_content_recovery_kb_budget_is_explicit_and_bounded(self):
+  import os,types
+  from cloud_daily import Runner
+  state=dict(prefix='same-batch',commits={'matrixone':'a'*40})
+  runner=object.__new__(Runner);runner.api=object();runner.objects=object();runner.state=state
+  runner.journal=types.SimpleNamespace(key='same-batch/checkpoint.json',value=state,save=lambda:None)
+  saved=dict(knowledge_index=dict(file_id='fid'),artifacts=dict(employee=dict(file_id='fid')))
+  with patch.dict(os.environ,{'MATRIX_KB_INGESTION_DEADLINE_SECONDS':'1'}), \
+       patch('knowledge_gate.ensure_sources') as ensure,patch('knowledge_gate.audit',return_value={'verified':True}):
+   runner.knowledge('matrixone',saved,[dict(file_id='fid',marker='marker')])
+  self.assertEqual(ensure.call_args.kwargs['deadline_seconds'],1)
+  self.assertEqual(saved['rag_proof'],{'verified':True})
+
  def focus_fixture(self):
   expected={'date':'2026-10-26','components':[dict(repo='matrixone',name='golang.org/x/crypto',advisories=[dict(id='GHSA-test',details='SSH servers which use the affected certificate callback may panic.')])]}
   item=dict(repo='matrixone',name='golang.org/x/crypto',risk='在使用受影响证书回调时可能触发服务崩溃。',action='核对SSH证书回调的配置与实际调用路径。',evidence=[dict(id='GHSA-test',quote='affected certificate callback')])
