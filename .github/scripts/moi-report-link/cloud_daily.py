@@ -673,6 +673,9 @@ class Runner:
         self.state.setdefault("commits",{name:proof["commit"] for name,proof in self.state.get("archives",{}).items()})
         job=Job(self.api,self.objects,self.journal,Path("out/knowledge"))
         artifacts=[saved["knowledge_index"],saved["artifacts"]["employee"]]
+        if os.environ.get('MATRIX_CONTENT_RECOVERY') == 'true':
+            emit('content_recovery_kb_unavailable',same_sources=True)
+            raise Failure('knowledge_ingestion_deadline')
         deadline_seconds=int(os.environ.get('MATRIX_KB_INGESTION_DEADLINE_SECONDS','1800'))
         ensure_sources(job,artifacts,deadline_seconds=deadline_seconds,registration_volume_id=140002,targets=targets)
         saved["rag_proof"]=audit(job,targets,tag);self.journal.save()

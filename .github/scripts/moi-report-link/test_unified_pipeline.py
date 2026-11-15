@@ -86,6 +86,12 @@ class UnifiedTests(unittest.TestCase):
    runner.knowledge('matrixone',saved,[dict(file_id='fid',marker='marker')])
   self.assertEqual(ensure.call_args.kwargs['deadline_seconds'],1)
   self.assertEqual(saved['rag_proof'],{'verified':True})
+  saved.pop('rag_proof')
+  with patch.dict(os.environ,{'MATRIX_CONTENT_RECOVERY':'true'}), \
+       patch('knowledge_gate.ensure_sources') as ensure:
+   with self.assertRaisesRegex(Exception,'knowledge_ingestion_deadline'):
+    runner.knowledge('matrixone',saved,[dict(file_id='fid',marker='marker')])
+  ensure.assert_not_called()
 
  def focus_fixture(self):
   expected={'date':'2026-10-26','components':[dict(repo='matrixone',name='golang.org/x/crypto',advisories=[dict(id='GHSA-test',details='SSH servers which use the affected certificate callback may panic.')])]}
