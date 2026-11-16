@@ -489,28 +489,39 @@ def publish_report(job, source, page, results, rendered=None):
     raw,md,marker,total=rendered or render(source,page,results,job.state['run_id'])
     from component_details import publish_and_link
     raw,component_details,detail_md,signing_at=publish_and_link(job,source,raw)
+    content_recovery = source.get('content_recovery') is True
+    if content_recovery:
+        raw=raw.replace(b'<footer>', '<article><strong>KB 入库与原生最终引用待平台恢复，本报告为同批内容恢复版，非完整链路验收。</strong></article><footer>'.encode(), 1)
     md+=('\n\n'+detail_md).encode()
     job.store('matrix-security-daily.html',raw)
     job.store('matrix-security-daily.md',md)
-    accepted=dict(schema='matrix_api_port_combined_acceptance_v2',component_details=component_details,publication_only_revision=bool(job.state.get('publication_revision_source')),date=job.state['date'],run_id=job.state['run_id'],source_receipt_file_id=job.state['source_id'],source_receipt_sha256=job.state['source_sha256'],component_batch_reused=not job.state.get('unified_current_batch',False),code_batch_reused=not job.state.get('unified_current_batch',False),source_commits=source['commits'],repositories=results,added_findings=total,network_scan_executed=False,whole_repository_review=False,daily_automation_ready=False,sent=False)
+    accepted=dict(schema='matrix_api_port_combined_acceptance_v2',component_details=component_details,publication_only_revision=bool(job.state.get('publication_revision_source')),date=job.state['date'],run_id=job.state['run_id'],source_receipt_file_id=job.state['source_id'],source_receipt_sha256=job.state['source_sha256'],component_batch_reused=not job.state.get('unified_current_batch',False),code_batch_reused=not job.state.get('unified_current_batch',False),source_commits=source['commits'],repositories=results,added_findings=total,content_recovery=content_recovery,knowledge_ingestion_verified=not content_recovery,network_scan_executed=False,whole_repository_review=False,daily_automation_ready=False,sent=False)
     job.store('acceptance.json',accepted)
     runner=Runner(job.api,job.objects,job.journal)
     # Native final Markdown is saved once, in the KB raw volume only.
     artifact,stored=runner.workflow('api_port_component_details_final_report_save',[runner.sink('report',md.decode(),'matrix-api-port-'+job.state['date']+'-'+job.state['run_id']+'.md',140002,'markdown')])['report']
     require(stored==md, 'native_report_bytes_mismatch')
     fid=artifact['file_id'];job.state['markdown_artifact']=artifact;job.journal.save()
-    from knowledge_gate import ensure_sources,audit
-    targets=[dict(file_id=fid,marker=marker)]
-    ensure_sources(job,[artifact],registration_volume_id=140002,targets=targets)
-    proof=audit(job,targets,'final_report')
-    job.store('knowledge-tool-proof.json',proof)
+    if content_recovery:
+        proof = None
+        job.store('content-recovery.json',dict(date=job.state['date'],run_id=job.state['run_id'],
+                                               kb_marker_retrieved=False,knowledge_ingestion_verified=False,
+                                               native_final_citations_verified=False))
+    else:
+        from knowledge_gate import ensure_sources,audit
+        targets=[dict(file_id=fid,marker=marker)]
+        ensure_sources(job,[artifact],registration_volume_id=140002,targets=targets)
+        proof=audit(job,targets,'final_report')
+        job.store('knowledge-tool-proof.json',proof)
     key='reports/'+job.state['date'].replace('-','')+'/api-port-kimi-k3/'+sha(raw)[:16]+'/matrix-security-daily.html'
     published=job.objects.publish(key,raw,'text/html; charset=utf-8')
     url,expiry=job.objects.presign(key,at=signing_at)
     require(all(x['expires_at_utc']==expiry for x in component_details),'detail_expiry_does_not_cover_report')
     verification=verify_login_free(url,raw)
-    receipt=dict(schema='matrix_api_port_publication_v2',component_details=component_details,publication_revision_source=job.state.get('publication_revision_source'),publication_only_revision=bool(job.state.get('publication_revision_source')),report_date=job.state['date'],scope='three-repositories',run_id=job.state['run_id'],commits=source['commits'],source_receipt_file_id=job.state['source_id'],source_receipt_sha256=job.state['source_sha256'],model='kimi-k3',rg_cloud_execution=True,execution_location='GitHub Actions cloud runner',workflow_head=os.environ.get('GITHUB_SHA'),runtime_head=os.environ.get('MATRIX_RUNTIME_SHA',os.environ.get('GITHUB_SHA')),markdown_artifact=artifact,kb_marker_retrieved=True,knowledge_retrieval=proof,published=published,url=url,expires_at_utc=expiry,login_free_verification=verification,added_findings=total,source_review_only=True,network_scan_executed=False,sent=False,daily_automation_ready=False)
-    receipt_artifact=job.api.upload('matrix-api-port-publication-'+job.state['run_id']+'.json',rawjson(receipt))
+    receipt=dict(schema='matrix_api_port_publication_v2',component_details=component_details,publication_revision_source=job.state.get('publication_revision_source'),publication_only_revision=bool(job.state.get('publication_revision_source')),report_date=job.state['date'],scope='three-repositories',run_id=job.state['run_id'],commits=source['commits'],source_receipt_file_id=job.state['source_id'],source_receipt_sha256=job.state['source_sha256'],model='kimi-k3',rg_cloud_execution=True,execution_location='GitHub Actions cloud runner',workflow_head=os.environ.get('GITHUB_SHA'),runtime_head=os.environ.get('MATRIX_RUNTIME_SHA',os.environ.get('GITHUB_SHA')),markdown_artifact=artifact,kb_marker_retrieved=not content_recovery,content_recovery=content_recovery,knowledge_ingestion_verified=not content_recovery,native_final_citations_verified=not content_recovery,knowledge_retrieval=proof,published=published,url=url,expires_at_utc=expiry,login_free_verification=verification,added_findings=total,source_review_only=True,network_scan_executed=False,sent=False,daily_automation_ready=False)
+    from native_upload import upload_named_once
+    intent_key=job.journal.key.rsplit('/',1)[0]+'/publication-upload-intent.json'
+    receipt_artifact=upload_named_once(job.api,job.objects,intent_key,'matrix-api-port-publication-'+job.state['run_id']+'.json',rawjson(receipt))
     receipt['receipt_artifact']=receipt_artifact
     job.store('publication-receipt-private.json',receipt)
     job.store('DIRECT_REPORT_LINK.md',('[打开 '+job.state['date']+' 组件＋代码＋API／端口安全日报]('+url+')\n\n有效期至 '+expiry+'（UTC）。\n').encode())

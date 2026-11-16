@@ -58,7 +58,9 @@ jobs:
           MATRIX_PIPELINE_MODE: ${{ inputs.mode || 'full' }}
           MATRIX_PIPELINE_RESUME_RUN_ID: ${{ inputs.resume_run_id }}
           MATRIX_SCHEDULED_BATCH: ${{ github.event_name == 'schedule' }}
-          MATRIX_CONTENT_RECOVERY: ${{ inputs.content_recovery || 'false' }}
+          # auto always tries the full KB path first. Only an actual KB outage
+          # may produce an explicitly labelled content-recovery report.
+          MATRIX_CONTENT_RECOVERY: ${{ inputs.content_recovery && 'true' || 'auto' }}
           MATRIX_KB_INGESTION_DEADLINE_SECONDS: ${{ inputs.content_recovery && '1' || '1800' }}
         run: python3 .github/scripts/moi-report-link/daily_supervisor.py scan ${{ github.event_name == 'schedule' && '--scheduled' || '' }}
       - name: Retain safe timings and status

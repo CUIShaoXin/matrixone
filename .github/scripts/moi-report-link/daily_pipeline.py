@@ -19,7 +19,12 @@ from resilient_storage import verify_login_free
 
 def verify_publication(api,objects,receipt_id,date,commits):
     receipt=json.loads(api.file(receipt_id))
-    require(receipt['report_date']==date and receipt['commits']==commits and receipt.get('kb_marker_retrieved') and not receipt.get('sent'),'resumed_publication_identity_mismatch')
+    recovery = receipt.get('content_recovery') is True
+    require(receipt['report_date']==date and receipt['commits']==commits and not receipt.get('sent'),'resumed_publication_identity_mismatch')
+    require((not recovery and receipt.get('kb_marker_retrieved'))
+            or (recovery and receipt.get('kb_marker_retrieved') is False
+                and receipt.get('knowledge_ingestion_verified') is False),
+            'resumed_publication_evidence_mismatch')
     require(dt.datetime.fromisoformat(receipt['expires_at_utc'])>dt.datetime.now(dt.timezone.utc)+dt.timedelta(hours=24),'resumed_publication_link_needs_renewal')
     for artifact in [dict(receipt['published'],url=receipt['url'])]+receipt['component_details']:
         stored=artifact.get('published',artifact)
@@ -94,7 +99,7 @@ def main():
             return 0
         prefix='receipts/'+date.replace('-','')+'/pipeline-'+run_id
         root=open_journal(objects,prefix+'/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix,sent=False))
-        if mode == 'full' and not root.value.get('published') and os.environ.get('MATRIX_CONTENT_RECOVERY') != 'true':
+        if mode == 'full' and not root.value.get('published') and os.environ.get('MATRIX_CONTENT_RECOVERY') not in ('auto', 'true'):
             knowledge_preflight(api)
             status['knowledge_read_preflight_verified']=True
         if mode == 'archives' and set(root.value.get('archives', {})) == {r.name for r in preflight.REPOSITORIES}:
@@ -102,8 +107,12 @@ def main():
             status.update(status='passed', commits=commits, archives_verified=True,
                           archive_readback_reverified=True, same_batch_end_to_end_passed=False)
         elif root.value.get('published'):
-            verify_publication(api,objects,root.value['publication_file_id'],date,root.value['commits'])
-            status.update(status='passed',publication_file_id=root.value['publication_file_id'],same_batch_end_to_end_passed=True)
+            receipt = verify_publication(api,objects,root.value['publication_file_id'],date,root.value['commits'])
+            recovery = receipt.get('content_recovery') is True
+            status.update(status='passed',publication_file_id=root.value['publication_file_id'],
+                          same_batch_end_to_end_passed=not recovery,
+                          content_recovery=recovery,content_recovery_ready=recovery,
+                          kb_verified=not recovery)
         else:
             archives=root.value.setdefault('archives',{})
             github=preflight.GitHub(os.environ.get('SCAN_GITHUB_TOKEN',''))
@@ -150,7 +159,8 @@ def main():
                             if re.fullmatch('[a-z][a-z0-9_]{0,100}',str(exc)):failure['safe_code']=str(exc)
                             root.value.setdefault('failures',[]).append(failure);root.save()
                             raise
-                        batch=dict(schema='matrix_daily_acceptance_v1',date=date,workspace=WORKSPACE,knowledge_base_id=80001,results=results,three_repository_reports_accepted=True,single_repository_test=False,daily_cloud_download_verified=True,sent=False,daily_automation_ready=False)
+                        content_recovery = any(value.get('content_recovery') is True for value in results.values())
+                        batch=dict(schema='matrix_daily_acceptance_v1',date=date,workspace=WORKSPACE,knowledge_base_id=80001,results=results,three_repository_reports_accepted=True,single_repository_test=False,daily_cloud_download_verified=True,content_recovery=content_recovery,sent=False,daily_automation_ready=False)
                     model_future.result()
                 if mode=='reviews':
                     status.update(status='passed',same_batch_end_to_end_passed=False,code_repositories=list(code),api_repositories=list(api_results))
@@ -161,19 +171,26 @@ def main():
                     with span('component_focus_summary'):
                         focus=build_focus(job,batch,files)
                     page,ncomp,ncode=render(batch,files,code,focus=focus)
-                    source=dict(schema='matrix_unified_scan_source_v1',report_date=date,scope='three-repositories',run_id=run_id,commits=commits,source_acceptance=batch,component_focus=focus,code_review=dict(model='kimi-k3',repositories=code),component_focus_count=ncomp,code_findings=ncode,kb_marker_retrieved=True,sent=False)
+                    source=dict(schema='matrix_unified_scan_source_v1',report_date=date,scope='three-repositories',run_id=run_id,commits=commits,source_acceptance=batch,component_focus=focus,code_review=dict(model='kimi-k3',repositories=code),component_focus_count=ncomp,code_findings=ncode,kb_marker_retrieved=not content_recovery,content_recovery=content_recovery,knowledge_ingestion_verified=not content_recovery,sent=False)
                     body=json_bytes(source);job.store('same-batch-source.json',body)
                     artifact=review_journal.value.get('source_artifact')
                     if artifact:require(api.file(artifact['file_id'])==body,'pipeline_source_artifact_mismatch')
                     else:
-                        artifact=api.upload('matrix-same-batch-source-'+run_id+'.json',body);review_journal.value['source_artifact']=artifact
+                        from native_upload import upload_named_once
+                        artifact=upload_named_once(api,objects,prefix+'/reviews/source-upload-intent.json',
+                                                   'matrix-same-batch-source-'+run_id+'.json',body)
+                        review_journal.value['source_artifact']=artifact
                     review_journal.value.update(source_id=artifact['file_id'],source_sha256=sha(body));review_journal.save()
                     if review_journal.value.get('published'):
                         saved=review_journal.value['receipt'];receipt=verify_publication(api,objects,saved['file_id'],date,commits);receipt['receipt_artifact']=saved
                     else:receipt=publish_report(job,source,page,api_results)
-                    root.value.update(published=True,publication_file_id=receipt['receipt_artifact']['file_id'],commits=commits);root.save()
-                    status.update(status='passed',same_batch_end_to_end_passed=True,publication_file_id=root.value['publication_file_id'],component_focus_count=ncomp,code_findings=ncode,api_port_findings=receipt['added_findings'],kb_verified=True,minio_login_free_verified=True)
-        if mode=='full' and status.get('same_batch_end_to_end_passed'):
+                    root.value.update(published=True,publication_file_id=receipt['receipt_artifact']['file_id'],commits=commits,content_recovery=content_recovery);root.save()
+                    status.update(status='passed',same_batch_end_to_end_passed=not content_recovery,
+                                  content_recovery=content_recovery,content_recovery_ready=content_recovery,
+                                  publication_file_id=root.value['publication_file_id'],component_focus_count=ncomp,code_findings=ncode,
+                                  api_port_findings=receipt['added_findings'],kb_verified=not content_recovery,
+                                  knowledge_ingestion_verified=not content_recovery,minio_login_free_verified=True)
+        if mode=='full' and (status.get('same_batch_end_to_end_passed') or status.get('content_recovery_ready')):
             require(dt.datetime.now(preflight.LOCAL).date().isoformat()==date,'pipeline_date_changed')
             from daily_delivery import export_ready
             export_ready(api,objects,prefix,date)

@@ -47,6 +47,29 @@ class DeliveryTests(unittest.TestCase):
         for s in ('角色恢复时可能重授权限', '调试监听配置需要核实', 'x/crypto', '[查看完整日报（免登录）]('): self.assertIn(s, text)
         self.assertNotIn('<a', text)
 
+    def test_content_recovery_message_is_explicit_and_still_compact(self):
+        bundle = self.bundle()
+        bundle['receipt']['content_recovery'] = True
+        text = d.compose(bundle, '2026-10-26')
+        self.assertIn('KB 入库与原生最终引用待平台恢复', text)
+        self.assertIn('非完整链路验收', text)
+        self.assertLessEqual(len(text.encode()), 4096)
+
+    def test_recovery_ready_binds_kb_state_into_global_identity(self):
+        bundle = self.bundle()
+        bundle['content_recovery'] = True
+        bundle['root'].update(run_id='daily-20261026', commits={r: 'a' * 40 for r in d.REPOS})
+        captured = {}
+        def atomic(objects, key, value):
+            captured.update(value)
+            return True, value
+        with patch.object(d, 'check_bundle', return_value=bundle), \
+             patch.object(d, 'create_once', side_effect=atomic):
+            pointer = d.export_ready(Mock(), Mock(), 'receipts/20261026/pipeline-daily-20261026', '2026-10-26')
+        self.assertTrue(pointer['content_recovery'])
+        self.assertFalse(pointer['knowledge_ingestion_verified'])
+        self.assertEqual(d.report_identity(pointer), d.report_identity(captured))
+
     def test_real_tool_output_required(self):
         self.assertTrue(d.verify_send(self.task(), self.claim())['sent'])
         task = self.task(); task['events'][1]['output']['output']['data']['ok'] = False

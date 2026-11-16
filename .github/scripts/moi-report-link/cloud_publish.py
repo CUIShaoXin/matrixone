@@ -216,11 +216,21 @@ def verify_batch(batch, files, today, historical=False):
         raise ValueError("report_workspace_mismatch")
     if not batch.get("three_repository_reports_accepted") or set(batch.get("results", {})) != set(REPOSITORIES):
         raise ValueError("incomplete_report_batch")
+    content_recovery = batch.get('content_recovery') is True
+    if content_recovery != any(value.get('content_recovery') is True
+                               for value in batch['results'].values()):
+        raise ValueError('report_content_recovery_mismatch')
     for repo in REPOSITORIES:
         result = batch["results"][repo]
         if not re.fullmatch(r"[0-9a-f]{40}", result.get("commit", "")):
             raise ValueError("report_commit_invalid")
-        if not result.get("independent_readback_verified") or not result.get("kb_marker_retrieved"):
+        result_recovery = result.get('content_recovery') is True
+        if result_recovery and (result.get('kb_marker_retrieved') is not False
+                                or result.get('knowledge_ingestion_verified') is not False):
+            raise ValueError('report_kb_recovery_state_mismatch')
+        if not result_recovery and not result.get('kb_marker_retrieved'):
+            raise ValueError("report_source_unaccepted")
+        if not result.get("independent_readback_verified"):
             raise ValueError("report_source_unaccepted")
         for kind in ("employee", "details", "osv"):
             evidence, raw = result["artifacts"][kind], files[(repo, kind)]

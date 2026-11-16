@@ -46,6 +46,19 @@ def transient_post_error(exc):
                         'moi_http_502', 'moi_http_503', 'moi_http_504')
 
 
+def kb_content_recovery_allowed(exc):
+    mode = os.environ.get('MATRIX_CONTENT_RECOVERY', '')
+    if mode not in ('auto', 'true'):
+        return False
+    if mode == 'true':
+        return str(exc) == 'knowledge_ingestion_deadline'
+    if isinstance(exc, (TimeoutError, urllib.error.URLError, ConnectionError)):
+        return True
+    return str(exc) in ('knowledge_ingestion_deadline', 'knowledge_audit_deadline',
+                        'moi_workflow_timeout', 'moi_http_408', 'moi_http_429',
+                        'moi_http_500', 'moi_http_502', 'moi_http_503', 'moi_http_504')
+
+
 def employee_evidence_summary(osv):
     """Render only verified scan facts; free-form model drafts are not evidence."""
     facts = osv['facts']
@@ -543,6 +556,8 @@ class Runner:
     def scan(self, repo, proof):
         saved = self.state.setdefault("repositories", {}).setdefault(repo.name, {})
         if saved.get("accepted"): return saved["result"]
+        if saved.get("content_accepted") and os.environ.get('MATRIX_CONTENT_RECOVERY') == 'true':
+            return saved['result']
         require(proof["report_date"] == self.state["date"] and proof.get("daily_cloud_download_verified") and proof.get("minio_readback_verified"), "daily_archive_unverified")
         manifests = self.import_manifests(repo, proof, saved)
         common = dict(manifests=manifests, archive_proof=dict(proof, manifest_import_method=IMPORT_DESCRIPTION), repository=proof["repository"], branch=proof["branch"], commit=proof["commit"], report_tag=repo.name)
@@ -583,8 +598,14 @@ class Runner:
             advisories,missing=merge_advisories(queries["ids"],advisory_groups)
         require(not missing, "osv_advisory_coverage_incomplete")
         if "final_sources" not in saved:
-            query_artifact = self.api.upload(run_prefix+"-queries-complete.json", json_bytes(queries))
-            advisory_artifact = self.api.upload(run_prefix+"-advisories-complete.json",json_bytes({"advisories":advisories}))
+            from native_upload import upload_named_once
+            upload_base = self.journal.key.rsplit('/', 1)[0] + '/' + repo.name
+            query_artifact = upload_named_once(
+                self.api, self.objects, upload_base+'-queries-upload-intent.json',
+                run_prefix+"-queries-complete.json", json_bytes(queries))
+            advisory_artifact = upload_named_once(
+                self.api, self.objects, upload_base+'-advisories-upload-intent.json',
+                run_prefix+"-advisories-complete.json",json_bytes({"advisories":advisories}))
             saved["final_sources"] = [dict(parsed_artifact,kind="parsed"),dict(query_artifact,kind="queries",name=run_prefix+"-queries-complete.json"),dict(advisory_artifact,kind="advisories_0",name=run_prefix+"-advisories-complete.json")]
             self.journal.save()
         sources=saved["final_sources"]
@@ -656,12 +677,29 @@ class Runner:
             require(stored==index_text.encode(),"knowledge_index_bytes_mismatch")
             saved["knowledge_index"]=artifact;self.journal.save()
         targets=[dict(file_id=saved["knowledge_index"]["file_id"],marker=saved["marker"]+"-DETAIL"),dict(file_id=saved["artifacts"]["employee"]["file_id"],marker=saved["marker"]+"-EMPLOYEE")]
-        self.knowledge(repo.name,saved,targets)
+        content_recovery = False
+        try:
+            self.knowledge(repo.name,saved,targets)
+        except Exception as exc:
+            if not kb_content_recovery_allowed(exc):
+                raise
+            content_recovery = True
+            failure = dict(error_type=type(exc).__name__)
+            if re.fullmatch('[a-z][a-z0-9_]{0,100}', str(exc)):
+                failure['safe_code'] = str(exc)
+            saved['kb_content_recovery'] = failure
+            self.journal.save()
         result=dict(commit=proof["commit"],branch=proof["branch"],counts=saved["counts"],artifacts=saved["artifacts"],
-                    independent_readback_verified=True,kb_marker_retrieved=True,knowledge_retrieval=saved["rag_proof"],knowledge_sources={"details":dict(saved["knowledge_index"],binding="compact_index_with_full_evidence_binding",full_advisory_text_indexed=False),"employee":saved["artifacts"]["employee"]},archive_proof=proof)
-        saved.update(accepted=True,result=result)
+                    independent_readback_verified=True,kb_marker_retrieved=not content_recovery,
+                    knowledge_ingestion_verified=not content_recovery,
+                    content_recovery=content_recovery,
+                    knowledge_retrieval=saved.get("rag_proof"),knowledge_sources={"details":dict(saved["knowledge_index"],binding="compact_index_with_full_evidence_binding",full_advisory_text_indexed=False),"employee":saved["artifacts"]["employee"]},archive_proof=proof)
+        if content_recovery:
+            saved.update(accepted=False,content_accepted=True,result=result)
+        else:
+            saved.update(accepted=True,content_accepted=False,result=result)
         self.journal.save()
-        self.event(stage=repo.name,status="accepted",counts=saved["counts"])
+        self.event(stage=repo.name,status="content_accepted" if content_recovery else "accepted",counts=saved["counts"])
         return result
 
     @timed("component_knowledge")

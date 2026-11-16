@@ -89,17 +89,30 @@ def check_bundle(api, objects, prefix, date):
     receipt_raw = api.file(root['publication_file_id'])
     r = json.loads(receipt_raw)
     require(r['report_date'] == date and r['run_id'] == root['run_id'] and r['commits'] == root['commits'] and r['scope'] == 'three-repositories', 'delivery_publication_identity_mismatch')
-    require(r.get('kb_marker_retrieved') and r.get('rg_cloud_execution') and r.get('model') == 'kimi-k3' and not r.get('publication_only_revision'), 'delivery_publication_evidence_missing')
+    content_recovery = r.get('content_recovery') is True
+    require(r.get('kb_marker_retrieved') is (not content_recovery)
+            and r.get('rg_cloud_execution') and r.get('model') == 'kimi-k3'
+            and not r.get('publication_only_revision'), 'delivery_publication_evidence_missing')
+    if content_recovery:
+        require(r.get('knowledge_ingestion_verified') is False
+                and r.get('native_final_citations_verified') is False,
+                'delivery_content_recovery_state_invalid')
     require(dt.datetime.fromisoformat(r['expires_at_utc']) > dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=24), 'delivery_links_expire_too_soon')
     source_raw = api.file(r['source_receipt_file_id'])
     require(sha(source_raw) == r['source_receipt_sha256'], 'delivery_source_hash_mismatch')
     source = json.loads(source_raw)
     require(source['report_date'] == date and source['run_id'] == root['run_id'] and source['commits'] == root['commits'] and source['scope'] == 'three-repositories', 'delivery_source_identity_mismatch')
+    require(bool(source.get('content_recovery')) is content_recovery
+            and source.get('knowledge_ingestion_verified', True) is (not content_recovery),
+            'delivery_source_recovery_mismatch')
     batch = source['source_acceptance']
     files = {(repo, kind): checked_file(api, v['artifacts'][kind]) for repo, v in batch['results'].items() for kind in ('osv', 'employee', 'details')}
     verify_batch(batch, files, date)
     accepted = read_json(objects, prefix + '/reviews/acceptance.json')
     require(not accepted.get('component_batch_reused') and not accepted.get('code_batch_reused') and accepted['source_commits'] == root['commits'], 'delivery_mixed_batch')
+    require(bool(accepted.get('content_recovery')) is content_recovery
+            and accepted.get('knowledge_ingestion_verified', True) is (not content_recovery),
+            'delivery_acceptance_recovery_mismatch')
     api_results = accepted['repositories']
     codes = source['code_review']['repositories']
     require(set(api_results) == set(codes) == set(REPOS), 'delivery_review_repository_missing')
@@ -116,10 +129,11 @@ def check_bundle(api, objects, prefix, date):
             proof = value['actual_model_execution_proof']
             require(all(proof.get(k) and all(m.get('model') == 'kimi-k3' and m.get('status') == 'completed' for m in proof[k]) for k in ('primary', 'final')), 'delivery_actual_review_model_missing')
     marker = 'MATRIX-API-PORT-' + date.replace('-', '') + '-' + root['run_id']
-    kb = final_kb_task(reviews['model_tasks'],root['commits'])
-    task = api.rpc('tasks/get', {'id': kb['task_id']}, str(uuid.uuid4()))
-    verify_rag(task, [dict(file_id=r['markdown_artifact']['file_id'], marker=marker)])
-    require(task.get('status', {}).get('state') == 'completed' and llm_calls(task) and all(m.get('model') == 'kimi-k3' and m.get('status') == 'completed' for m in llm_calls(task)), 'delivery_kb_task_not_completed')
+    if not content_recovery:
+        kb = final_kb_task(reviews['model_tasks'],root['commits'])
+        task = api.rpc('tasks/get', {'id': kb['task_id']}, str(uuid.uuid4()))
+        verify_rag(task, [dict(file_id=r['markdown_artifact']['file_id'], marker=marker)])
+        require(task.get('status', {}).get('state') == 'completed' and llm_calls(task) and all(m.get('model') == 'kimi-k3' and m.get('status') == 'completed' for m in llm_calls(task)), 'delivery_kb_task_not_completed')
     md = checked_file(api, r['markdown_artifact'])
     require(marker.encode() in md, 'delivery_native_marker_missing')
     pages = [dict(published=r['published'], url=r['url'], expires_at_utc=r['expires_at_utc'])] + r['component_details']
@@ -136,8 +150,12 @@ def check_bundle(api, objects, prefix, date):
         else:
             require(p['url'].replace('&', '&amp;').encode() in main and p['commit'] == root['commits'][p['repository']], 'delivery_detail_link_mismatch')
     require(all(('id="' + s + '"').encode() in main for s in ('components', 'code', 'api-port')), 'delivery_report_sections_missing')
+    if content_recovery:
+        require('KB 入库与原生最终引用待平台恢复'.encode() in main,
+                'delivery_content_recovery_notice_missing')
     return dict(root=root, receipt=r, source=source, api_results=api_results,
-                publication_sha256=sha(receipt_raw), pages_verified=len(pages))
+                publication_sha256=sha(receipt_raw), pages_verified=len(pages),
+                content_recovery=content_recovery)
 
 
 def export_ready(api, objects, prefix, date):
@@ -147,9 +165,11 @@ def export_ready(api, objects, prefix, date):
                        prefix=prefix, run_id=bundle['root']['run_id'], commits=bundle['root']['commits'],
                        publication_file_id=bundle['root']['publication_file_id'],
                        publication_sha256=bundle['publication_sha256'],
+                       content_recovery=bundle['content_recovery'],
+                       knowledge_ingestion_verified=not bundle['content_recovery'],
                        verified_at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
         _, saved = create_once(objects, 'daily/' + date.replace('-', '') + '/ready.json', pointer)
-        require(all(saved.get(k) == pointer[k] for k in ('schema', 'date', 'scope', 'prefix', 'run_id', 'commits', 'publication_file_id', 'publication_sha256')), 'daily_ready_conflict')
+        require(all(saved.get(k) == pointer[k] for k in REPORT_IDENTITY_FIELDS), 'daily_ready_conflict')
         return pointer
 
 
@@ -173,6 +193,8 @@ def compose(bundle, date):
     lines += ['[查看完整日报（免登录）](' + r['url'] + ')',
               '点击组件名称可看详情。链接至 ' + dt.datetime.fromisoformat(r['expires_at_utc']).astimezone(LOCAL).strftime('%m-%d %H:%M') + '。',
               '均需研发核实触发条件；源码审查覆盖选定上下文，端口实际暴露尚未探测。']
+    if r.get('content_recovery') is True:
+        lines.append('KB 入库与原生最终引用待平台恢复，本报告为同批内容恢复版，非完整链路验收。')
     content = '\n'.join(lines)
     require(len(content.encode()) <= 4096, 'delivery_message_exceeds_limit')
     return content
@@ -265,7 +287,8 @@ def verify_send(task, claim):
 # is useful for fault drills; the attempt cap also prevents a hot retry loop.
 MAX_RECOVERY_ATTEMPTS = 128
 REPORT_IDENTITY_FIELDS = ('schema', 'date', 'scope', 'prefix', 'run_id', 'commits',
-                          'publication_file_id', 'publication_sha256')
+                          'publication_file_id', 'publication_sha256',
+                          'content_recovery', 'knowledge_ingestion_verified')
 
 
 def transient(exc):
@@ -629,6 +652,8 @@ def deliver(api, objects, date, preview=False, poll_seconds=15, deadline_seconds
     bundle = check_bundle(api, objects, pointer['prefix'], date)
     require(bundle['root']['publication_file_id'] == pointer['publication_file_id']
             and bundle['publication_sha256'] == pointer['publication_sha256']
+            and bundle['receipt'].get('content_recovery') is pointer.get('content_recovery')
+            and bundle['receipt'].get('knowledge_ingestion_verified') is pointer.get('knowledge_ingestion_verified')
             and all(bundle['root'].get(k) == pointer[k] for k in ('run_id', 'commits') if k in pointer),
             'delivery_pointer_changed')
     content = compose(bundle, date)
