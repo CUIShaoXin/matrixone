@@ -18,10 +18,14 @@ on:
       runtime_ref:
         description: Reviewed immutable runtime revision
         required: true
-        default: 935a752ab06ca72ded6e5b41594a466d0e24e616
+        default: 5cc4f4201a44350efcb0f1ebc1efb358470166be
       resume_run_id:
         description: Same-day checkpoint only; blank starts the daily batch on schedule
         required: false
+      content_recovery:
+        description: Explicit recovery only; automatic KB-outage recovery remains labelled and never marks KB accepted
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -35,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.runtime_ref || '935a752ab06ca72ded6e5b41594a466d0e24e616' }}
+          ref: ${{ inputs.runtime_ref || '5cc4f4201a44350efcb0f1ebc1efb358470166be' }}
           persist-credentials: false
           sparse-checkout: |
             .github/scripts/moi-report-link
@@ -54,6 +58,8 @@ jobs:
           MATRIX_PIPELINE_MODE: ${{ inputs.mode || 'full' }}
           MATRIX_PIPELINE_RESUME_RUN_ID: ${{ inputs.resume_run_id }}
           MATRIX_SCHEDULED_BATCH: ${{ github.event_name == 'schedule' }}
+          MATRIX_CONTENT_RECOVERY: ${{ inputs.content_recovery && 'true' || 'auto' }}
+          MATRIX_KB_INGESTION_DEADLINE_SECONDS: ${{ inputs.content_recovery && '1' || '1800' }}
         run: python3 .github/scripts/moi-report-link/daily_supervisor.py scan ${{ github.event_name == 'schedule' && '--scheduled' || '' }}
       - name: Retain safe timings and status
         if: always()
@@ -76,7 +82,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.runtime_ref || '935a752ab06ca72ded6e5b41594a466d0e24e616' }}
+          ref: ${{ inputs.runtime_ref || '5cc4f4201a44350efcb0f1ebc1efb358470166be' }}
           persist-credentials: false
           sparse-checkout: |
             .github/scripts/moi-report-link
