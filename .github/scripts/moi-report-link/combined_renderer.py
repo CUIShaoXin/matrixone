@@ -40,9 +40,10 @@ def focus_inputs(batch, files):
 
 def parse_focus(task, expected):
     from api_port_review import task_json,llm_calls,require
+    from review_model import is_kimi_model
     require(task.get('status',{}).get('state')=='completed','focus_task_incomplete')
     calls=llm_calls(task)
-    require(calls and all(c.get('model')=='kimi-k3' and c.get('status')=='completed' for c in calls),'focus_actual_kimi_missing')
+    require(calls and all(is_kimi_model(c.get('model')) and c.get('status')=='completed' for c in calls),'focus_actual_kimi_missing')
     def tool_calls(value):
         if isinstance(value,dict):return value.get('type')=='moi.tool.call' or any(tool_calls(v) for v in value.values())
         return isinstance(value,list) and any(tool_calls(v) for v in value)

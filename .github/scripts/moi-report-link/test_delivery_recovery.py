@@ -241,6 +241,7 @@ class RecoveryTests(unittest.TestCase):
         self.enterContext(patch.object(d.time, 'sleep', side_effect=lambda s: self.clock.sleep(s)))
         self.enterContext(patch.object(d.SignedObjects, 'call', side_effect=lambda obj, *a, **kw: obj.call(*a, **kw)))
         self.enterContext(patch.dict(d.os.environ, {}, clear=True))
+        self.enterContext(patch('daily_delivery.resolve_review_model', return_value='kimi-k3'))
         self.enterContext(patch('socket.socket.connect', side_effect=AssertionError('network forbidden')))
         self.enterContext(patch('urllib.request.OpenerDirector.open', side_effect=AssertionError('network forbidden')))
         self.enterContext(patch('pipeline_telemetry.emit'))

@@ -21,6 +21,7 @@ from cloud_publish import verify_batch
 from resilient_storage import Objects, SignedObjects, verify_login_free
 from api_port_review import llm_calls
 from pipeline_telemetry import span, error_fields
+from review_model import is_kimi_model, resolve_review_model
 
 LOCAL = dt.timezone(dt.timedelta(hours=8))
 REPOS = ('matrixone', 'taas', 'matrixflow')
@@ -91,7 +92,7 @@ def check_bundle(api, objects, prefix, date):
     require(r['report_date'] == date and r['run_id'] == root['run_id'] and r['commits'] == root['commits'] and r['scope'] == 'three-repositories', 'delivery_publication_identity_mismatch')
     content_recovery = r.get('content_recovery') is True
     require(r.get('kb_marker_retrieved') is (not content_recovery)
-            and r.get('rg_cloud_execution') and r.get('model') == 'kimi-k3'
+            and r.get('rg_cloud_execution') and is_kimi_model(r.get('model'))
             and not r.get('publication_only_revision'), 'delivery_publication_evidence_missing')
     if content_recovery:
         require(r.get('knowledge_ingestion_verified') is False
@@ -127,13 +128,13 @@ def check_bundle(api, objects, prefix, date):
             require(len(raw) == artifact['bytes'] and sha(raw) == artifact['sha256'] and json.loads(raw) == value, 'delivery_review_artifact_mismatch')
             require(value['commit'] == root['commits'][repo] and value['archive_proof']['report_date'] == date and not value.get('whole_repository_review'), 'delivery_review_identity_mismatch')
             proof = value['actual_model_execution_proof']
-            require(all(proof.get(k) and all(m.get('model') == 'kimi-k3' and m.get('status') == 'completed' for m in proof[k]) for k in ('primary', 'final')), 'delivery_actual_review_model_missing')
+            require(all(proof.get(k) and all(is_kimi_model(m.get('model')) and m.get('status') == 'completed' for m in proof[k]) for k in ('primary', 'final')), 'delivery_actual_review_model_missing')
     marker = 'MATRIX-API-PORT-' + date.replace('-', '') + '-' + root['run_id']
     if not content_recovery:
         kb = final_kb_task(reviews['model_tasks'],root['commits'])
         task = api.rpc('tasks/get', {'id': kb['task_id']}, str(uuid.uuid4()))
         verify_rag(task, [dict(file_id=r['markdown_artifact']['file_id'], marker=marker)])
-        require(task.get('status', {}).get('state') == 'completed' and llm_calls(task) and all(m.get('model') == 'kimi-k3' and m.get('status') == 'completed' for m in llm_calls(task)), 'delivery_kb_task_not_completed')
+        require(task.get('status', {}).get('state') == 'completed' and llm_calls(task) and all(is_kimi_model(m.get('model')) and m.get('status') == 'completed' for m in llm_calls(task)), 'delivery_kb_task_not_completed')
     md = checked_file(api, r['markdown_artifact'])
     require(marker.encode() in md, 'delivery_native_marker_missing')
     pages = [dict(published=r['published'], url=r['url'], expires_at_utc=r['expires_at_utc'])] + r['component_details']
@@ -676,7 +677,7 @@ def deliver(api, objects, date, preview=False, poll_seconds=15, deadline_seconds
               '不得改写、拆分、换群、发其他消息、调用其他工具、读取凭据或扫描。超时或未知停止，禁止重试发送。'
               '控制器已在MinIO持久化全局当日唯一claim，负责回读真实任务并保存回执。完成工具调用后立即结束，不要再保存文件。\nBEGIN_MESSAGE\n'
               + content + '\nEND_MESSAGE')
-    request = dict(model='kimi-k3', idempotencyKey=rid, message=dict(kind='message', role='user', messageId=rid, parts=[dict(kind='text', text=prompt)]))
+    request = dict(model=resolve_review_model(api), idempotencyKey=rid, message=dict(kind='message', role='user', messageId=rid, parts=[dict(kind='text', text=prompt)]))
     claim = dict(schema='matrix_daily_claim_v1', date=date, channel_instance_id=CHANNEL,
                  attempt_id=rid, task_id=tid, content=content, request=request,
                  publication_file_id=pointer['publication_file_id'], prefix=pointer['prefix'],

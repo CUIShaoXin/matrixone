@@ -72,7 +72,8 @@ def audit(job,targets,label):
    actual=llm_calls(task)
    if task.get('status',{}).get('state')=='completed':
     try:
-     if not actual or any(v.get('model')!='kimi-k3' or v.get('status')!='completed' for v in actual):raise ValueError('knowledge_actual_kimi_missing')
+     from review_model import is_kimi_model
+     if not actual or any(not is_kimi_model(v.get('model')) or v.get('status')!='completed' for v in actual):raise ValueError('knowledge_actual_kimi_missing')
      return verify(task,targets)
     except ValueError:pass
    elif task.get('status',{}).get('state') not in ('failed','canceled','cancelled','rejected'):
@@ -89,7 +90,8 @@ def audit(job,targets,label):
   job.journal.save()
  def parser(task):
   actual=llm_calls(task)
-  if not actual or any(v.get('model')!='kimi-k3' or v.get('status')!='completed' for v in actual):raise ValueError('knowledge_actual_kimi_missing')
+  from review_model import is_kimi_model
+  if not actual or any(not is_kimi_model(v.get('model')) or v.get('status')!='completed' for v in actual):raise ValueError('knowledge_actual_kimi_missing')
   return verify(task,targets)
  return run_review(job,repo,phase,context,prompt,parser,max_attempts=1,
                    deadline_seconds=tasks[key]['validation_budget_seconds'],recover_pending_submission=True)

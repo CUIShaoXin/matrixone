@@ -290,12 +290,13 @@ def llm_calls(task):
     return list(found.values())
 
 def parse_review(task, repo, commit):
+    from review_model import is_kimi_model
     require(task.get('status',{}).get('state') == 'completed', 'model_task_not_completed')
     result=task_json(task)
     require(result.get('schema')==SCHEMA and result.get('repository')==repo and result.get('commit')==commit, 'model_result_identity_mismatch')
     require(isinstance(result.get('findings'),list) and len(result['findings'])<=3, 'invalid_findings_contract')
     calls=llm_calls(task)
-    require(calls and all(c.get('model')=='kimi-k3' and c.get('status')=='completed' for c in calls), 'actual_kimi_execution_missing')
+    require(calls and all(is_kimi_model(c.get('model')) and c.get('status')=='completed' for c in calls), 'actual_kimi_execution_missing')
     return result, calls
 
 def model_review(job, repo, phase, context, prior=None):
@@ -403,7 +404,7 @@ def review_repository(job, repo, proof):
         findings,rejected,repairs=accept(final,evidence)
         supplied={f['path'] for f in meta['files']}
         unresolved=[r for r in requests if r.get('path','').split('(RANGE')[0].strip() not in supplied]
-        result=dict(schema=SCHEMA,date=proof['report_date'],repository=repo,commit=proof['commit'],archive_proof=proof,model='kimi-k3',model_entry='MOI existing Agent A2A',inventory_artifact=inventory_artifact,counts=counts,searched_files=len(files),selected_files=meta['selected_files'],selected_lines=meta['selected_lines'],context_sha256=meta['context_sha256'],context_requests=requests,unresolved_context_requests=unresolved,final_context_requests=final.get('context_requests',[]),omitted_files=omitted,excluded_match_files=meta['excluded_match_files'],findings=findings,rejected_evidence=rejected,evidence_repairs=repairs,decisions=final.get('decisions',[]),actual_model_execution_proof={'primary':first_calls,'final':last_calls},whole_repository_review=False,network_scan_executed=False,application_tests_executed=False)
+        result=dict(schema=SCHEMA,date=proof['report_date'],repository=repo,commit=proof['commit'],archive_proof=proof,model=job.state['review_model'],model_entry='MOI existing Agent A2A',inventory_artifact=inventory_artifact,counts=counts,searched_files=len(files),selected_files=meta['selected_files'],selected_lines=meta['selected_lines'],context_sha256=meta['context_sha256'],context_requests=requests,unresolved_context_requests=unresolved,final_context_requests=final.get('context_requests',[]),omitted_files=omitted,excluded_match_files=meta['excluded_match_files'],findings=findings,rejected_evidence=rejected,evidence_repairs=repairs,decisions=final.get('decisions',[]),actual_model_execution_proof={'primary':first_calls,'final':last_calls},whole_repository_review=False,network_scan_executed=False,application_tests_executed=False)
         result['final_phase']=final_phase
         artifact=job.store(repo+'/accepted.json',result)
         saved.update(accepted=True,result=artifact);job.journal.save()
@@ -518,7 +519,7 @@ def publish_report(job, source, page, results, rendered=None):
     url,expiry=job.objects.presign(key,at=signing_at)
     require(all(x['expires_at_utc']==expiry for x in component_details),'detail_expiry_does_not_cover_report')
     verification=verify_login_free(url,raw)
-    receipt=dict(schema='matrix_api_port_publication_v2',component_details=component_details,publication_revision_source=job.state.get('publication_revision_source'),publication_only_revision=bool(job.state.get('publication_revision_source')),report_date=job.state['date'],scope='three-repositories',run_id=job.state['run_id'],commits=source['commits'],source_receipt_file_id=job.state['source_id'],source_receipt_sha256=job.state['source_sha256'],model='kimi-k3',rg_cloud_execution=True,execution_location='GitHub Actions cloud runner',workflow_head=os.environ.get('GITHUB_SHA'),runtime_head=os.environ.get('MATRIX_RUNTIME_SHA',os.environ.get('GITHUB_SHA')),markdown_artifact=artifact,kb_marker_retrieved=not content_recovery,content_recovery=content_recovery,knowledge_ingestion_verified=not content_recovery,native_final_citations_verified=not content_recovery,knowledge_retrieval=proof,published=published,url=url,expires_at_utc=expiry,login_free_verification=verification,added_findings=total,source_review_only=True,network_scan_executed=False,sent=False,daily_automation_ready=False)
+    receipt=dict(schema='matrix_api_port_publication_v2',component_details=component_details,publication_revision_source=job.state.get('publication_revision_source'),publication_only_revision=bool(job.state.get('publication_revision_source')),report_date=job.state['date'],scope='three-repositories',run_id=job.state['run_id'],commits=source['commits'],source_receipt_file_id=job.state['source_id'],source_receipt_sha256=job.state['source_sha256'],model=job.state['review_model'],rg_cloud_execution=True,execution_location='GitHub Actions cloud runner',workflow_head=os.environ.get('GITHUB_SHA'),runtime_head=os.environ.get('MATRIX_RUNTIME_SHA',os.environ.get('GITHUB_SHA')),markdown_artifact=artifact,kb_marker_retrieved=not content_recovery,content_recovery=content_recovery,knowledge_ingestion_verified=not content_recovery,native_final_citations_verified=not content_recovery,knowledge_retrieval=proof,published=published,url=url,expires_at_utc=expiry,login_free_verification=verification,added_findings=total,source_review_only=True,network_scan_executed=False,sent=False,daily_automation_ready=False)
     from native_upload import upload_named_once
     intent_key=job.journal.key.rsplit('/',1)[0]+'/publication-upload-intent.json'
     receipt_artifact=upload_named_once(job.api,job.objects,intent_key,'matrix-api-port-publication-'+job.state['run_id']+'.json',rawjson(receipt))

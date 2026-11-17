@@ -414,7 +414,8 @@ def audit(job,targets,label):
     context=json.dumps(targets,sort_keys=True)
     def parser(task):
         calls=llm_calls(task)
-        if not calls or any(c.get('model')!='kimi-k3' or c.get('status')!='completed' for c in calls):
+        from review_model import is_kimi_model
+        if not calls or any(not is_kimi_model(c.get('model')) or c.get('status')!='completed' for c in calls):
             raise ValueError('knowledge_actual_kimi_missing')
         return verify_rag(task,targets)
     # Retain the prior incorrect-scope task and its original inference budget.

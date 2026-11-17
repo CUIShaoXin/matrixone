@@ -58,12 +58,13 @@ def context_for(repo,proof,files,requests=(),prior=None):
 
 
 def parse(task,repo,commit,phase):
+    from review_model import is_kimi_model
     require(task.get('status',{}).get('state')=='completed','code_model_not_completed')
     value=task_json(task);schema='matrix_code_review_findings_v1' if phase=='primary' else 'matrix_code_review_verdict_v1'
     require(value.get('schema')==schema and value.get('repository')==repo and value.get('commit')==commit,'code_result_identity_mismatch')
     require(isinstance(value.get('findings'),list) and len(value['findings'])<=2,'code_findings_contract_invalid')
     calls=llm_calls(task)
-    require(bool(calls) and all(c.get('model')=='kimi-k3' and c.get('status')=='completed' for c in calls),'code_actual_kimi_missing')
+    require(bool(calls) and all(is_kimi_model(c.get('model')) and c.get('status')=='completed' for c in calls),'code_actual_kimi_missing')
     return value,calls
 
 

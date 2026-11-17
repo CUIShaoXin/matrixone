@@ -7,6 +7,11 @@ import daily_delivery as d
 
 
 class DeliveryTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch('daily_delivery.resolve_review_model', return_value='kimi-k3')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_final_audit_accepts_one_immutable_v2_or_v3_task_but_never_ambiguous_tasks(self):
         commits={r:'a'*40 for r in d.REPOS};repo=sorted(commits)[0]
         for version in ('v2','v3'):
@@ -176,6 +181,10 @@ class DeliveryTests(unittest.TestCase):
 
 
 class FaultDrills(unittest.TestCase):
+ def setUp(self):
+  patcher=patch('daily_delivery.resolve_review_model',return_value='kimi-k3')
+  patcher.start();self.addCleanup(patcher.stop)
+
  def batch(self):
   date='2026-10-26';commits={r:'a'*40 for r in d.REPOS}
   root=dict(date=date,scope='three-repositories',published=True,run_id='batch',commits=commits,publication_file_id='file',archives={r:dict(report_date=date,repository='matrixorigin/'+r,commit=commits[r],daily_cloud_download_verified=True,minio_readback_verified=True) for r in d.REPOS})

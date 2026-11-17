@@ -21,7 +21,7 @@ class PublishContentRecoveryTests(unittest.TestCase):
         publication_artifact = dict(file_id='22222222-2222-4222-8222-222222222222')
         saved = {}
         job = types.SimpleNamespace(
-            state=dict(date=date, run_id='daily-test', source_id='source-fid',
+            state=dict(date=date, run_id='daily-test', source_id='source-fid', review_model='kimi-k3',
                        source_sha256='a' * 64, unified_current_batch=True),
             journal=types.SimpleNamespace(key='receipts/test/reviews/checkpoint.json',
                                           value={}, save=lambda: None),

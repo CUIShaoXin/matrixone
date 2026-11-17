@@ -74,7 +74,8 @@ class ReviewAPI:
     def rpc(self, method, params, rid):
         if method != 'message/send':
             return self.original.rpc(method, params, rid)
-        require(params.get('model') == 'kimi-k3' and params.get('idempotencyKey') == rid and
+        expected_model = self.job.state.get('review_model')
+        require(expected_model and params.get('model') == expected_model and params.get('idempotencyKey') == rid and
                 params.get('message', {}).get('messageId') == rid and
                 not params['message'].get('contextId') and not params['message'].get('taskId'),
                 'review_new_request_identity_invalid')

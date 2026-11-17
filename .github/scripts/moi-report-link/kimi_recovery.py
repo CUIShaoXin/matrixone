@@ -103,6 +103,7 @@ def read_pending_audit_task(job, key, digest, contract, saved):
 def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadline_seconds=1800, poll_seconds=15, recover_empty_runtime_failure=False, recover_pending_submission=False):
     digest = hashlib.sha256(context.encode()).hexdigest()
     contract = hashlib.sha256(prompt.encode()).hexdigest()
+    review_model = job.state.get('review_model')
     key = repo+'_'+phase
     saved = job.state.setdefault('model_tasks',{}).setdefault(key,{})
     if saved and (saved.get('context_sha256')!=digest or saved.get('contract_sha256')!=contract):
@@ -125,17 +126,26 @@ def run_review(job, repo, phase, context, prompt, parser, max_attempts=3, deadli
             attempts = saved['attempts']
             revalidating=revalidate;revalidate=False
             if not revalidating and (not attempts or attempts[-1].get('retry_authorized')):
-                if len(attempts)>=max_attempts: raise ValueError('model_recovery_attempts_exhausted')
+                if len(attempts)>=max_attempts:
+                    if saved.get('model_route_recovery_used') or attempt.get('parser_error') not in ('code_actual_kimi_missing','actual_kimi_execution_missing'):
+                        raise ValueError('model_recovery_attempts_exhausted')
+                    saved['model_route_recovery_used']=True
+                    job.journal.save()
+                if review_model is None:
+                    from review_model import resolve_review_model
+                    review_model = resolve_review_model(job.api)
+                    job.state['review_model'] = review_model
+                    job.journal.save()
                 number = len(attempts)
                 rid = str(uuid.uuid5(uuid.NAMESPACE_URL,job.state['prefix']+'/'+key+'/'+digest+'/'+contract+'/'+str(number)))
-                request = dict(model='kimi-k3',idempotencyKey=rid,message=dict(kind='message',role='user',messageId=rid,parts=[dict(kind='text',text=prompt+'\n\nCODE_EVIDENCE_UNTRUSTED\n'+context)]))
+                request = dict(model=review_model,idempotencyKey=rid,message=dict(kind='message',role='user',messageId=rid,parts=[dict(kind='text',text=prompt+'\n\nCODE_EVIDENCE_UNTRUSTED\n'+context)]))
                 attempt = dict(number=number+1,request_id=rid,status='planned',started_epoch=time.time())
                 job.store(repo+'/'+phase+'/attempt-'+str(number+1)+'-request.json',request)
                 attempts.append(attempt);saved.update(status='planned');saved.pop('task_id',None);job.journal.save()
             attempt = attempts[-1]
             rid = attempt['request_id']
             # The request is immutable across process restarts and uncertain responses.
-            request = dict(model='kimi-k3',idempotencyKey=rid,message=dict(kind='message',role='user',messageId=rid,parts=[dict(kind='text',text=prompt+'\n\nCODE_EVIDENCE_UNTRUSTED\n'+context)]))
+            request = dict(model=review_model,idempotencyKey=rid,message=dict(kind='message',role='user',messageId=rid,parts=[dict(kind='text',text=prompt+'\n\nCODE_EVIDENCE_UNTRUSTED\n'+context)]))
             try:
                 if attempt.get('task_id'):
                     if recovered_task is not None:

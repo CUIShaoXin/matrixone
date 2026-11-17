@@ -31,7 +31,7 @@ class Storage(Objects):
 
 class Job:
  def __init__(self,api):
-  self.state={'prefix':'test/unique','commits':{'repo':'a'*40}};self.api=api;self.stored={};self.saves=0;self.journal=types.SimpleNamespace(save=self.save)
+  self.state={'prefix':'test/unique','commits':{'repo':'a'*40},'review_model':'kimi-k3'};self.api=api;self.stored={};self.saves=0;self.journal=types.SimpleNamespace(save=self.save)
  def save(self):self.saves+=1
  def store(self,key,value):self.stored[key]=copy.deepcopy(value)
  def issue(self,*args):pass

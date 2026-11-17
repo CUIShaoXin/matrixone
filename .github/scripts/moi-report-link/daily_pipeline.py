@@ -171,7 +171,7 @@ def main():
                     with span('component_focus_summary'):
                         focus=build_focus(job,batch,files)
                     page,ncomp,ncode=render(batch,files,code,focus=focus)
-                    source=dict(schema='matrix_unified_scan_source_v1',report_date=date,scope='three-repositories',run_id=run_id,commits=commits,source_acceptance=batch,component_focus=focus,code_review=dict(model='kimi-k3',repositories=code),component_focus_count=ncomp,code_findings=ncode,kb_marker_retrieved=not content_recovery,content_recovery=content_recovery,knowledge_ingestion_verified=not content_recovery,sent=False)
+                    source=dict(schema='matrix_unified_scan_source_v1',report_date=date,scope='three-repositories',run_id=run_id,commits=commits,source_acceptance=batch,component_focus=focus,code_review=dict(model=review_journal.value['review_model'],repositories=code),component_focus_count=ncomp,code_findings=ncode,kb_marker_retrieved=not content_recovery,content_recovery=content_recovery,knowledge_ingestion_verified=not content_recovery,sent=False)
                     body=json_bytes(source);job.store('same-batch-source.json',body)
                     artifact=review_journal.value.get('source_artifact')
                     if artifact:require(api.file(artifact['file_id'])==body,'pipeline_source_artifact_mismatch')
