@@ -273,14 +273,14 @@ class DailyAPI(publication.ReportAPI):
 
 
 class Journal:
-    def __init__(self, objects, key, initial):
+    def __init__(self, objects, key, initial, *, existing_only=False):
         self.objects, self.key = objects, key
         self._lock = threading.RLock()
         try:
             self.value = json.loads(objects.call("GET", key)[2])
             require(self.value["date"] == initial["date"] and self.value["scope"] == initial["scope"], "checkpoint_scope_mismatch")
         except RuntimeError as exc:
-            if str(exc) != "minio_http_404": raise
+            if str(exc) != "minio_http_404" or existing_only: raise
             self.value = initial
             self.save()
 

@@ -34,8 +34,8 @@ def verify_publication(api,objects,receipt_id,date,commits):
     return receipt
 
 
-def open_journal(objects,key,initial):
-    journal=Journal(objects,key,initial)
+def open_journal(objects,key,initial,*,existing_only=False):
+    journal=Journal(objects,key,initial,existing_only=existing_only)
     require(journal.value['run_id']==initial['run_id'],'resume_run_identity_mismatch')
     return journal
 
@@ -74,15 +74,39 @@ def reverify_archives(objects, archives, date):
     return commits
 
 
+def manual_recovery_date(env, clock_date):
+    """Pin an explicitly authorized, already-existing batch, including yesterday."""
+    resume_id=env.get('MATRIX_PIPELINE_RESUME_RUN_ID','')
+    if not (env.get('GITHUB_EVENT_NAME')=='workflow_dispatch'
+            and env.get('MATRIX_SCHEDULED_BATCH')!='true'
+            and env.get('MATRIX_PIPELINE_MODE')=='full'
+            and env.get('MATRIX_CONTENT_RECOVERY')=='true'
+            and re.fullmatch(r'daily-[0-9]{8}', resume_id)):
+        return None
+    try:
+        date=dt.datetime.strptime(resume_id[6:],'%Y%m%d').date()
+        elapsed=(dt.date.fromisoformat(clock_date)-date).days
+    except ValueError:
+        raise ValueError('manual_recovery_date_invalid') from None
+    require(resume_id=='daily-'+date.strftime('%Y%m%d') and elapsed in (0,1),
+            'manual_recovery_date_outside_window')
+    return date.isoformat()
+
+
 def main():
-    date=dt.datetime.now(preflight.LOCAL).date().isoformat();start=time.monotonic()
+    clock_date=dt.datetime.now(preflight.LOCAL).date().isoformat();start=time.monotonic()
+    date=clock_date
     run_id=os.environ.get('MATRIX_PIPELINE_RESUME_RUN_ID') or ('daily-'+date.replace('-','') if os.environ.get('MATRIX_SCHEDULED_BATCH')=='true' else os.environ['GITHUB_RUN_ID']+'-'+os.environ.get('GITHUB_RUN_ATTEMPT','1'))
     mode=os.environ.get('MATRIX_PIPELINE_MODE','full')
     status=dict(schema='matrix_unified_no_send_status_v1',date=date,run_id=run_id,mode=mode,sent=False,daily_automation_ready=False,execution_head=os.environ.get('MATRIX_RUNTIME_SHA',os.environ.get('GITHUB_SHA')))
     out=Path('out/pipeline');out.mkdir(parents=True,exist_ok=True)
     try:
-        require(os.environ.get('MATRIX_EXPECTED_REPORT_DATE',date)==date,'pipeline_expected_date_mismatch')
+        require(os.environ.get('MATRIX_EXPECTED_REPORT_DATE',clock_date)==clock_date,'pipeline_expected_date_mismatch')
         require(re.fullmatch('[A-Za-z0-9_-]{1,80}',run_id) and mode in ('archives','reviews','full','maintenance'),'invalid_pipeline_input')
+        recovery_date=manual_recovery_date(os.environ,clock_date)
+        if recovery_date is not None:
+            date=recovery_date
+            status.update(date=date,recovery_clock_date=clock_date,report_delayed=date!=clock_date)
         api=DailyAPI(os.environ['MOI_API_KEY']);objects=preflight.Objects.from_workspace(api)
         if mode == 'maintenance':
             from review_conversations import probe as review_conversation_probe
@@ -98,7 +122,21 @@ def main():
             print(json.dumps(status), flush=True)
             return 0
         prefix='receipts/'+date.replace('-','')+'/pipeline-'+run_id
-        root=open_journal(objects,prefix+'/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix,sent=False))
+        root=open_journal(objects,prefix+'/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix,sent=False),existing_only=recovery_date is not None)
+        if recovery_date is not None:
+            require(root.value.get('prefix')==prefix and set(root.value.get('archives',{}))==set(REPOS),
+                    'manual_recovery_archives_missing')
+            components=open_journal(objects,prefix+'/components/checkpoint.json',
+                                    dict(date=date,scope='three-repositories',run_id=run_id),existing_only=True)
+            reviews=open_journal(objects,prefix+'/reviews/checkpoint.json',
+                                 dict(date=date,scope='three-repositories',run_id=run_id),existing_only=True)
+            require(components.value.get('archives')==root.value['archives']
+                    and reviews.value.get('commits')=={repo:proof['commit'] for repo,proof in root.value['archives'].items()},
+                    'manual_recovery_snapshot_mismatch')
+            parse=components.value.get('stages',{}).get('matrixflow_parse',{})
+            require(parse.get('status')=='completed' and bool(parse.get('execution_id'))
+                    and parse.get('parse_registration_recovery',{}).get('attempts')==1,
+                    'manual_recovery_parse_not_completed')
         if mode == 'full' and not root.value.get('published') and os.environ.get('MATRIX_CONTENT_RECOVERY') not in ('auto', 'true'):
             knowledge_preflight(api)
             status['knowledge_read_preflight_verified']=True
@@ -126,7 +164,7 @@ def main():
             commits={r:p['commit'] for r,p in archives.items()};status['commits']=commits
             if mode=='archives':status.update(status='passed',same_batch_end_to_end_passed=False,archives_verified=True)
             else:
-                review_journal=open_journal(objects,prefix+'/reviews/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix+'/reviews',commits=commits,issues=[],events=[],unified_current_batch=True,source_id=None,source_sha256=None))
+                review_journal=open_journal(objects,prefix+'/reviews/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix+'/reviews',commits=commits,issues=[],events=[],unified_current_batch=True,source_id=None,source_sha256=None),existing_only=recovery_date is not None)
                 require(review_journal.value['commits']==commits,'review_resume_commit_mismatch')
                 job=Job(api,objects,review_journal,out/'private')
                 code={};api_results={}
@@ -144,7 +182,7 @@ def main():
                 with futures.ThreadPoolExecutor(max_workers=1) as model_pool:
                     model_future=model_pool.submit(all_reviews)
                     if mode=='full':
-                        component_journal=open_journal(objects,prefix+'/components/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix+'/components',archives=archives,commits=commits,sent=False))
+                        component_journal=open_journal(objects,prefix+'/components/checkpoint.json',dict(date=date,scope='three-repositories',run_id=run_id,prefix=prefix+'/components',archives=archives,commits=commits,sent=False),existing_only=recovery_date is not None)
                         require(component_journal.value['archives']==archives,'component_resume_archive_mismatch')
                         runner=Runner(api,objects,component_journal)
                         def component_failure(repo,exc):
@@ -191,7 +229,12 @@ def main():
                                   api_port_findings=receipt['added_findings'],kb_verified=not content_recovery,
                                   knowledge_ingestion_verified=not content_recovery,minio_login_free_verified=True)
         if mode=='full' and (status.get('same_batch_end_to_end_passed') or status.get('content_recovery_ready')):
-            require(dt.datetime.now(preflight.LOCAL).date().isoformat()==date,'pipeline_date_changed')
+            finish_date=dt.datetime.now(preflight.LOCAL).date().isoformat()
+            if recovery_date is None:
+                require(finish_date==clock_date,'pipeline_date_changed')
+            else:
+                require(manual_recovery_date(os.environ,finish_date)==date,'pipeline_date_changed')
+                status['report_delayed']=finish_date!=date
             from daily_delivery import export_ready
             export_ready(api,objects,prefix,date)
             status['daily_delivery_readiness_verified']=True
