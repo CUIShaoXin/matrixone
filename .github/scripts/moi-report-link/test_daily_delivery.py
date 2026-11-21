@@ -179,6 +179,98 @@ class DeliveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'prefix_invalid'):
             d.check_bundle(Mock(), Mock(), 'receipts/20261025/pipeline-old', '2026-10-26')
 
+    def test_delayed_delivery_is_opt_in_and_never_changes_the_scheduler_date(self):
+        env = {'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_EVENT_PATH': 'event.json',
+               'MATRIX_RUNTIME_SHA': 'a' * 40}
+        self.assertEqual(d.delivery_report_date({}, '2026-10-27'), ('2026-10-27', None))
+        with patch.object(d.Path, 'read_bytes', return_value=d.json_bytes(
+                {'inputs': {'mode': 'deliver', 'resume_run_id': 'daily-20261026', 'runtime_ref': 'a' * 40}})) as read:
+            self.assertEqual(d.delivery_report_date(dict(env, GITHUB_EVENT_NAME='schedule'), '2026-10-27'),
+                             ('2026-10-27', None))
+            read.assert_not_called()
+            self.assertEqual(d.delivery_report_date(env, '2026-10-27'), ('2026-10-26', 'daily-20261026'))
+            for date in ('2026-10-25', '2026-10-28'):
+                with self.assertRaisesRegex(ValueError, 'delivery_resume_date_invalid'):
+                    d.delivery_report_date(env, date)
+            with self.assertRaisesRegex(ValueError, 'delivery_resume_mode_mismatch'):
+                d.delivery_report_date(dict(env, MATRIX_DELIVERY_PREVIEW='true'), '2026-10-27')
+            with self.assertRaisesRegex(ValueError, 'delivery_resume_runtime_mismatch'):
+                d.delivery_report_date(dict(env, MATRIX_RUNTIME_SHA='b' * 40), '2026-10-27')
+        with patch.object(d.Path, 'read_bytes', return_value=d.json_bytes(
+                {'inputs': {'mode': 'deliver', 'runtime_ref': 'a' * 40}})):
+            with self.assertRaisesRegex(ValueError, 'delivery_resume_id_invalid'):
+                d.delivery_report_date(env, '2026-10-27')
+
+    def test_delayed_ack_uses_actual_day_and_never_relabels_report(self):
+        claim = dict(self.claim(), delivery_date='2026-10-27', at_utc='2026-10-26T17:00:00+00:00')
+        task = self.native_task()
+        with self.assertRaisesRegex(ValueError, 'delivery_ack_wrong_date'):
+            d.verify_send(task, claim)
+        task['events'][1]['output']['created_at'] = '2026-10-26T16:59:59Z'
+        with self.assertRaisesRegex(ValueError, 'delivery_ack_before_claim'):
+            d.verify_send(task, claim)
+        task['events'][1]['output']['created_at'] = '2026-10-26T17:00:05Z'
+        result = d.verify_send(task, claim)
+        self.assertEqual(result['date'], '2026-10-26')
+        self.assertEqual(result['delivery_date'], '2026-10-27')
+        self.assertTrue(result['report_delayed'])
+
+    def explicit_resume(self):
+        date, run_id = '2026-10-26', 'daily-20261026'
+        prefix = 'receipts/20261026/pipeline-' + run_id
+        bundle = self.bundle()
+        bundle.update(pages_verified=6)
+        bundle['root'].update(run_id=run_id)
+        pointer = dict(schema='matrix_daily_ready_v1', date=date, scope='three-repositories',
+                       prefix=prefix, run_id=run_id, publication_file_id='file',
+                       publication_sha256='hash')
+        return date, run_id, bundle, pointer
+
+    def test_delayed_preview_targets_exact_report_and_requires_six_pages(self):
+        date, run_id, bundle, pointer = self.explicit_resume()
+        api, objects = Mock(), Mock()
+        with patch.object(d, 'read_json', side_effect=[None, pointer]), \
+             patch.object(d, 'check_bundle', return_value=bundle) as check, patch.object(d, 'create_once') as create:
+            status = d.deliver(api, objects, date, preview=True, resumed_run_id=run_id, actual_delivery_date='2026-10-27')
+            self.assertEqual(status['status'], 'preview_passed')
+            check.assert_called_once_with(api, objects, pointer['prefix'], date)
+            create.assert_not_called()
+        bundle.update(pages_verified=5)
+        with patch.object(d, 'read_json', side_effect=[None, pointer]), \
+             patch.object(d, 'check_bundle', return_value=bundle), patch.object(d, 'create_once') as create:
+            with self.assertRaisesRegex(ValueError, 'resumed_report_requires_six_pages'):
+                d.deliver(api, objects, date, preview=True, resumed_run_id=run_id, actual_delivery_date='2026-10-27')
+            create.assert_not_called()
+        api.rpc.assert_not_called()
+
+    def test_delayed_delivery_only_uses_existing_day_claim_and_send_key(self):
+        date, run_id, bundle, pointer = self.explicit_resume()
+        api, objects, stored = Mock(), Mock(), {}
+        actual = '2026-10-27'
+        def read(objects, key, missing=False):
+            return pointer if key.endswith('/ready.json') else stored.get(key)
+        def create(objects, key, claim):
+            self.assertEqual(key, 'daily/20261026/delivery-claim.json')
+            stored[key] = claim
+            api.rpc.return_value = {'id': claim['task_id']}
+            return True, claim
+        now = dt.datetime(2026, 10, 27, 1, 0, tzinfo=d.LOCAL)
+        with patch.object(d, 'read_json', side_effect=read), \
+             patch.object(d, 'check_bundle', return_value=bundle), patch.object(d, 'prior_delivery'), \
+             patch.object(d, 'recover_claim') as recover, patch.object(d, 'create_once', side_effect=create) as reserve, \
+             patch.object(d, 'assert_expected_date') as check_clock, \
+             patch.object(d.dt, 'datetime', wraps=dt.datetime) as clock:
+            clock.now.return_value = now
+            for _ in range(2):
+                d.deliver(api, objects, date, resumed_run_id=run_id, actual_delivery_date=actual,
+                          not_before=d.delivery_not_before(date))
+        self.assertEqual(recover.call_count, 2)
+        self.assertEqual(reserve.call_count, 1)
+        self.assertEqual(check_clock.call_count, 3)
+        self.assertEqual([call.args[0] for call in api.rpc.call_args_list], ['message/send'])
+        self.assertEqual(api.rpc.call_args.args[2], 'matrix-daily-20261026-' + d.CHANNEL)
+        self.assertIn('2026-10-26（补发）', stored['daily/20261026/delivery-claim.json']['content'])
+
 
 class FaultDrills(unittest.TestCase):
  def setUp(self):

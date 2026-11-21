@@ -180,9 +180,9 @@ def brief(text, limit=42):
     return re.sub(r'([\\`*_{}\[\]()<>])', r'\\\1', text)
 
 
-def compose(bundle, date):
+def compose(bundle, date, *, delayed=False):
     source, r = bundle['source'], bundle['receipt']
-    lines = ['【安全日报｜组件＋代码＋API／端口】', date, '']
+    lines = ['【安全日报｜组件＋代码＋API／端口】', date + ('（补发）' if delayed else ''), '']
     for repo in REPOS:
         components = [c for c in source['component_focus'] if c['repo'] == repo]
         code = source['code_review']['repositories'][repo]['retained_findings']
@@ -262,12 +262,15 @@ def verify_send(task, claim):
               and isinstance(result.get('created_at'), str) and output.get('ok') is True
               and output.get('operation') == 'group_robot_send' and output.get('request_id') == cid
               and output.get('workspace_id') == WORKSPACE)
-    require(legacy or native, 'delivery_real_tool_receipt_missing')
+    delivery_date = claim.get('delivery_date', claim['date'])
+    require(native or (legacy and delivery_date == claim['date']), 'delivery_real_tool_receipt_missing')
     if native:
         # Go emits nanoseconds; Python 3.9 accepts at most microseconds.
         stamp = re.sub(r'(\.\d{6})\d+', r'\1', result['created_at']).replace('Z', '+00:00')
         at = dt.datetime.fromisoformat(stamp)
-        require(at.tzinfo is not None and at.astimezone(LOCAL).date().isoformat() == claim['date'], 'delivery_ack_wrong_date')
+        require(at.tzinfo is not None and at.astimezone(LOCAL).date().isoformat() == delivery_date, 'delivery_ack_wrong_date')
+        if delivery_date != claim['date']:
+            require(at >= dt.datetime.fromisoformat(claim['at_utc']), 'delivery_ack_before_claim')
     final = dict(schema='matrix_daily_delivery_v1', date=claim['date'], scope='three-repositories',
                 sent=True, status='sent', channel_instance_id=CHANNEL, task_id=task['id'],
                 attempt_id=claim['attempt_id'], tool_call_id=cid, tool_output=result,
@@ -281,6 +284,8 @@ def verify_send(task, claim):
                      claim_content_sha256=sha(claim['content'].encode()))
     if 'report_identity' in claim:
         final['report_identity'] = claim['report_identity']
+    if delivery_date != claim['date']:
+        final.update(delivery_date=delivery_date, report_delayed=True)
     return final
 
 
@@ -366,6 +371,9 @@ def validate_claim(claim, date, pointer=None):
             and all(isinstance(claim.get(k), str) and claim[k] for k in
                     ('task_id', 'attempt_id', 'content', 'publication_file_id', 'prefix')),
             'delivery_claim_conflict')
+    if 'delivery_date' in claim:
+        require(claim['delivery_date'] == (dt.date.fromisoformat(date) + dt.timedelta(days=1)).isoformat(),
+                'delivery_claim_conflict')
     if 'content_sha256' in claim:
         require(claim['content_sha256'] == sha(claim['content'].encode()), 'delivery_claim_conflict')
     identity = claim.get('report_identity')
@@ -612,6 +620,8 @@ def recover_claim(api, objects, date, claim, complete, deadline, poll_seconds, p
             return dict(status='already_sent' if complete is not None else 'sent_verified',
                         sent=True, duplicate_prevented=True, successful_send_count=1,
                         tool_call_id=stored['tool_call_id'], task_id=stored['task_id'],
+                        sent_at_utc=stored.get('sent_at_utc'),
+                        tool_receipt_protocol=stored.get('tool_receipt_protocol'),
                         receipt_file_id=artifact['file_id'],
                         catalog_attachment=artifact.get('catalog_attachment', 'unknown'))
         except Exception as exc:
@@ -621,7 +631,7 @@ def recover_claim(api, objects, date, claim, complete, deadline, poll_seconds, p
     raise ValueError('delivery_uncertain_read_original_task_only')
 
 
-def recover_delivery(api, objects, date, poll_seconds=15, deadline_seconds=900):
+def recover_delivery(api, objects, date, poll_seconds=15, deadline_seconds=900, *, expected_prefix=None):
     """Receipt-only entry point: no report downloads and no message/send path."""
     deadline = time.monotonic() + deadline_seconds
     base = 'daily/' + date.replace('-', '')
@@ -631,6 +641,7 @@ def recover_delivery(api, objects, date, poll_seconds=15, deadline_seconds=900):
         try:
             claim = read_json(bounded_objects, base + '/delivery-claim.json')
             require(claim is not None, 'delivery_existing_claim_required')
+            require(expected_prefix is None or claim.get('prefix') == expected_prefix, 'delivery_claim_conflict')
             complete = read_json(bounded_objects, base + '/delivery-completed.json', missing=True)
         except Exception as exc:
             if not transient(exc):
@@ -641,15 +652,24 @@ def recover_delivery(api, objects, date, poll_seconds=15, deadline_seconds=900):
     raise ValueError('delivery_uncertain_read_original_task_only')
 
 
-def deliver(api, objects, date, preview=False, poll_seconds=15, deadline_seconds=900, not_before=None):
+def deliver(api, objects, date, preview=False, poll_seconds=15, deadline_seconds=900, not_before=None,
+            resumed_run_id=None, actual_delivery_date=None):
     base = 'daily/' + date.replace('-', '')
+    explicit_prefix = None
+    if resumed_run_id is not None:
+        require(resumed_run_id == 'daily-' + date.replace('-', ''), 'delivery_resume_id_mismatch')
+        explicit_prefix = 'receipts/' + date.replace('-', '') + '/pipeline-' + resumed_run_id
     complete = read_json(objects, base + '/delivery-completed.json', missing=True)
     if complete is not None and not preview:
         deadline = time.monotonic() + deadline_seconds
         claim = read_json(objects, base + '/delivery-claim.json')
+        require(explicit_prefix is None or claim['prefix'] == explicit_prefix, 'delivery_claim_conflict')
         return recover_claim(api, objects, date, claim, complete, deadline, poll_seconds)
     pointer = read_json(objects, base + '/ready.json')
     require(pointer['schema'] == 'matrix_daily_ready_v1' and pointer['date'] == date and pointer['scope'] == 'three-repositories', 'delivery_ready_wrong_identity')
+    if explicit_prefix is not None:
+        require(pointer['prefix'] == explicit_prefix and pointer.get('run_id') == resumed_run_id,
+                'delivery_resume_id_mismatch')
     bundle = check_bundle(api, objects, pointer['prefix'], date)
     require(bundle['root']['publication_file_id'] == pointer['publication_file_id']
             and bundle['publication_sha256'] == pointer['publication_sha256']
@@ -657,18 +677,37 @@ def deliver(api, objects, date, preview=False, poll_seconds=15, deadline_seconds
             and bundle['receipt'].get('knowledge_ingestion_verified') is pointer.get('knowledge_ingestion_verified')
             and all(bundle['root'].get(k) == pointer[k] for k in ('run_id', 'commits') if k in pointer),
             'delivery_pointer_changed')
-    content = compose(bundle, date)
+    if explicit_prefix is not None:
+        require(bundle['pages_verified'] == 6, 'delivery_resumed_report_requires_six_pages')
+    content = compose(bundle, date, delayed=actual_delivery_date is not None)
     if preview:
-        return dict(status='preview_passed', sent=False, pages_verified=bundle['pages_verified'], message_bytes=len(content.encode()))
+        result = dict(status='preview_passed', sent=False, pages_verified=bundle['pages_verified'],
+                      message_bytes=len(content.encode()))
+        if explicit_prefix is not None:
+            result.update(run_id=resumed_run_id, publication_file_id=pointer['publication_file_id'],
+                          publication_sha256=bundle['publication_sha256'])
+        return result
     existing = read_json(objects, base + '/delivery-claim.json', missing=True)
     if existing is not None:
         deadline = time.monotonic() + deadline_seconds
         return recover_claim(api, objects, date, existing, None, deadline, poll_seconds, pointer)
-    if not_before is not None:
+    if actual_delivery_date is None and not_before is not None:
         wait_until_delivery(date, not_before)
     prior_delivery(api, date)
-    if not_before is not None:
-        assert_send_time(date, not_before)
+    def send_guard():
+        if actual_delivery_date is not None:
+            require(explicit_prefix is not None
+                    and actual_delivery_date == (dt.date.fromisoformat(date) + dt.timedelta(days=1)).isoformat(),
+                    'delivery_resume_date_invalid')
+            assert_expected_date(actual_delivery_date)
+            require(not_before is not None and not_before >= delivery_not_before(date)
+                    and dt.datetime.now(LOCAL) >= not_before,
+                    'delivery_before_ten_blocked')
+        elif not_before is not None:
+            assert_send_time(date, not_before)
+        elif os.environ.get('MATRIX_EXPECTED_REPORT_DATE') is not None:
+            assert_expected_date(date)
+    send_guard()
     deadline = time.monotonic() + deadline_seconds
     rid = 'matrix-daily-' + date.replace('-', '') + '-' + CHANNEL
     tid = 'art-' + sha((WORKSPACE + '\0' + rid).encode())[:48]
@@ -684,10 +723,9 @@ def deliver(api, objects, date, preview=False, poll_seconds=15, deadline_seconds
                  content_sha256=sha(content.encode()), report_identity=report_identity(pointer),
                  owner=os.environ.get('GITHUB_RUN_ID', 'manual') + '-' + os.environ.get('GITHUB_RUN_ATTEMPT', '1'),
                  at_utc=dt.datetime.now(dt.timezone.utc).isoformat())
-    if not_before is not None:
-        assert_send_time(date, not_before)
-    elif os.environ.get('MATRIX_EXPECTED_REPORT_DATE') is not None:
-        assert_expected_date(date)
+    if actual_delivery_date is not None:
+        claim.update(delivery_date=actual_delivery_date)
+    send_guard()
     created, existing = create_once(RecoveryObjects(objects, deadline), base + '/delivery-claim.json', claim)
     claim = existing
     validate_claim(claim, date, pointer)
@@ -696,10 +734,7 @@ def deliver(api, objects, date, preview=False, poll_seconds=15, deadline_seconds
         # Exactly one caller receives permission. Death or an uncertain response
         # permanently removes permission to submit, including on process restart.
         remaining(deadline)
-        if not_before is not None:
-            assert_send_time(date, not_before)
-        elif os.environ.get('MATRIX_EXPECTED_REPORT_DATE') is not None:
-            assert_expected_date(date)
+        send_guard()
         try:
             task = RecoveryAPI(api, deadline).rpc('message/send', claim['request'], claim['attempt_id'])
         except Exception:
@@ -748,13 +783,47 @@ def wait_until_delivery(date, not_before):
         time.sleep(min(60, (not_before - now).total_seconds()))
 
 
+def delivery_report_date(env, clock_date):
+    if env.get('GITHUB_EVENT_NAME') != 'workflow_dispatch':
+        return clock_date, None
+    event_path = env.get('GITHUB_EVENT_PATH')
+    require(bool(event_path), 'delivery_resume_event_missing')
+    try:
+        event = json.loads(Path(event_path).read_bytes())
+    except (OSError, ValueError):
+        raise ValueError('delivery_resume_event_unreadable') from None
+    inputs = event.get('inputs') if isinstance(event, dict) else None
+    require(isinstance(inputs, dict), 'delivery_resume_inputs_missing')
+    mode = 'preview' if env.get('MATRIX_DELIVERY_PREVIEW') == 'true' else 'deliver'
+    require(inputs.get('mode') == mode, 'delivery_resume_mode_mismatch')
+    head = env.get('MATRIX_RUNTIME_SHA', '')
+    require(re.fullmatch(r'[0-9a-f]{40}', head) and inputs.get('runtime_ref') == head,
+            'delivery_resume_runtime_mismatch')
+    run_id = inputs.get('resume_run_id')
+    require(isinstance(run_id, str) and re.fullmatch(r'daily-[0-9]{8}', run_id),
+            'delivery_resume_id_invalid')
+    raw = run_id[6:]
+    try:
+        business_date = dt.date.fromisoformat(raw[:4]+'-'+raw[4:6]+'-'+raw[6:])
+    except ValueError:
+        raise ValueError('delivery_resume_date_invalid') from None
+    require((dt.date.fromisoformat(clock_date) - business_date).days in (0, 1),
+            'delivery_resume_date_invalid')
+    return business_date.isoformat(), run_id
+
+
 def main():
-    date = dt.datetime.now(LOCAL).date().isoformat()
+    clock_date = date = dt.datetime.now(LOCAL).date().isoformat()
     out = Path('out/delivery'); out.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
     status = dict(date=date, sent=False, runtime_head=os.environ.get('MATRIX_RUNTIME_SHA'))
     try:
-        assert_expected_date(date)
+        assert_expected_date(clock_date)
+        date, resume = delivery_report_date(os.environ, clock_date)
+        late = clock_date if date != clock_date else None
+        status.update(date=date)
+        if late is not None:
+            status.update(delivery_date=late, report_delayed=True)
         preview = os.environ.get('MATRIX_DELIVERY_PREVIEW') == 'true'
         scheduled = os.environ.get('MATRIX_DELIVERY_NOT_BEFORE')
         not_before = delivery_not_before(date, scheduled)
@@ -766,11 +835,14 @@ def main():
         api = DailyAPI(os.environ['MOI_API_KEY']); objects = Objects.from_workspace(api)
         if not preview and (os.environ.get('MATRIX_DELIVERY_RECOVER_ONLY') == 'true'
                 or read_json(objects, 'daily/' + date.replace('-', '') + '/delivery-claim.json', missing=True) is not None):
-            status.update(recover_delivery(api, objects, date, deadline_seconds=deadline_seconds))
+            expected_prefix = 'receipts/' + date.replace('-', '') + '/pipeline-' + resume if resume else None
+            status.update(recover_delivery(api, objects, date, deadline_seconds=deadline_seconds,
+                                          expected_prefix=expected_prefix))
         else:
-            require(preview or scheduled is not None or dt.datetime.now(LOCAL).hour >= 10, 'delivery_before_ten_blocked')
+            require(preview or late is not None or scheduled is not None or dt.datetime.now(LOCAL).hour >= 10, 'delivery_before_ten_blocked')
             status.update(deliver(api, objects, date, preview=preview,
-                                  deadline_seconds=deadline_seconds, not_before=not_before))
+                                  deadline_seconds=deadline_seconds, not_before=not_before,
+                                  resumed_run_id=resume, actual_delivery_date=late))
     except Exception as exc:
         status.update(status='failed', **error_fields(exc))
         if re.fullmatch('[a-z][a-z0-9_]{0,100}', str(exc)): status['safe_code'] = str(exc)
