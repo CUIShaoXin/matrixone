@@ -5,7 +5,7 @@ import unittest
 import uuid
 from unittest.mock import patch
 
-from cloud_daily import Runner, WORKSPACE, Failure, sha256, json_bytes
+from cloud_daily import Runner, WORKSPACE, Failure, sha256, json_bytes, PARSE_REGISTRATION_ERROR
 
 
 class MemoryObjects:
@@ -33,6 +33,9 @@ class WorkflowAPI:
         self.active = 0
         self.changed = False
         self.summary_total = None
+        self.terminal_error = None
+        self.current_execution = 'execution-1'
+        self.deploy_payloads = []
 
     @staticmethod
     def data(value):
@@ -46,6 +49,7 @@ class WorkflowAPI:
     def request(self, path, payload=None, method=None, **kw):
         if path.endswith('/workflow-deployments'):
             self.deploys += 1
+            self.deploy_payloads.append(copy.deepcopy(payload))
             self.exists = True
             self.wid = payload.get('workflow_id', 'server-assigned-' + str(self.deploys) + '-' + str(id(self)))
             self.definition = dict(id=self.wid, name=payload['name'], description=payload['description'],
@@ -54,11 +58,15 @@ class WorkflowAPI:
             return {'workflow': {'id': self.wid}}
         if path.endswith('/executions'):
             self.submits += 1
-            return {'workflow_run': {'execution_id': 'execution-1'}}
+            self.current_execution = 'execution-' + str(self.submits)
+            return {'workflow_run': {'execution_id': self.current_execution}}
         if path.endswith('/result'):
             if not self.exists:
                 raise Failure('moi_http_404')
-            return {'result': dict(execution_id='execution-1', workflow_id=self.wid, status=self.terminal)}
+            result = dict(execution_id=self.current_execution, workflow_id=self.wid, status=self.terminal)
+            if self.terminal_error is not None:
+                result['case_error'] = self.terminal_error
+            return {'result': result}
         if '/nodes/root.' in path:
             if not self.exists:
                 raise Failure('moi_http_404')
@@ -76,9 +84,24 @@ class WorkflowAPI:
         if not self.exists:
             raise Failure('moi_http_404')
         definition = dict(self.definition, execution_summary=dict(active_executions=self.active,
-                          latest_execution_id='another-run' if self.changed else 'execution-1',
+                          latest_execution_id='another-run' if self.changed else self.current_execution,
                           total_executions=self.summary_total if self.summary_total is not None else (1 if self.submits else 0)))
         return {'workflow': definition}
+
+
+class ParseRegistrationAPI(WorkflowAPI):
+    def __init__(self, succeed_on_retry=True):
+        super().__init__()
+        self.succeed_on_retry = succeed_on_retry
+        self.terminal = 'failed'
+        self.terminal_error = PARSE_REGISTRATION_ERROR
+
+    def request(self, path, payload=None, method=None, **kw):
+        response = super().request(path, payload, method, **kw)
+        if path.endswith('/executions') and self.succeed_on_retry and self.submits == 2:
+            self.terminal = 'completed'
+            self.terminal_error = None
+        return response
 
 
 class WorkflowLifecycleTests(unittest.TestCase):
@@ -357,6 +380,74 @@ class WorkflowLifecycleTests(unittest.TestCase):
         self.assertEqual(stage['status'], 'failed')
         self.assertEqual(stage['cleanup']['status'], 'deleted')
         self.assertEqual((runner.api.deploys, runner.api.submits), (1, 1))
+
+    def test_parse_registration_failure_reserves_one_identical_input_retry(self):
+        runner, nodes = self.runner()
+        runner.api = ParseRegistrationAPI()
+        runner.workflow('matrixflow_parse', nodes)
+        stage = runner.state['stages']['matrixflow_parse']
+        recovery = stage['parse_registration_recovery']
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(recovery['attempts'], 1)
+        self.assertEqual(recovery['original_execution_id'], 'execution-1')
+        self.assertEqual(recovery['input_sha256'], stage['input_sha256'])
+        self.assertNotEqual(recovery['original_workflow_id'], stage['workflow_id'])
+        self.assertEqual(runner.api.deploy_payloads[0]['dsl_yaml'], runner.api.deploy_payloads[1]['dsl_yaml'])
+        self.assertEqual((runner.api.deploys, runner.api.submits, runner.api.deletes), (2, 2, 2))
+
+    def test_parse_registration_second_failure_never_retries_again(self):
+        runner, nodes = self.runner()
+        runner.api = ParseRegistrationAPI(succeed_on_retry=False)
+        for _ in range(2):
+            with self.assertRaisesRegex(Failure, 'moi_workflow_failed'):
+                runner.workflow('matrixflow_parse', nodes)
+        stage = runner.state['stages']['matrixflow_parse']
+        self.assertEqual(stage['status'], 'failed')
+        self.assertEqual(stage['parse_registration_recovery']['attempts'], 1)
+        self.assertEqual((runner.api.deploys, runner.api.submits, runner.api.deletes), (2, 2, 2))
+
+    def test_parse_registration_retry_requires_retired_original_and_exact_error(self):
+        runner, nodes = self.runner()
+        runner.api = ParseRegistrationAPI()
+        runner.api.active = 1
+        with self.assertRaisesRegex(Failure, 'moi_workflow_failed'):
+            runner.workflow('matrixflow_parse', nodes)
+        stage = runner.state['stages']['matrixflow_parse']
+        self.assertNotIn('parse_registration_recovery', stage)
+        self.assertEqual((runner.api.deploys, runner.api.submits, runner.api.deletes), (1, 1, 0))
+
+        other, other_nodes = self.runner()
+        other.api.terminal = 'failed'
+        other.api.terminal_error = 'a different execution failure'
+        with self.assertRaisesRegex(Failure, 'moi_workflow_failed'):
+            other.workflow('matrixflow_parse', other_nodes)
+        self.assertEqual((other.api.deploys, other.api.submits), (1, 1))
+
+    def test_parse_registration_resume_uses_verified_archive_after_crash(self):
+        runner, nodes = self.runner()
+        runner.api = ParseRegistrationAPI()
+        with patch.object(Runner, '_prepare_parse_registration_retry', side_effect=RuntimeError('crash after archive')):
+            with self.assertRaisesRegex(RuntimeError, 'crash after archive'):
+                runner.workflow('matrixflow_parse', nodes)
+        stage = runner.state['stages']['matrixflow_parse']
+        self.assertEqual(stage['status'], 'failed')
+        stage['cleanup'] = dict(status='pending', safe_error='workflow_cleanup_delete_unconfirmed')
+        self.assertNotIn('parse_registration_recovery', stage)
+        runner.workflow('matrixflow_parse', nodes)
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['parse_registration_recovery']['original_execution_id'], 'execution-1')
+        self.assertEqual((runner.api.deploys, runner.api.submits, runner.api.deletes), (2, 2, 2))
+
+    def test_parse_registration_resume_still_rejects_changed_input(self):
+        runner, nodes = self.runner()
+        runner.api = ParseRegistrationAPI(succeed_on_retry=False)
+        with self.assertRaisesRegex(Failure, 'moi_workflow_failed'):
+            runner.workflow('matrixflow_parse', nodes)
+        changed = copy.deepcopy(nodes)
+        changed[0]['input']['text'] = 'changed manifest input'
+        with self.assertRaisesRegex(Failure, 'workflow_resume_input_changed'):
+            runner.workflow('matrixflow_parse', changed)
+        self.assertEqual((runner.api.deploys, runner.api.submits), (2, 2))
 
     def test_crash_after_delete_recovers_from_verified_archive(self):
         from workflow_lifecycle import retire
