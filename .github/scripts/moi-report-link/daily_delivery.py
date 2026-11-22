@@ -201,21 +201,46 @@ def compose(bundle, date):
     return content
 
 
+def delivery_catalog_rows(api):
+    """Scan the same volume, including legacy origin names, with fewer reads."""
+    size, page, total = 400, 1, None
+    seen = set()
+    while page <= 100:
+        data = api.data(api.request('/catalog/file/list', {
+            'filters': [{'name': 'volume_id', 'values': ['130001']}],
+            'page': page, 'page_size': size}))
+        rows, count = data.get('list'), data.get('total')
+        require(isinstance(rows, list) and type(count) is int and count >= 0,
+                'delivery_history_unreadable')
+        if page == 1 and size == 400 and len(rows) == 100 and count > 100:
+            # Older deployments may cap page size at 100. Restart from page 1
+            # with the explicit cap; never interpret a short page as EOF.
+            size = 100
+            continue
+        total = count if total is None else total
+        require(count == total and len(rows) == min(size, max(0, total - len(seen))),
+                'delivery_history_pagination_changed')
+        for row in rows:
+            fid = row.get('file_id') or row.get('id')
+            require(isinstance(fid, str) and fid and fid not in seen,
+                    'delivery_history_pagination_changed')
+            seen.add(fid)
+            yield row
+        if len(seen) == total:
+            return
+        page += 1
+    raise ValueError('delivery_history_pagination_incomplete')
+
+
 def prior_delivery(api, date):
     """Inspect older native delivery receipts as well as the new global claim."""
-    for page in range(1, 101):
-        result = api.data(api.request('/catalog/file/list', {'filters': [{'name': 'volume_id', 'values': ['130001']}], 'page': page, 'page_size': 100}))
-        rows = result.get('list')
-        require(isinstance(rows, list), 'delivery_history_unreadable')
-        for row in rows:
+    with span('delivery_legacy_history'):
+        for row in delivery_catalog_rows(api):
             name = row.get('origin_file_name') or row.get('name', '')
             if 'delivery' in name and date.replace('-', '') in name and name.endswith('.json'):
-                value = json.loads(api.file(row.get('file_id', row.get('id'))))
+                value = json.loads(api.file(row.get('file_id') or row.get('id')))
                 if value.get('channel_instance_id') == CHANNEL and (value.get('sent') or value.get('status') in ('sending', 'uncertain', 'sent')):
                     raise ValueError('native_prior_delivery_requires_reconciliation')
-        if len(rows) < 100:
-            return
-    raise ValueError('delivery_history_pagination_incomplete')
 
 
 def send_events(task, kind):
@@ -402,22 +427,15 @@ def find_native_receipt(api, final):
     """Reconcile a lost upload response by catalog/file reads, never re-upload."""
     name = 'matrix-security-delivery-' + final['date'].replace('-', '') + '.json'
     found = None
-    for page in range(1, 101):
-        result = api.data(api.request('/catalog/file/list', {
-            'filters': [{'name': 'volume_id', 'values': ['130001']}],
-            'page': page, 'page_size': 100}))
-        rows = result.get('list')
-        require(isinstance(rows, list), 'delivery_history_unreadable')
-        for row in rows:
+    with span('delivery_native_receipt_lookup'):
+        for row in delivery_catalog_rows(api):
             if (row.get('origin_file_name') or row.get('name')) == name:
-                fid = row.get('file_id', row.get('id'))
+                fid = row.get('file_id') or row.get('id')
                 raw = api.file(fid)
                 require(raw == json_bytes(final), 'delivery_native_receipt_mismatch')
                 found = dict(file_id=fid, bytes=len(raw), sha256=sha(raw), readback_verified=True,
                              catalog_attachment='verified')
-        if len(rows) < 100:
-            return found
-    raise ValueError('delivery_history_pagination_incomplete')
+    return found
 
 
 def upload_receipt_file(api, name, raw):
@@ -612,6 +630,7 @@ def recover_claim(api, objects, date, claim, complete, deadline, poll_seconds, p
             return dict(status='already_sent' if complete is not None else 'sent_verified',
                         sent=True, duplicate_prevented=True, successful_send_count=1,
                         tool_call_id=stored['tool_call_id'], task_id=stored['task_id'],
+                        sent_at_utc=stored.get('sent_at_utc'),
                         receipt_file_id=artifact['file_id'],
                         catalog_attachment=artifact.get('catalog_attachment', 'unknown'))
         except Exception as exc:
@@ -659,7 +678,25 @@ def deliver(api, objects, date, preview=False, poll_seconds=15, deadline_seconds
             'delivery_pointer_changed')
     content = compose(bundle, date)
     if preview:
-        return dict(status='preview_passed', sent=False, pages_verified=bundle['pages_verified'], message_bytes=len(content.encode()))
+        with span('delivery_preview_history'):
+            history_rows = sum(1 for _ in delivery_catalog_rows(api))
+        summary = dict(status='preview_passed', sent=False, pages_verified=bundle['pages_verified'],
+                       message_bytes=len(content.encode()), history_rows=history_rows)
+        if complete is not None:
+            # Compare the original ack and both receipts without writing remote
+            # objects or inferring a send from this preview.
+            claim = read_json(objects, base + '/delivery-claim.json')
+            validate_claim(claim, date, pointer)
+            task = api.rpc('tasks/get', {'id': claim['task_id']}, str(uuid.uuid4()))
+            if 'report_identity' not in claim and 'report_identity' in complete:
+                claim = dict(claim, report_identity=report_identity(pointer))
+            validate_completion(complete, verify_send(task, claim))
+            artifact = read_json(objects, base + '/native-delivery-receipt.json')
+            require(checked_file(api, artifact) == json_bytes(complete), 'delivery_native_receipt_mismatch')
+            summary.update(existing_send_verified=True, sent_at_utc=complete.get('sent_at_utc'),
+                           successful_send_count=1, tool_call_id=complete['tool_call_id'],
+                           receipt_file_id=artifact['file_id'])
+        return summary
     existing = read_json(objects, base + '/delivery-claim.json', missing=True)
     if existing is not None:
         deadline = time.monotonic() + deadline_seconds

@@ -17,6 +17,7 @@ TRANSIENT_TYPES = {'TimeoutError', 'URLError', 'ConnectionError', 'IncompleteRea
 SCAN_RECOVERABLE = {'component_scan_incomplete', 'source_review_incomplete',
                     'knowledge_ingestion_deadline', 'moi_workflow_timeout'}
 DELIVERY_RECOVERABLE = {'delivery_uncertain_read_original_task_only',
+                        'delivery_history_pagination_changed',
                         'minio_http_404'}
 
 

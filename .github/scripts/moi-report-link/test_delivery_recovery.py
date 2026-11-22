@@ -140,7 +140,9 @@ class FakeAPI:
         self.calls.append((path, copy.deepcopy(payload), self.clock.elapsed))
         if path == '/catalog/file/list':
             self.fault('list')
-            return dict(list=[dict(file_id=fid, origin_file_name=name) for fid, name in self.backend['names'].items()])
+            rows = [dict(file_id=fid, origin_file_name=name) for fid, name in self.backend['names'].items()]
+            size, page = payload['page_size'], payload['page']
+            return dict(total=len(rows), list=rows[(page - 1) * size:page * size])
         if path == '/catalog/file/create':
             # Fail any test that attaches before the exact FID is durable.
             identity = self.objects.get_json(UPLOAD_FILE)
@@ -785,6 +787,21 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(code, 0); self.assertEqual(status['status'], 'preview_passed')
         self.assertEqual(self.clock.sleeps, [])
         self.assertTrue(all(c[0] == 'GET' for c in self.objects.calls)); self.assert_no_resend()
+
+    def test_preview_recovers_the_ack_time_without_receipt_writes(self):
+        self.fresh('2026-10-28T10:10:00+08:00')
+        self.seed_claim()
+        original = self.recover()
+        self.objects.calls.clear()
+        self.api.calls.clear()
+        code, status = self.run_main(dict(MATRIX_DELIVERY_PREVIEW='true'))
+        self.assertEqual(code, 0)
+        self.assertFalse(status['sent'])
+        self.assertTrue(status['existing_send_verified'])
+        self.assertEqual(status['sent_at_utc'], original['sent_at_utc'])
+        self.assertEqual(status['tool_call_id'], original['tool_call_id'])
+        self.assertTrue(all(c[0] == 'GET' for c in self.objects.calls))
+        self.assertEqual([c[0] for c in self.api.calls if c[0] in ('message/send', 'tasks/get')], ['tasks/get'])
 
     def test_main_without_not_before_preserves_ten_oclock_gate(self):
         self.fresh('2026-10-28T09:50:00+08:00')

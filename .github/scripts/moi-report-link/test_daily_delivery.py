@@ -141,10 +141,47 @@ class DeliveryTests(unittest.TestCase):
 
     def test_preview_checks_but_never_claims_or_sends(self):
         api, objects = Mock(), Mock()
+        api.data.return_value = dict(total=0, list=[])
         pointer = dict(schema='matrix_daily_ready_v1', date='2026-10-26', scope='three-repositories', prefix='prefix', publication_file_id='file', publication_sha256='hash')
         with patch.object(d, 'read_json', side_effect=[None, pointer]), patch.object(d, 'check_bundle', return_value=self.bundle()), patch.object(d, 'create_once') as create:
             self.assertEqual(d.deliver(api, objects, '2026-10-26', preview=True)['status'], 'preview_passed')
             create.assert_not_called(); api.rpc.assert_not_called()
+
+    def test_large_catalog_still_finds_a_renamed_legacy_receipt_on_last_page(self):
+        api = Mock()
+        rows = [dict(id=str(i), name='archive') for i in range(8000)]
+        rows[-1]['origin_file_name'] = 'legacy-delivery-20261026.json'
+        sizes = []
+        def list_page(path, args):
+            page, size = args['page'], args['page_size']
+            sizes.append(size)
+            return dict(total=len(rows), list=rows[(page - 1) * size:page * size])
+        api.request.side_effect = list_page
+        api.data.side_effect = lambda reply: reply
+        api.file.return_value = d.json_bytes(dict(channel_instance_id=d.CHANNEL, status='uncertain'))
+        with self.assertRaisesRegex(ValueError, 'native_prior_delivery_requires_reconciliation'):
+            d.prior_delivery(api, '2026-10-26')
+        self.assertEqual(sizes, [400] * 20)
+        api.file.assert_called_once_with('7999')
+
+    def test_catalog_cap_restarts_without_skipping_and_unstable_pages_block(self):
+        api = Mock()
+        rows = [dict(id=str(i)) for i in range(150)]
+        api.data.side_effect = lambda reply: reply
+        api.request.side_effect = [dict(total=150, list=rows[:100]),
+                                   dict(total=150, list=rows[:100]),
+                                   dict(total=150, list=rows[100:])]
+        self.assertEqual(list(d.delivery_catalog_rows(api)), rows)
+        self.assertEqual([(c.args[1]['page'], c.args[1]['page_size']) for c in api.request.call_args_list],
+                         [(1, 400), (1, 100), (2, 100)])
+        first = [dict(id=str(i)) for i in range(400)]
+        for bad in (dict(total=402, list=[dict(id='400'), dict(id='401')]),
+                    dict(total=401, list=[dict(id='399')]),
+                    dict(total=401, list=[])):
+            with self.subTest(bad=bad):
+                api.request.side_effect = [dict(total=401, list=first), bad]
+                with self.assertRaisesRegex(ValueError, 'delivery_history_pagination_changed'):
+                    list(d.delivery_catalog_rows(api))
 
     def test_second_trigger_only_reads_original_task(self):
         api, objects = Mock(), Mock(); api.rpc.return_value = self.task()
@@ -152,6 +189,7 @@ class DeliveryTests(unittest.TestCase):
         with patch.object(d, 'read_json', side_effect=[final, self.claim()]), patch.object(d, 'native_receipt', return_value=dict(file_id='receipt')):
             result = d.deliver(api, objects, '2026-10-26')
         self.assertTrue(result['duplicate_prevented'])
+        self.assertEqual(result['sent_at_utc'], final['sent_at_utc'])
         self.assertEqual([c.args[0] for c in api.rpc.call_args_list], ['tasks/get'])
 
     def test_existing_claim_and_unknown_task_never_resubmits(self):
