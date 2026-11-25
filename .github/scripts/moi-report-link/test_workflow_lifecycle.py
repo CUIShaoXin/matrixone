@@ -6,6 +6,7 @@ import uuid
 from unittest.mock import patch
 
 from cloud_daily import Runner, WORKSPACE, Failure, sha256, json_bytes
+from cloud_publish import Failure as APIFailure
 
 
 class MemoryObjects:
@@ -371,7 +372,7 @@ class WorkflowLifecycleTests(unittest.TestCase):
         def request(path, payload=None, method=None, **kw):
             if path.endswith('/result') and not failed_once['value']:
                 failed_once['value'] = True
-                raise Failure('moi_http_404')
+                raise APIFailure('moi_http_404')
             return original(path, payload, method, **kw)
 
         runner.api.request = request

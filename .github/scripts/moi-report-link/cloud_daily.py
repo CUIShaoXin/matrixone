@@ -24,6 +24,7 @@ import cloud_publish as publication
 WORKSPACE = preflight.WORKSPACE
 AGENT = "8f4c2d1e-7a63-4b95-9c2e-3d6f1a0b5c47"
 Failure = preflight.Failure
+APIFailure = publication.Failure
 sha256 = preflight.sha256
 verify_login_free = getattr(publication, "verify_login_free", None)
 if verify_login_free is None:
@@ -369,7 +370,7 @@ class Runner:
         if stage["status"] == "deploying":
             try:
                 definition = self._reconcile_deploying(label, wid, dsl)
-            except Failure as exc:
+            except (APIFailure, Failure) as exc:
                 if str(exc) != "moi_http_404":
                     raise
                 lookup = stage.setdefault('deployment_lookup_recovery', {'attempts': 0})
@@ -386,7 +387,7 @@ class Runner:
                     time.sleep(2)
                     try:
                         definition = self._reconcile_deploying(label, wid, dsl)
-                    except Failure as retry_exc:
+                    except (APIFailure, Failure) as retry_exc:
                         if str(retry_exc) != "moi_http_404":
                             raise
                         lookup['attempts'] = 2
@@ -440,7 +441,7 @@ class Runner:
             try:
                 definition = self.api.data(self.api.request(fresh_route(
                     "/workflow/v2/workflow-apps/" + wid)))["workflow"]
-            except Failure as exc:
+            except (APIFailure, Failure) as exc:
                 if str(exc) != "moi_http_404":
                     raise
                 self.recover_workflow_identity(label, stage, 'submitted_app_missing')
@@ -469,7 +470,7 @@ class Runner:
                     try:
                         definition = self.api.data(self.api.request(
                             "/workflow/v2/workflow-apps/" + wid))["workflow"]
-                    except Failure as lookup_error:
+                    except (APIFailure, Failure) as lookup_error:
                         if str(lookup_error) != "moi_http_404":
                             raise
                         self.recover_workflow_identity(label, stage, 'execution_post_app_missing')
@@ -493,7 +494,7 @@ class Runner:
                 try:
                     result = self.api.data(self.api.request(
                         "/workflow/v2/workflow-apps/executions/" + eid + "/result"))["result"]
-                except Failure as exc:
+                except (APIFailure, Failure) as exc:
                     if str(exc) != "moi_http_404":
                         raise
                     recovery = stage.setdefault('result_read_recovery', {'attempts': 0})
@@ -556,7 +557,7 @@ class Runner:
         try:
             definition = self.api.data(self.api.request(fresh_route(
                 "/workflow/v2/workflow-apps/" + wid)))["workflow"]
-        except Failure as exc:
+        except (APIFailure, Failure) as exc:
             if str(exc) != "moi_http_404": raise
         if definition is None:
             from urllib.parse import quote
