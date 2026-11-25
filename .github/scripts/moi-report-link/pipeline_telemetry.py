@@ -54,7 +54,15 @@ def timed(label):
     def decorate(function):
         @functools.wraps(function)
         def wrapped(*args, **kwargs):
-            with span(label):
+            fields = {}
+            if label == 'component_workflow' and len(args) >= 2 and isinstance(args[1], str):
+                workflow_label = args[1]
+                stage = getattr(args[0], 'state', {}).get('stages', {}).get(workflow_label, {})
+                fields = dict(workflow_label=workflow_label,
+                              workflow_status=stage.get('status'),
+                              workflow_id=stage.get('workflow_id'),
+                              execution_id=stage.get('execution_id'))
+            with span(label, **fields):
                 return function(*args, **kwargs)
         return wrapped
     return decorate
