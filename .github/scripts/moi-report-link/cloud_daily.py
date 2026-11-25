@@ -367,7 +367,36 @@ class Runner:
                     lines += ["        save:"] + ["          " + k + ": " + json.dumps(v) for k,v in node["save"].items()]
             dsl = "\n".join(lines)+"\n"
         if stage["status"] == "deploying":
-            definition = self._reconcile_deploying(label, wid, dsl)
+            try:
+                definition = self._reconcile_deploying(label, wid, dsl)
+            except Failure as exc:
+                if str(exc) != "moi_http_404":
+                    raise
+                lookup = stage.setdefault('deployment_lookup_recovery', {'attempts': 0})
+                lookup['attempts'] = lookup.get('attempts', 0) + 1
+                lookup['at_utc'] = dt.datetime.now(dt.timezone.utc).isoformat()
+                self.journal.save()
+                # A single ambiguous lookup remaining 404 is retained. Two
+                # consecutive same-batch observations prove the recorded app
+                # identity cannot be reconciled, so redeploy with a fresh
+                # recovery identity instead of looping on it forever.
+                if lookup['attempts'] < 2:
+                    self.event(stage=label, status='workflow_deployment_lookup_missing',
+                               observation=lookup['attempts'])
+                    time.sleep(2)
+                    try:
+                        definition = self._reconcile_deploying(label, wid, dsl)
+                    except Failure as retry_exc:
+                        if str(retry_exc) != "moi_http_404":
+                            raise
+                        lookup['attempts'] = 2
+                        lookup['at_utc'] = dt.datetime.now(dt.timezone.utc).isoformat()
+                        self.journal.save()
+                    else:
+                        lookup.clear()
+                if lookup.get('attempts', 0) >= 2:
+                    self.recover_workflow_identity(label, stage, 'deployment_lookup_missing_confirmed')
+                    return self.workflow(label, nodes)
             if definition is not None:
                 stage.update(workflow_id=definition["id"], status="deployed", deployment_reconciled=True,
                              deployment_version_id=definition.get("latest_workflow_version_id"))

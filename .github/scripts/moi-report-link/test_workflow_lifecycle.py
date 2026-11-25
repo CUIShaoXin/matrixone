@@ -140,7 +140,7 @@ class WorkflowLifecycleTests(unittest.TestCase):
         self.assertEqual((runner.api.deploys, runner.api.submits), (1, 1))
 
     def test_deployment_recovery_blocks_changed_missing_or_executed_app(self):
-        for damage in ('dsl', 'active', 'executed', 'identity', 'missing'):
+        for damage in ('dsl', 'active', 'executed', 'identity'):
             with self.subTest(damage=damage):
                 runner, nodes = self.uncertain_deployment(damage)
                 with self.assertRaises(Failure):
@@ -395,7 +395,21 @@ class WorkflowLifecycleTests(unittest.TestCase):
         self.assertEqual(result['output'][0]['sha256'], sha256(runner.api.raw))
         self.assertEqual(runner.api.deploys, 1)
         self.assertEqual(runner.api.submits, 1)
-        self.assertEqual(stage['workflow_identity_recovery']['attempts'], 1)
+        self.assertEqual(stage['cleanup']['status'], 'deleted')
+
+    def test_repeated_deploying_lookup_404_redeploys_with_fresh_identity(self):
+        runner, nodes = self.runner()
+        stage = dict(status='deploying', lifecycle_version=3,
+                     workflow_id='missing-workflow',
+                     input_sha256=sha256(json_bytes(nodes)),
+                     deployment_lookup_recovery={'attempts': 1})
+        runner.state['stages'] = {'lifecycle_probe': stage}
+
+        result = runner.workflow('lifecycle_probe', nodes)
+        stage = runner.state['stages']['lifecycle_probe']
+        self.assertEqual(result['output'][0]['sha256'], sha256(runner.api.raw))
+        self.assertEqual(runner.api.deploys, 1)
+        self.assertEqual(runner.api.submits, 1)
         self.assertEqual(stage['cleanup']['status'], 'deleted')
 
     def test_changed_inputs_block_resume(self):
