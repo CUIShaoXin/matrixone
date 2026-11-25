@@ -363,6 +363,26 @@ class WorkflowLifecycleTests(unittest.TestCase):
         self.assertEqual(stage['output_cache_recovery']['attempts'], 1)
         self.assertEqual(stage['cleanup']['status'], 'deleted')
 
+    def test_missing_execution_result_reexecutes_once(self):
+        runner, nodes = self.runner()
+        original = runner.api.request
+        failed_once = {'value': False}
+
+        def request(path, payload=None, method=None, **kw):
+            if path.endswith('/result') and not failed_once['value']:
+                failed_once['value'] = True
+                raise Failure('moi_http_404')
+            return original(path, payload, method, **kw)
+
+        runner.api.request = request
+        result = runner.workflow('lifecycle_probe', nodes)
+        stage = runner.state['stages']['lifecycle_probe']
+        self.assertEqual(result['output'][0]['sha256'], sha256(runner.api.raw))
+        self.assertEqual(runner.api.submits, 2)
+        self.assertEqual(stage['result_read_recovery']['attempts'], 1)
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['cleanup']['status'], 'deleted')
+
     def test_changed_inputs_block_resume(self):
         runner, nodes = self.runner()
         runner.workflow('lifecycle_probe', nodes)

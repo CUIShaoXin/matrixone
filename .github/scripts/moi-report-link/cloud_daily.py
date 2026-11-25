@@ -422,7 +422,38 @@ class Runner:
             self.event(stage=label, status="MOI_running", execution_id=eid)
             deadline = time.monotonic() + 1500
             while time.monotonic() < deadline:
-                result = self.api.data(self.api.request("/workflow/v2/workflow-apps/executions/" + eid + "/result"))["result"]
+                try:
+                    result = self.api.data(self.api.request(
+                        "/workflow/v2/workflow-apps/executions/" + eid + "/result"))["result"]
+                except Failure as exc:
+                    if str(exc) != "moi_http_404":
+                        raise
+                    recovery = stage.setdefault('result_read_recovery', {'attempts': 0})
+                    from workflow_lifecycle import fresh_route
+                    definition = self.api.data(self.api.request(fresh_route(
+                        "/workflow/v2/workflow-apps/" + wid)))["workflow"]
+                    summary = definition.get("execution_summary", {})
+                    latest = summary.get("latest_execution_id")
+                    if latest and latest != eid:
+                        stage.update(execution_id=latest, status="running")
+                        stage['result_read_recovery']['adopted_execution_id'] = latest
+                        stage['result_read_recovery']['at_utc'] = dt.datetime.now(dt.timezone.utc).isoformat()
+                        self.journal.save()
+                        self.event(stage=label, status="execution_result_recovered",
+                                   execution_id=latest, resubmitted=False)
+                        eid = latest
+                        continue
+                    recovery['attempts'] = recovery.get('attempts', 0) + 1
+                    require(recovery['attempts'] <= 2, 'workflow_result_recovery_exhausted')
+                    recovery['previous_execution_id'] = eid
+                    recovery['reason'] = 'execution_result_missing'
+                    recovery['at_utc'] = dt.datetime.now(dt.timezone.utc).isoformat()
+                    stage.update(status="deployed")
+                    stage.pop('execution_id', None)
+                    self.journal.save()
+                    self.event(stage=label, status="workflow_result_missing_reexecuting",
+                               recovery_attempt=recovery['attempts'])
+                    return self.workflow(label, nodes)
                 if result["status"] == "completed":
                     stage.update(status="completed", moi_case_id=result.get("moi_case_id"))
                     self.journal.save()
