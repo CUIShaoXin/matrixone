@@ -383,6 +383,21 @@ class WorkflowLifecycleTests(unittest.TestCase):
         self.assertEqual(stage['status'], 'completed')
         self.assertEqual(stage['cleanup']['status'], 'deleted')
 
+    def test_submitting_stage_with_missing_app_redeploys_once(self):
+        runner, nodes = self.runner()
+        stage = dict(status='submitting', lifecycle_version=3,
+                     workflow_id='missing-workflow', execution_id='missing-execution',
+                     input_sha256=sha256(json_bytes(nodes)))
+        runner.state['stages'] = {'lifecycle_probe': stage}
+
+        result = runner.workflow('lifecycle_probe', nodes)
+        stage = runner.state['stages']['lifecycle_probe']
+        self.assertEqual(result['output'][0]['sha256'], sha256(runner.api.raw))
+        self.assertEqual(runner.api.deploys, 1)
+        self.assertEqual(runner.api.submits, 1)
+        self.assertEqual(stage['workflow_identity_recovery']['attempts'], 1)
+        self.assertEqual(stage['cleanup']['status'], 'deleted')
+
     def test_changed_inputs_block_resume(self):
         runner, nodes = self.runner()
         runner.workflow('lifecycle_probe', nodes)

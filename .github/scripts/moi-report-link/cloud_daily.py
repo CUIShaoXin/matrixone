@@ -229,9 +229,15 @@ def extract_manifests(raw, proof):
 class DailyAPI(publication.ReportAPI):
     def request(self,path,payload=None,method=None,timeout=35,retry=True):
         read_only=(method or ('GET' if payload is None else 'POST'))=='GET' or path=='/connectors/get'
+        route=path.split('?',1)[0]
         operation=('knowledge_sources' if path.startswith('/semantic-models/80001/sources') else
                    'knowledge_reconcile' if path=='/semantic-models/80001/source-jobs/reconcile' else
-                   'knowledge_jobs' if path.startswith('/semantic-models/80001/source-jobs') else 'other_catalog')
+                   'knowledge_jobs' if path.startswith('/semantic-models/80001/source-jobs') else
+                   'workflow_deploy' if route=='/workflow/v2/workflow-deployments' else
+                   'workflow_result' if re.fullmatch(r'/workflow/v2/workflow-apps/executions/[^/]+/result',route) else
+                   'workflow_node' if route.startswith('/workflow/v2/workflow-apps/executions/') and '/nodes/' in route else
+                   'workflow_submit' if route.startswith('/workflow/v2/workflow-apps/') and route.endswith('/executions') else
+                   'workflow_definition' if route.startswith('/workflow/v2/workflow-apps') else 'other_catalog')
         if operation.startswith('knowledge_'):
             timeout = max(timeout, 90)
         for attempt in range(3 if read_only and retry else 1):
@@ -294,6 +300,26 @@ class Runner:
 
     def event(self, **fields):
         print(json.dumps(dict(stage=fields.pop("stage", "progress"), **fields)), flush=True)
+
+    def recover_workflow_identity(self, label, stage, reason):
+        recovery = stage.setdefault('workflow_identity_recovery', {'attempts': 0})
+        recovery['attempts'] = recovery.get('attempts', 0) + 1
+        require(recovery['attempts'] <= 2, 'workflow_identity_recovery_exhausted')
+        recovery['previous_workflow_id'] = stage.get('workflow_id')
+        recovery['previous_execution_id'] = stage.get('execution_id')
+        recovery['reason'] = reason
+        recovery['at_utc'] = dt.datetime.now(dt.timezone.utc).isoformat()
+        for key in ('workflow_id', 'execution_id', 'output_artifacts', 'cleanup',
+                    'workflow_archive', 'deployment_version_id'):
+            stage.pop(key, None)
+        identity = (WORKSPACE + '/matrix-daily-ephemeral-v3/' + self.state['date'] +
+                    '/' + self.state['run_id'] + '/' + label + '/identity-recovery-' +
+                    str(recovery['attempts']))
+        stage['workflow_id'] = str(uuid.uuid5(uuid.NAMESPACE_URL, identity))
+        stage['status'] = 'planned'
+        self.journal.save()
+        self.event(stage=label, status='workflow_identity_missing_reexecuting',
+                   recovery_attempt=recovery['attempts'], reason=reason)
 
     @timed("component_workflow")
     def workflow(self, label, nodes):
@@ -382,8 +408,14 @@ class Runner:
             # means the POST never landed (safe to submit); otherwise adopt the
             # existing execution instead of creating a duplicate.
             from workflow_lifecycle import fresh_route
-            definition = self.api.data(self.api.request(fresh_route(
-                "/workflow/v2/workflow-apps/" + wid)))["workflow"]
+            try:
+                definition = self.api.data(self.api.request(fresh_route(
+                    "/workflow/v2/workflow-apps/" + wid)))["workflow"]
+            except Failure as exc:
+                if str(exc) != "moi_http_404":
+                    raise
+                self.recover_workflow_identity(label, stage, 'submitted_app_missing')
+                return self.workflow(label, nodes)
             summary = definition.get("execution_summary", {})
             if not summary.get("total_executions"):
                 stage["status"] = "deployed"
@@ -405,7 +437,14 @@ class Runner:
                     break
                 except Exception as exc:
                     if not transient_post_error(exc) or attempt == 4: raise
-                    definition = self.api.data(self.api.request("/workflow/v2/workflow-apps/" + wid))["workflow"]
+                    try:
+                        definition = self.api.data(self.api.request(
+                            "/workflow/v2/workflow-apps/" + wid))["workflow"]
+                    except Failure as lookup_error:
+                        if str(lookup_error) != "moi_http_404":
+                            raise
+                        self.recover_workflow_identity(label, stage, 'execution_post_app_missing')
+                        return self.workflow(label, nodes)
                     summary = definition.get("execution_summary", {})
                     if summary.get("total_executions"):
                         latest = summary.get("latest_execution_id")
