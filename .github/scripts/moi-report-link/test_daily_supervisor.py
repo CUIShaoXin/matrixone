@@ -46,7 +46,14 @@ class SupervisorTests(unittest.TestCase):
     def test_persistent_network_failure_is_bounded(self):
         def run(*args): return {'status': 'failed', 'error_type': 'TimeoutError'}
         self.assertEqual(self.run_supervisor('scan', run)['attempts'], 14)
-        self.assertEqual(self.run_supervisor('deliver', run)['attempts'], 5)
+        self.assertEqual(self.run_supervisor('deliver', run)['attempts'],
+                         s.DISPATCH_DELIVERY_MAX_ATTEMPTS)
+
+    def test_preview_keeps_short_delivery_budget(self):
+        def run(*args): return {'status': 'failed', 'safe_code': 'minio_http_404'}
+        final = self.run_supervisor('deliver', run, env={'MATRIX_DELIVERY_PREVIEW': 'true'})
+        self.assertEqual(final['attempts'], 5)
+        self.assertLessEqual(final['seconds'], 900)
 
     def test_fast_scan_failures_use_increasing_bounded_backoff(self):
         self.assertEqual([s.retry_delay('scan', attempt) for attempt in range(1, 9)],
@@ -96,6 +103,18 @@ class SupervisorTests(unittest.TestCase):
         final = self.run_supervisor('deliver', run, clock, True)
         self.assertEqual(final['status'], 'passed')
         self.assertEqual(len(calls), 27)
+
+    def test_dispatch_delivery_covers_late_same_day_ready(self):
+        clock = Clock(10, 3); calls = []
+        ready_at = dt.datetime(2026, 10, 29, 14, 54, tzinfo=s.LOCAL)
+        def run(*args):
+            calls.append(clock.now())
+            return ({'status': 'failed', 'safe_code': 'minio_http_404'}
+                    if clock.now() < ready_at else {'status': 'sent_verified'})
+        final = self.run_supervisor('deliver', run, clock)
+        self.assertEqual(final['status'], 'passed')
+        self.assertEqual(calls[-1], ready_at)
+        self.assertGreater(final['attempts'], 5)
 
     def test_actual_http_errors_and_login_free_errors_have_bounded_recovery(self):
         for value in ({'error_type': 'HTTPError', 'http_status': 503},

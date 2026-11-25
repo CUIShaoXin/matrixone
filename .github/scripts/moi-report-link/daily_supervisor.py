@@ -19,6 +19,11 @@ SCAN_RECOVERABLE = {'component_scan_incomplete', 'source_review_incomplete',
 DELIVERY_RECOVERABLE = {'delivery_uncertain_read_original_task_only',
                         'delivery_history_pagination_changed',
                         'minio_http_404'}
+# MOI's 10:00 trigger enters through workflow_dispatch, not --scheduled.
+# It still needs to wait for a late same-day scan instead of failing after five
+# quick ready-pointer 404s. Keep this below the 360-minute delivery job limit.
+DISPATCH_DELIVERY_BUDGET_SECONDS = 330 * 60
+DISPATCH_DELIVERY_MAX_ATTEMPTS = 640
 
 
 def local_now():
@@ -92,6 +97,9 @@ def supervise(kind, scheduled=False, env=None, now=local_now, sleep=time.sleep,
             max_attempts = 1
     else:
         budget, max_attempts = 15 * 60, 5
+        if not scheduled and env.get('MATRIX_DELIVERY_PREVIEW') != 'true':
+            budget = DISPATCH_DELIVERY_BUDGET_SECONDS
+            max_attempts = DISPATCH_DELIVERY_MAX_ATTEMPTS
         if scheduled:
             # Before 10:00 a missing ready pointer is an observation, not a
             # failed send. Allow bounded read-only polls through the warmup.
