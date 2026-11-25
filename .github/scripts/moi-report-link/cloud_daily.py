@@ -315,6 +315,23 @@ class Runner:
             if cached is not None:
                 retire(self, label)
                 return cached
+            # A completed execution without a durable output cache can happen
+            # when MOI acknowledges completion before a sink node becomes
+            # readable. Reusing the old execution loops on the same 404 forever.
+            # This only applies to the current lifecycle format, whose every
+            # workflow stage has at least one sink, and is bounded per stage.
+            if stage.get('lifecycle_version') == 3:
+                recovery = stage.setdefault('output_cache_recovery', {'attempts': 0})
+                recovery['attempts'] = recovery.get('attempts', 0) + 1
+                require(recovery['attempts'] <= 2, 'workflow_output_recovery_exhausted')
+                recovery['previous_execution_id'] = stage.get('execution_id')
+                recovery['reason'] = 'completed_without_durable_outputs'
+                recovery['at_utc'] = dt.datetime.now(dt.timezone.utc).isoformat()
+                stage['status'] = 'deployed'
+                stage.pop('execution_id', None)
+                self.journal.save()
+                self.event(stage=label, status='workflow_output_missing_reexecuting',
+                           recovery_attempt=recovery['attempts'])
         require(stage['status'] not in ('failed','cancelled','canceled','error','timeout'), 'moi_workflow_failed:'+label)
         if stage["status"] in ("planned", "deploying"):
             lines = ["workflow:", "  name: matrix_daily_" + label, "  root: root", "root:", "  chain:"]
